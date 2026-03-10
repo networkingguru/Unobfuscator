@@ -188,3 +188,25 @@ def set_config(conn, key: str, value) -> None:
         "INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)",
         (key, json.dumps(value))
     )
+
+
+def get_document_for_pdf(conn, doc_id: int) -> Optional[dict]:
+    """Return id, source, release_batch, original_filename, pdf_url for a document."""
+    row = conn.execute(
+        "SELECT id, source, release_batch, original_filename, pdf_url "
+        "FROM documents WHERE id = ?", (doc_id,)
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def append_soft_redaction_text(conn, doc_id: int, recovered_text: str) -> None:
+    """Append recovered soft-redaction text to a document's extracted_text."""
+    conn.execute(
+        "UPDATE documents SET extracted_text = extracted_text || ? WHERE id = ?",
+        (f"\n\n[SOFT_REDACTION_RECOVERED]\n{recovered_text}", doc_id)
+    )
+
+
+def mark_pdf_processed(conn, doc_id: int) -> None:
+    """Mark a document's PDF as processed."""
+    conn.execute("UPDATE documents SET pdf_processed = 1 WHERE id = ?", (doc_id,))
