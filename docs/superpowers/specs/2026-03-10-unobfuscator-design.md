@@ -68,7 +68,8 @@ unobfuscator/
 [Stage 4: PDF Processor]  ← runs in parallel, slow background track
     Downloads original PDFs
     Detects and removes soft/overlay redactions
-    Feeds recovered text back into merger
+    Inserts a new Stage 3 (merge) job into the jobs table for the affected group
+    Stage 3 re-runs and incorporates the newly recovered text
     |
 [Stage 5: Output Generator]
     Only generates output if at least one redaction was recovered
@@ -155,10 +156,17 @@ config
 
 ### Key Design Decisions
 
-- `match_group_members` is a many-to-many join — one doc can only belong to one group, but groups accumulate members as more docs are indexed
+- `match_group_members` has a `UNIQUE` constraint on `doc_id` — each document belongs to exactly one group. Groups accumulate members as more documents are indexed, but a document cannot be re-assigned once grouped.
 - `jobs` drives all work across both modes — the only difference between background and manual is the `priority` value
 - `config` table mirrors `config.yaml` but allows runtime overrides without editing the file
 - All boolean progress flags (`text_processed`, `merged`, `output_generated`) are the resume mechanism — on restart, anything `False` gets re-queued
+
+### Storage Split: DuckDB vs SQLite
+
+These two databases serve distinct roles and never overlap:
+
+- **DuckDB** — used only in `core/api.py` to query the Jmail Parquet files directly over HTTP (the remote data source). No local writes. Read-only.
+- **SQLite (`unobfuscator.db`)** — stores all local application state: indexed documents, fingerprints, match groups, merge results, job queue, config. All writes go here via `core/db.py`.
 
 ---
 
@@ -203,13 +211,15 @@ Documents that share no buckets are very unlikely to be the same document
 and are safely skipped. Result: only a small fraction of pairs are inspected.
 ```
 
+The `similarity_threshold` config value (default: 0.70) is the target Jaccard similarity this banding is tuned to guarantee. Adjusting it changes the band/row parameters. It is not applied as a direct filter in Phase 3 — Phase 3 uses `min_overlap_chars` (from config, default: 200) as its verification gate.
+
 ### Phase 3 — Verification & Grouping
 
 ```
 FOR EACH candidate pair (doc_A, doc_B):
 
   1. Find the longest common text segments (ignoring redaction markers)
-  2. IF common text < 200 characters → Reject.
+  2. IF common text < min_overlap_chars (from config, default: 200) → Reject.
   3. Check for complementary redactions:
      IF doc_A has text where doc_B is redacted, OR vice versa:
        → Confirmed match. Group them.
@@ -292,6 +302,8 @@ Flags:
   --wait        Block until results are ready, then print summary
   --output DIR  Override output directory for this run only
 ```
+
+`--person NAME` queries the Jmail `people` dataset (facial recognition + name index) to retrieve document IDs associated with that person, then scopes the search to those documents. It is more targeted than a plain string search, which scans `extracted_text` and `description` fields. Both approaches insert jobs into the shared queue — `--person` just seeds a narrower document set.
 
 Manual search jobs get priority +100. Results persist into the shared dataset.
 
