@@ -49,7 +49,9 @@ CREATE TABLE IF NOT EXISTS merge_results (
     source_doc_ids TEXT,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    output_generated BOOLEAN DEFAULT 0
+    output_generated BOOLEAN DEFAULT 0,
+    recovered_segments TEXT,
+    soft_recovered_count INTEGER DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS release_batches (
@@ -164,7 +166,9 @@ def merge_groups(conn, group_id_keep: int, group_id_remove: int) -> None:
 
 def upsert_merge_result(conn, group_id: int, merged_text: str,
                         recovered_count: int, total_redacted: int,
-                        source_doc_ids: list) -> None:
+                        source_doc_ids: list,
+                        recovered_segments: list = None,
+                        soft_recovered_count: int = 0) -> None:
     existing = conn.execute(
         "SELECT recovered_count FROM merge_results WHERE group_id = ?", (group_id,)
     ).fetchone()
@@ -172,10 +176,12 @@ def upsert_merge_result(conn, group_id: int, merged_text: str,
     conn.execute("""
         INSERT OR REPLACE INTO merge_results
         (group_id, merged_text, recovered_count, previous_recovered_count,
-         total_redacted, source_doc_ids, updated_at, output_generated)
-        VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, 0)
+         total_redacted, source_doc_ids, recovered_segments,
+         soft_recovered_count, updated_at, output_generated)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, 0)
     """, (group_id, merged_text, recovered_count, prev_count,
-          total_redacted, json.dumps(source_doc_ids)))
+          total_redacted, json.dumps(source_doc_ids),
+          json.dumps(recovered_segments or []), soft_recovered_count))
 
 
 def get_config(conn, key: str, default=None):
@@ -210,3 +216,58 @@ def append_soft_redaction_text(conn, doc_id: int, recovered_text: str) -> None:
 def mark_pdf_processed(conn, doc_id: int) -> None:
     """Mark a document's PDF as processed."""
     conn.execute("UPDATE documents SET pdf_processed = 1 WHERE id = ?", (doc_id,))
+
+
+def get_merge_result(conn, group_id: int) -> Optional[dict]:
+    row = conn.execute(
+        "SELECT * FROM merge_results WHERE group_id = ?", (group_id,)
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def get_documents_by_ids(conn, doc_ids: list[int]) -> list[dict]:
+    if not doc_ids:
+        return []
+    placeholders = ",".join("?" * len(doc_ids))
+    rows = conn.execute(
+        f"SELECT id, source, release_batch, original_filename, extracted_text "
+        f"FROM documents WHERE id IN ({placeholders})", doc_ids
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def mark_output_generated(conn, group_id: int) -> None:
+    conn.execute(
+        "UPDATE merge_results SET output_generated = 1, updated_at = CURRENT_TIMESTAMP "
+        "WHERE group_id = ?", (group_id,)
+    )
+
+
+def get_pending_output_groups(conn) -> list[dict]:
+    rows = conn.execute("""
+        SELECT group_id, merged_text, recovered_count, total_redacted,
+               source_doc_ids, recovered_segments, soft_recovered_count
+        FROM merge_results
+        WHERE output_generated = 0 AND recovered_count > 0
+    """).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_pending_pdf_document(conn) -> Optional[dict]:
+    row = conn.execute(
+        "SELECT id FROM documents WHERE pdf_processed = 0 AND pdf_url IS NOT NULL LIMIT 1"
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def get_known_batch_ids(conn) -> set:
+    return {r["batch_id"] for r in conn.execute(
+        "SELECT batch_id FROM release_batches"
+    ).fetchall()}
+
+
+def insert_release_batch(conn, batch_id: str) -> None:
+    conn.execute(
+        "INSERT OR IGNORE INTO release_batches (batch_id, fully_indexed) VALUES (?, 0)",
+        (batch_id,)
+    )

@@ -145,7 +145,8 @@ def run_merger(conn, redaction_markers: list[str], anchor_length: int = 50) -> i
             result["merged_text"],
             result["recovered_count"],
             result["total_redacted"],
-            result["source_doc_ids"]
+            result["source_doc_ids"],
+            recovered_segments=result.get("recovered_segments", [])
         )
         conn.execute(
             "UPDATE match_groups SET merged = 1 WHERE group_id = ?", (group_id,)
