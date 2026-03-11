@@ -1,8 +1,13 @@
+import json
 import pytest
 import yaml
 import fitz
 from unittest.mock import patch, call
-from core.db import init_db, get_connection, insert_release_batch, upsert_document
+from core.db import (
+    init_db, get_connection, insert_release_batch, upsert_document,
+    create_match_group, add_group_member,
+)
+from core.queue import enqueue, get_queue_stats
 from unobfuscator import _run_one_cycle
 
 
@@ -95,3 +100,82 @@ def test_run_one_cycle_processes_multiple_pdfs(mock_text_batch, mock_meta, mock_
         "SELECT COUNT(*) FROM documents WHERE pdf_processed = 1"
     ).fetchone()[0]
     assert processed == 2, f"Expected 2 PDFs processed, got {processed}"
+
+
+@patch("stages.indexer.fetch_documents_metadata")
+@patch("stages.indexer.fetch_documents_text_batch")
+def test_index_jobs_marked_done_after_cycle(mock_text_batch, mock_meta, conn, cfg):
+    """After a cycle, any pending 'index' queue jobs are marked done."""
+    # Enqueue two index jobs before running the cycle.
+    enqueue(conn, stage="index", payload={"doc_id": 1})
+    enqueue(conn, stage="index", payload={"doc_id": 2})
+    conn.commit()
+
+    # No documents to actually index — empty API returns.
+    mock_meta.return_value = []
+    mock_text_batch.return_value = {}
+
+    stats_before = get_queue_stats(conn)
+    assert stats_before["pending"] == 2
+
+    _run_one_cycle(conn, cfg)
+    conn.commit()
+
+    stats_after = get_queue_stats(conn)
+    assert stats_after["pending"] == 0, (
+        f"Expected 0 pending jobs after cycle, got {stats_after['pending']}"
+    )
+    assert stats_after["done"] == 2, (
+        f"Expected 2 done jobs after cycle, got {stats_after['done']}"
+    )
+
+
+@patch("stages.indexer.fetch_documents_metadata")
+@patch("stages.indexer.fetch_documents_text_batch")
+def test_merge_job_resets_group_and_reruns_merger(mock_text_batch, mock_meta, conn, cfg):
+    """A pending 'merge' queue job causes the named group to be re-merged."""
+    # Seed two documents with complementary text so the merger can recover a redaction.
+    base_text = "The witness was [REDACTED] at the event."
+    donor_text = "The witness was Maxwell at the event."
+
+    for doc_id, text in ((20, base_text), (21, donor_text)):
+        upsert_document(conn, {
+            "id": doc_id, "source": "doj", "release_batch": "VOL00010",
+            "original_filename": f"doc{doc_id}.pdf", "page_count": 1,
+            "size_bytes": 100, "description": "", "extracted_text": text,
+        })
+        conn.execute(
+            "UPDATE documents SET text_processed = 1 WHERE id = ?", (doc_id,)
+        )
+
+    # Create a match group containing both documents that has already been merged.
+    group_id = create_match_group(conn)
+    add_group_member(conn, group_id, 20, similarity=0.9)
+    add_group_member(conn, group_id, 21, similarity=0.9)
+    conn.execute("UPDATE match_groups SET merged = 1 WHERE group_id = ?", (group_id,))
+    conn.commit()
+
+    # Enqueue a merge job targeting this group (simulating a pdf_processor re-merge request).
+    enqueue(conn, stage="merge", payload={"group_id": group_id})
+    conn.commit()
+
+    mock_meta.return_value = []
+    mock_text_batch.return_value = {}
+
+    _run_one_cycle(conn, cfg)
+    conn.commit()
+
+    # The merge job should now be done (not pending).
+    stats = get_queue_stats(conn)
+    assert stats["pending"] == 0, (
+        f"Expected 0 pending jobs after cycle, got {stats['pending']}"
+    )
+
+    # The group should have been re-merged and have a merge_result entry.
+    merge_row = conn.execute(
+        "SELECT recovered_count FROM merge_results WHERE group_id = ?", (group_id,)
+    ).fetchone()
+    assert merge_row is not None, "Expected a merge_result row for the re-merged group"
+    assert merge_row["recovered_count"] >= 1, (
+        f"Expected at least 1 recovered redaction, got {merge_row['recovered_count']}"
+    )

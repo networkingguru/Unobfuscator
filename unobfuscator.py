@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Unobfuscator — CLI entry point."""
 
+import json
 import os
 import signal
 import time
@@ -15,7 +16,7 @@ from core.db import (
 )
 from core.config import load_config, get as cfg_get
 from core.api import fetch_release_batches, fetch_person_document_ids
-from core.queue import enqueue, get_queue_stats
+from core.queue import enqueue, get_queue_stats, dequeue, mark_done
 from stages.indexer import run_indexer_batch
 from stages.matcher import (
     run_phase0_email_fastpath, run_phase2_lsh_candidates,
@@ -81,6 +82,22 @@ def _run_one_cycle(conn, cfg: dict) -> None:
 
     run_merger(conn, redaction_markers=markers)
 
+    # Process any pending merge queue jobs (e.g., from soft-redaction discoveries).
+    merge_job = dequeue(conn, stage="merge")
+    while merge_job:
+        payload = json.loads(merge_job["payload"])
+        group_id = payload.get("group_id")
+        if group_id is not None:
+            # Reset merged flag so run_merger picks it up again.
+            conn.execute(
+                "UPDATE match_groups SET merged = 0 WHERE group_id = ?", (group_id,)
+            )
+        mark_done(conn, merge_job["job_id"])
+        merge_job = dequeue(conn, stage="merge")
+
+    # Re-run merger to process any groups that were just reset.
+    run_merger(conn, redaction_markers=markers)
+
     if not _shutdown_requested:
         pdf_limit = cfg_get(cfg, "workers.pdf", default=2)
         for pdf_doc in get_pending_pdf_documents(conn, limit=pdf_limit):
@@ -90,6 +107,12 @@ def _run_one_cycle(conn, cfg: dict) -> None:
 
     if not _shutdown_requested:
         run_output_generator(conn, output_dir=output_dir, redaction_markers=markers)
+
+    # Mark pending index jobs done — the cycle already processed all DB state.
+    index_job = dequeue(conn, stage="index")
+    while index_job:
+        mark_done(conn, index_job["job_id"])
+        index_job = dequeue(conn, stage="index")
 
     conn.commit()
 
