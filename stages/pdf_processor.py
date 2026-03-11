@@ -14,15 +14,6 @@ from typing import Optional
 from core.db import get_doc_group, get_document_for_pdf, append_soft_redaction_text, mark_pdf_processed
 from core.queue import enqueue
 
-# Jmail PDF base URL — confirmed pattern from API exploration.
-# Format: https://data.jmail.world/v1/files/{source}/{batch}/{filename}
-_PDF_BASE_URL = "https://data.jmail.world/v1/files"
-
-
-def build_pdf_url(doc_id: int, source: str, batch: str, original_filename: str) -> str:
-    """Construct the Jmail download URL for a document's original PDF."""
-    return f"{_PDF_BASE_URL}/{source}/{batch}/{original_filename}"
-
 
 def extract_soft_redactions(pdf_bytes: bytes) -> list[dict]:
     """Detect and extract text hidden under black rectangle overlays.

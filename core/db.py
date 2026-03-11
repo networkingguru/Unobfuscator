@@ -109,7 +109,7 @@ def upsert_document(conn, doc: dict) -> None:
             source = :source, release_batch = :release_batch,
             original_filename = :original_filename, page_count = :page_count,
             size_bytes = :size_bytes, description = :description,
-            extracted_text = :extracted_text
+            extracted_text = :extracted_text, pdf_url = :pdf_url
         WHERE id = :id
           AND text_processed = 0 AND pdf_processed = 0
     """, params)

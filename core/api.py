@@ -7,6 +7,15 @@ JMAIL_DOCS_TEXT_URL = "https://data.jmail.world/v1/documents_text/shard_*.parque
 JMAIL_BATCHES_URL = "https://data.jmail.world/v1/release_batches.parquet"
 JMAIL_PEOPLE_URL = "https://data.jmail.world/v1/people.parquet"
 
+# Jmail PDF base URL — confirmed pattern from API exploration.
+# Format: https://data.jmail.world/v1/files/{source}/{batch}/{filename}
+_PDF_BASE_URL = "https://data.jmail.world/v1/files"
+
+
+def build_pdf_url(doc_id: int, source: str, batch: str, original_filename: str) -> str:
+    """Construct the Jmail download URL for a document's original PDF."""
+    return f"{_PDF_BASE_URL}/{source}/{batch}/{original_filename}"
+
 
 def fetch_release_batches() -> list[str]:
     """Return list of all known release batch IDs from Jmail."""

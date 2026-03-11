@@ -7,8 +7,7 @@ import re
 import numpy as np
 from typing import Optional
 from datasketch import MinHash
-from core.api import fetch_documents_metadata, fetch_documents_text_batch
-from stages.pdf_processor import build_pdf_url
+from core.api import fetch_documents_metadata, fetch_documents_text_batch, build_pdf_url
 from core.db import (
     upsert_document, upsert_fingerprint, mark_text_processed
 )

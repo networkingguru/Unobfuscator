@@ -3,9 +3,8 @@ import io
 import fitz  # PyMuPDF
 from unittest.mock import patch, MagicMock
 from core.db import init_db, get_connection, upsert_document, create_match_group, add_group_member
-from stages.pdf_processor import (
-    extract_soft_redactions, build_pdf_url, process_pdf_for_document
-)
+from core.api import build_pdf_url
+from stages.pdf_processor import extract_soft_redactions, process_pdf_for_document
 
 
 @pytest.fixture
