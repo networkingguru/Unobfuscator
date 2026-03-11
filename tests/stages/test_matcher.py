@@ -34,6 +34,22 @@ UNRELATED_TEXT = (
     "Department heads reviewed the figures."
 )
 
+# Two versions of the same document with >500 chars of shared body text.
+# Neither redaction marker appears in both texts simultaneously, so
+# _has_complementary_redactions returns False — grouping is confirmed by
+# the long common text (secondary signal: >500 chars).
+_LONG_SHARED_BODY = (
+    "The Palm Beach estate served as the primary venue for gatherings during the period "
+    "in question. Multiple witnesses confirmed that the events described in the attached "
+    "exhibit took place on or around the dates listed. Transportation was arranged by "
+    "staff. Travel logs were maintained and are available upon subpoena. The relevant "
+    "parties were present at all material times and their identities are known to counsel. "
+    "Corroborating documentation was produced in discovery and has been reviewed by all "
+    "parties prior to filing with the court."
+)
+LONG_OVERLAP_TEXT_A = "Version A preamble. " + _LONG_SHARED_BODY + " End of version A."
+LONG_OVERLAP_TEXT_B = "Version B preamble. " + _LONG_SHARED_BODY + " End of version B."
+
 
 @pytest.fixture
 def conn(tmp_path):
@@ -145,8 +161,9 @@ def test_find_longest_common_substring_returns_empty_for_unrelated():
 
 
 def test_phase3_groups_confirmed_candidate_pair(conn):
-    seed_doc(conn, 1, EMAIL_TEXT_A)
-    seed_doc(conn, 2, EMAIL_TEXT_B)
+    # Uses >500 chars of shared text (secondary confirmation signal).
+    seed_doc(conn, 1, LONG_OVERLAP_TEXT_A)
+    seed_doc(conn, 2, LONG_OVERLAP_TEXT_B)
     conn.commit()
     candidates = [(1, 2)]
     run_phase3_verify_and_group(
@@ -175,9 +192,10 @@ def test_phase3_rejects_unrelated_pair(conn):
 
 
 def test_phase3_merges_two_existing_groups(conn):
-    # doc 1 and 2 are already in separate groups; phase3 should merge them
-    seed_doc(conn, 1, EMAIL_TEXT_A)
-    seed_doc(conn, 2, EMAIL_TEXT_B)
+    # doc 1 and 2 are already in separate groups; phase3 should merge them.
+    # Uses >500 chars of shared text (secondary confirmation signal).
+    seed_doc(conn, 1, LONG_OVERLAP_TEXT_A)
+    seed_doc(conn, 2, LONG_OVERLAP_TEXT_B)
     conn.commit()
     g1 = create_match_group(conn)
     g2 = create_match_group(conn)
@@ -192,3 +210,51 @@ def test_phase3_merges_two_existing_groups(conn):
     )
     conn.commit()
     assert get_doc_group(conn, 1) == get_doc_group(conn, 2)
+
+
+def test_phase3_groups_complementary_redactions_with_short_overlap(conn):
+    # One doc has a redaction where the other has text — complementary signal.
+    # Common text is well under 500 chars, but complementary redactions confirm the match.
+    shared = "The meeting took place at the Palm Beach estate on March 10th 2002."
+    text_a = shared + " Guests included [REDACTED] and several staff members."
+    text_b = shared + " Guests included Prince Andrew and several staff members."
+    seed_doc(conn, 1, text_a)
+    seed_doc(conn, 2, text_b)
+    conn.commit()
+    candidates = [(1, 2)]
+    run_phase3_verify_and_group(
+        conn, candidates,
+        redaction_markers=REDACTION_MARKERS,
+        min_overlap_chars=20
+    )
+    conn.commit()
+    # Complementary redactions present → should be grouped despite short common text
+    assert get_doc_group(conn, 1) is not None
+    assert get_doc_group(conn, 1) == get_doc_group(conn, 2)
+
+
+def test_phase3_rejects_medium_overlap_without_complementary_redactions(conn):
+    # Shared segment is between min_overlap_chars (200) and 500 chars.
+    # Neither document has any redaction markers — no complementary signal.
+    # The new logic requires complementary redactions OR >500 chars; this has neither.
+    shared = (
+        "This document concerns the financial arrangements made between the parties "
+        "in the spring of 2001. The terms were agreed upon after several rounds of "
+        "negotiation and were considered final by all participants at that time."
+    )
+    # shared is ~230 chars — above min_overlap_chars=200 but below 500
+    text_a = "Addendum A. " + shared + " No further amendments were anticipated."
+    text_b = "Addendum B. " + shared + " Subsequent reviews confirmed the arrangements."
+    seed_doc(conn, 1, text_a)
+    seed_doc(conn, 2, text_b)
+    conn.commit()
+    candidates = [(1, 2)]
+    run_phase3_verify_and_group(
+        conn, candidates,
+        redaction_markers=REDACTION_MARKERS,
+        min_overlap_chars=200
+    )
+    conn.commit()
+    # No complementary redactions AND common text <= 500 chars → should be rejected
+    assert get_doc_group(conn, 1) is None
+    assert get_doc_group(conn, 2) is None

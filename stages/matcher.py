@@ -257,9 +257,12 @@ def run_phase3_verify_and_group(
 
         common = find_longest_common_substring(text_a, text_b, redaction_markers)
         if len(common) < min_overlap_chars:
-            continue  # Not the same document — reject
+            continue  # Insufficient overlap — reject
 
-        # Confirmed match: sufficient common text (primary or secondary signal)
+        has_complementary = _has_complementary_redactions(text_a, text_b, redaction_markers)
+        if not has_complementary and len(common) <= 500:
+            continue  # Weak evidence — not enough to confirm match
+
         _assign_to_group(conn, doc_a, doc_b,
                          similarity=len(common) / max(len(text_a), len(text_b), 1))
 
