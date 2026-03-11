@@ -7,7 +7,8 @@ import re
 import numpy as np
 from typing import Optional
 from datasketch import MinHash
-from core.api import fetch_documents_metadata, fetch_document_text
+from core.api import fetch_documents_metadata, fetch_documents_text_batch
+from stages.pdf_processor import build_pdf_url
 from core.db import (
     upsert_document, upsert_fingerprint, mark_text_processed
 )
@@ -68,10 +69,19 @@ def run_indexer_batch(conn, batch_id: Optional[str],
                       num_perm: int = 128) -> int:
     """Fetch all documents for a batch from Jmail and index them. Returns count."""
     docs = fetch_documents_metadata(batch_id=batch_id)
+    if not docs:
+        return 0
+    doc_ids = [meta["id"] for meta in docs]
+    text_map = fetch_documents_text_batch(doc_ids)
     count = 0
     for meta in docs:
-        text = fetch_document_text(meta["id"])
-        doc = {**meta, "extracted_text": text or ""}
+        doc = {
+            **meta,
+            "extracted_text": text_map.get(meta["id"]) or "",
+            "pdf_url": build_pdf_url(
+                meta["id"], meta["source"], meta["release_batch"], meta["original_filename"]
+            ),
+        }
         index_document(conn, doc, redaction_markers, num_perm)
         conn.commit()
         count += 1

@@ -1,5 +1,5 @@
 import pytest
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch, MagicMock, call
 from core.db import init_db, get_connection, get_all_fingerprints, get_unprocessed_documents
 from stages.indexer import (
     clean_text, shingle, build_fingerprint,
@@ -71,7 +71,8 @@ def test_index_document_stores_doc_and_fingerprint(conn):
         "id": 1, "source": "doj", "release_batch": "VOL00001",
         "original_filename": "a.pdf", "page_count": 2,
         "size_bytes": 500, "description": "Test",
-        "extracted_text": "The flight departed from Palm Beach with several passengers on board."
+        "extracted_text": "The flight departed from Palm Beach with several passengers on board.",
+        "pdf_url": "https://data.jmail.world/v1/files/doj/VOL00001/a.pdf",
     }
     index_document(conn, doc, redaction_markers=REDACTION_MARKERS, num_perm=128)
     conn.commit()
@@ -86,7 +87,8 @@ def test_index_document_handles_empty_text_gracefully(conn):
         "id": 2, "source": "doj", "release_batch": "VOL00001",
         "original_filename": "empty.pdf", "page_count": 1,
         "size_bytes": 100, "description": "Empty doc",
-        "extracted_text": ""
+        "extracted_text": "",
+        "pdf_url": None,
     }
     index_document(conn, doc, redaction_markers=REDACTION_MARKERS, num_perm=128)
     conn.commit()
@@ -96,17 +98,57 @@ def test_index_document_handles_empty_text_gracefully(conn):
 
 
 @patch("stages.indexer.fetch_documents_metadata")
-@patch("stages.indexer.fetch_document_text")
-def test_run_indexer_batch_processes_all_docs(mock_text, mock_meta, conn):
+@patch("stages.indexer.fetch_documents_text_batch")
+def test_run_indexer_batch_processes_all_docs(mock_text_batch, mock_meta, conn):
     mock_meta.return_value = [
         {"id": 10, "source": "doj", "release_batch": "VOL00001",
          "original_filename": "x.pdf", "page_count": 1,
          "size_bytes": 200, "description": "Doc 10"},
     ]
-    mock_text.return_value = "This is a document with enough words to generate shingles for testing."
+    mock_text_batch.return_value = {
+        10: "This is a document with enough words to generate shingles for testing."
+    }
     run_indexer_batch(conn, batch_id="VOL00001",
                       redaction_markers=REDACTION_MARKERS, num_perm=128)
     conn.commit()
     fps = get_all_fingerprints(conn)
     assert len(fps) == 1
     assert fps[0]["doc_id"] == 10
+
+
+@patch("stages.indexer.fetch_documents_metadata")
+@patch("stages.indexer.fetch_documents_text_batch")
+def test_run_indexer_batch_uses_batch_text_fetch(mock_text_batch, mock_meta, conn):
+    """fetch_documents_text_batch must be called once (not per-document) with all IDs."""
+    mock_meta.return_value = [
+        {"id": 20, "source": "fbi", "release_batch": "VOL00002",
+         "original_filename": "a.pdf", "page_count": 1,
+         "size_bytes": 100, "description": "Doc 20"},
+        {"id": 21, "source": "fbi", "release_batch": "VOL00002",
+         "original_filename": "b.pdf", "page_count": 1,
+         "size_bytes": 100, "description": "Doc 21"},
+    ]
+    mock_text_batch.return_value = {20: "some text", 21: "other text"}
+    run_indexer_batch(conn, batch_id="VOL00002",
+                      redaction_markers=REDACTION_MARKERS, num_perm=128)
+    # Must be called exactly once with both IDs
+    mock_text_batch.assert_called_once_with([20, 21])
+
+
+@patch("stages.indexer.fetch_documents_metadata")
+@patch("stages.indexer.fetch_documents_text_batch")
+def test_run_indexer_batch_stores_pdf_url(mock_text_batch, mock_meta, conn):
+    """pdf_url must be populated in the documents table after indexing."""
+    mock_meta.return_value = [
+        {"id": 30, "source": "doj", "release_batch": "VOL00003",
+         "original_filename": "report.pdf", "page_count": 3,
+         "size_bytes": 800, "description": "Doc 30"},
+    ]
+    mock_text_batch.return_value = {30: ""}
+    run_indexer_batch(conn, batch_id="VOL00003",
+                      redaction_markers=REDACTION_MARKERS, num_perm=128)
+    conn.commit()
+    row = conn.execute("SELECT pdf_url FROM documents WHERE id = 30").fetchone()
+    assert row is not None
+    expected_url = "https://data.jmail.world/v1/files/doj/VOL00003/report.pdf"
+    assert row["pdf_url"] == expected_url

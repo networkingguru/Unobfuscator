@@ -95,13 +95,15 @@ def init_db(db_path: str) -> None:
 def upsert_document(conn, doc: dict) -> None:
     # INSERT OR IGNORE preserves text_processed/pdf_processed flags on re-index.
     # Then UPDATE refreshes metadata fields without touching progress flags.
+    # pdf_url is optional — callers that don't supply it get NULL.
+    params = {**doc, "pdf_url": doc.get("pdf_url")}
     conn.execute("""
         INSERT OR IGNORE INTO documents
         (id, source, release_batch, original_filename, page_count,
-         size_bytes, description, extracted_text, indexed_at)
+         size_bytes, description, extracted_text, pdf_url, indexed_at)
         VALUES (:id, :source, :release_batch, :original_filename, :page_count,
-                :size_bytes, :description, :extracted_text, CURRENT_TIMESTAMP)
-    """, doc)
+                :size_bytes, :description, :extracted_text, :pdf_url, CURRENT_TIMESTAMP)
+    """, params)
     conn.execute("""
         UPDATE documents SET
             source = :source, release_batch = :release_batch,
@@ -110,7 +112,7 @@ def upsert_document(conn, doc: dict) -> None:
             extracted_text = :extracted_text
         WHERE id = :id
           AND text_processed = 0 AND pdf_processed = 0
-    """, doc)
+    """, params)
 
 
 def get_unprocessed_documents(conn, limit: int = 1000) -> list:

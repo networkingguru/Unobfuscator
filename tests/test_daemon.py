@@ -31,8 +31,8 @@ def conn(cfg):
 
 
 @patch("stages.indexer.fetch_documents_metadata")
-@patch("stages.indexer.fetch_document_text")
-def test_run_one_cycle_completes_without_error(mock_text, mock_meta, conn, cfg):
+@patch("stages.indexer.fetch_documents_text_batch")
+def test_run_one_cycle_completes_without_error(mock_text_batch, mock_meta, conn, cfg):
     """Smoke test: one full cycle with a seeded batch does not raise."""
     insert_release_batch(conn, "VOL00001")
     conn.commit()
@@ -42,10 +42,12 @@ def test_run_one_cycle_completes_without_error(mock_text, mock_meta, conn, cfg):
         "original_filename": "a.pdf", "page_count": 1,
         "size_bytes": 100, "description": ""
     }]
-    mock_text.return_value = (
-        "From: a@a.com\nTo: b@b.com\nDate: 2002-01-01\nSubject: Test\n\n"
-        "The attendee was [REDACTED] at the location."
-    )
+    mock_text_batch.return_value = {
+        1: (
+            "From: a@a.com\nTo: b@b.com\nDate: 2002-01-01\nSubject: Test\n\n"
+            "The attendee was [REDACTED] at the location."
+        )
+    }
 
     _run_one_cycle(conn, cfg)
     conn.commit()

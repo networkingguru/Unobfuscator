@@ -27,7 +27,8 @@ SAMPLE_DOC = {
     "id": 1, "source": "doj", "release_batch": "VOL00001",
     "original_filename": "test.pdf", "page_count": 5,
     "size_bytes": 1000, "description": "A test document",
-    "extracted_text": "This is test content about someone important."
+    "extracted_text": "This is test content about someone important.",
+    "pdf_url": "https://data.jmail.world/v1/files/doj/VOL00001/test.pdf",
 }
 
 
@@ -123,3 +124,20 @@ def test_config_get_set_roundtrip(conn):
 
 def test_config_get_returns_default_when_missing(conn):
     assert get_config(conn, "nonexistent", default="fallback") == "fallback"
+
+
+def test_upsert_document_stores_pdf_url(conn):
+    upsert_document(conn, SAMPLE_DOC)
+    conn.commit()
+    row = conn.execute("SELECT pdf_url FROM documents WHERE id = 1").fetchone()
+    assert row is not None
+    assert row["pdf_url"] == SAMPLE_DOC["pdf_url"]
+
+
+def test_upsert_document_without_pdf_url_stores_null(conn):
+    doc = {**SAMPLE_DOC, "id": 99, "pdf_url": None}
+    upsert_document(conn, doc)
+    conn.commit()
+    row = conn.execute("SELECT pdf_url FROM documents WHERE id = 99").fetchone()
+    assert row is not None
+    assert row["pdf_url"] is None
