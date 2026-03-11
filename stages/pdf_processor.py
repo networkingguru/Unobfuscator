@@ -8,11 +8,14 @@ Logic reference: PIPELINE.md — Phase 5
 """
 
 import json
+import logging
 import fitz  # PyMuPDF
 import httpx
 from typing import Optional
 from core.db import get_doc_group, get_document_for_pdf, append_soft_redaction_text, mark_pdf_processed
 from core.queue import enqueue
+
+logger = logging.getLogger(__name__)
 
 
 def extract_soft_redactions(pdf_bytes: bytes) -> list[dict]:
@@ -66,7 +69,8 @@ def process_pdf_for_document(conn, doc_id: int) -> None:
         response = httpx.get(doc["pdf_url"], timeout=30)
         response.raise_for_status()
         pdf_bytes = response.content
-    except Exception:
+    except Exception as e:
+        logger.warning("Failed to download PDF for doc %s (%s): %s", doc_id, doc.get("pdf_url"), e)
         return  # Network failure — will be retried by the job queue on next run
 
     soft_redactions = extract_soft_redactions(pdf_bytes)

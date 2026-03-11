@@ -2,6 +2,7 @@
 """Unobfuscator — CLI entry point."""
 
 import json
+import logging
 import os
 import signal
 import time
@@ -28,6 +29,7 @@ from stages.pdf_processor import process_pdf_for_document
 from stages.output_generator import run_output_generator
 
 console = Console()
+logger = logging.getLogger(__name__)
 
 PID_FILE = ".unobfuscator.pid"
 _shutdown_requested = False
@@ -128,7 +130,8 @@ def _poll_for_new_batches(conn, cfg: dict) -> None:
     known = get_known_batch_ids(conn)
     try:
         current = set(fetch_release_batches())
-    except Exception:
+    except Exception as e:
+        logger.warning("Failed to fetch release batches: %s", e)
         return  # Network failure — try again next poll
 
     for batch_id in current - known:
@@ -159,6 +162,18 @@ def start(ctx):
     init_db(db_path)
     conn = get_connection(db_path)
     _shutdown_requested = False
+
+    log_path = cfg_get(cfg, "log_path", default="./data/unobfuscator.log")
+    Path(log_path).parent.mkdir(parents=True, exist_ok=True)
+    logging.basicConfig(
+        level=logging.WARNING,
+        format="%(asctime)s %(name)s %(levelname)s %(message)s",
+        handlers=[
+            logging.FileHandler(log_path),
+            logging.StreamHandler(),
+        ],
+    )
+
     _write_pid()
     console.print(f"[green]Daemon started (PID {os.getpid()})[/green]")
 
