@@ -21,6 +21,10 @@ _HEADER_PATTERNS = [
     re.compile(r"^Subject:\s*(.+)$", re.MULTILINE | re.IGNORECASE),
 ]
 
+# Minimum common-text length (chars) required to confirm a match when no
+# complementary redactions are present (secondary confirmation signal).
+_SECONDARY_OVERLAP_THRESHOLD = 500
+
 
 def extract_email_headers(text: str) -> list[str]:
     """Return a list of normalized header values found in the text."""
@@ -260,9 +264,10 @@ def run_phase3_verify_and_group(
             continue  # Insufficient overlap — reject
 
         has_complementary = _has_complementary_redactions(text_a, text_b, redaction_markers)
-        if not has_complementary and len(common) <= 500:
+        if not has_complementary and len(common) <= _SECONDARY_OVERLAP_THRESHOLD:
             continue  # Weak evidence — not enough to confirm match
 
+        # At least one confirmation signal met — assign to group
         _assign_to_group(conn, doc_a, doc_b,
                          similarity=len(common) / max(len(text_a), len(text_b), 1))
 
