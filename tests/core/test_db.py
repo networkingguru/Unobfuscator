@@ -48,7 +48,7 @@ def test_upsert_document_stores_record(conn):
     conn.commit()
     rows = get_unprocessed_documents(conn)
     assert len(rows) == 1
-    assert rows[0]["id"] == 1
+    assert rows[0]["id"] == "1"
     assert rows[0]["extracted_text"] == SAMPLE_DOC["extracted_text"]
 
 
@@ -68,7 +68,7 @@ def test_upsert_fingerprint_stores_and_retrieves(conn):
     conn.commit()
     fps = get_all_fingerprints(conn)
     assert len(fps) == 1
-    assert fps[0]["doc_id"] == 1
+    assert fps[0]["doc_id"] == "1"
     assert fps[0]["minhash_sig"] == sig
 
 

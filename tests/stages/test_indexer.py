@@ -79,7 +79,7 @@ def test_index_document_stores_doc_and_fingerprint(conn):
     assert get_unprocessed_documents(conn) == []  # marked as processed
     fps = get_all_fingerprints(conn)
     assert len(fps) == 1
-    assert fps[0]["doc_id"] == 1
+    assert str(fps[0]["doc_id"]) == "1"
 
 
 def test_index_document_handles_empty_text_gracefully(conn):
@@ -113,7 +113,7 @@ def test_run_indexer_batch_processes_all_docs(mock_text_batch, mock_meta, conn):
     conn.commit()
     fps = get_all_fingerprints(conn)
     assert len(fps) == 1
-    assert fps[0]["doc_id"] == 10
+    assert str(fps[0]["doc_id"]) == "10"
 
 
 @patch("stages.indexer.fetch_documents_metadata")
@@ -138,11 +138,13 @@ def test_run_indexer_batch_uses_batch_text_fetch(mock_text_batch, mock_meta, con
 @patch("stages.indexer.fetch_documents_metadata")
 @patch("stages.indexer.fetch_documents_text_batch")
 def test_run_indexer_batch_stores_pdf_url(mock_text_batch, mock_meta, conn):
-    """pdf_url must be populated in the documents table after indexing."""
+    """pdf_url is taken directly from source_url in the metadata record."""
+    source_url = "https://www.justice.gov/epstein/files/DataSet3/report.pdf"
     mock_meta.return_value = [
         {"id": 30, "source": "doj", "release_batch": "VOL00003",
          "original_filename": "report.pdf", "page_count": 3,
-         "size_bytes": 800, "description": "Doc 30"},
+         "size_bytes": 800, "description": "Doc 30",
+         "source_url": source_url},
     ]
     mock_text_batch.return_value = {30: ""}
     run_indexer_batch(conn, batch_id="VOL00003",
@@ -150,5 +152,4 @@ def test_run_indexer_batch_stores_pdf_url(mock_text_batch, mock_meta, conn):
     conn.commit()
     row = conn.execute("SELECT pdf_url FROM documents WHERE id = 30").fetchone()
     assert row is not None
-    expected_url = "https://data.jmail.world/v1/files/doj/VOL00003/report.pdf"
-    assert row["pdf_url"] == expected_url
+    assert row["pdf_url"] == source_url

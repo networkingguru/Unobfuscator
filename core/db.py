@@ -5,7 +5,7 @@ from typing import Optional
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS documents (
-    id INTEGER PRIMARY KEY,
+    id TEXT PRIMARY KEY,
     source TEXT NOT NULL,
     release_batch TEXT,
     original_filename TEXT,
@@ -20,7 +20,7 @@ CREATE TABLE IF NOT EXISTS documents (
 );
 
 CREATE TABLE IF NOT EXISTS document_fingerprints (
-    doc_id INTEGER PRIMARY KEY REFERENCES documents(id),
+    doc_id TEXT PRIMARY KEY REFERENCES documents(id),
     minhash_sig BLOB NOT NULL,
     shingle_count INTEGER,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
@@ -34,7 +34,7 @@ CREATE TABLE IF NOT EXISTS match_groups (
 
 CREATE TABLE IF NOT EXISTS match_group_members (
     group_id INTEGER REFERENCES match_groups(group_id),
-    doc_id INTEGER UNIQUE REFERENCES documents(id),
+    doc_id TEXT UNIQUE REFERENCES documents(id),
     similarity REAL,
     added_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (group_id, doc_id)
@@ -122,11 +122,11 @@ def get_unprocessed_documents(conn, limit: int = 1000) -> list:
     """, (limit,)).fetchall()
 
 
-def mark_text_processed(conn, doc_id: int) -> None:
+def mark_text_processed(conn, doc_id: str) -> None:
     conn.execute("UPDATE documents SET text_processed = 1 WHERE id = ?", (doc_id,))
 
 
-def upsert_fingerprint(conn, doc_id: int, sig: bytes, shingle_count: int) -> None:
+def upsert_fingerprint(conn, doc_id: str, sig: bytes, shingle_count: int) -> None:
     conn.execute("""
         INSERT OR REPLACE INTO document_fingerprints (doc_id, minhash_sig, shingle_count)
         VALUES (?, ?, ?)
@@ -144,14 +144,14 @@ def create_match_group(conn) -> int:
     return cursor.lastrowid
 
 
-def add_group_member(conn, group_id: int, doc_id: int, similarity: float) -> None:
+def add_group_member(conn, group_id: int, doc_id: str, similarity: float) -> None:
     conn.execute("""
         INSERT OR IGNORE INTO match_group_members (group_id, doc_id, similarity)
         VALUES (?, ?, ?)
     """, (group_id, doc_id, similarity))
 
 
-def get_doc_group(conn, doc_id: int) -> Optional[int]:
+def get_doc_group(conn, doc_id: str) -> Optional[int]:
     row = conn.execute(
         "SELECT group_id FROM match_group_members WHERE doc_id = ?", (doc_id,)
     ).fetchone()
@@ -198,7 +198,7 @@ def set_config(conn, key: str, value) -> None:
     )
 
 
-def get_document_for_pdf(conn, doc_id: int) -> Optional[dict]:
+def get_document_for_pdf(conn, doc_id: str) -> Optional[dict]:
     """Return id, source, release_batch, original_filename, pdf_url for a document."""
     row = conn.execute(
         "SELECT id, source, release_batch, original_filename, pdf_url "
@@ -207,7 +207,7 @@ def get_document_for_pdf(conn, doc_id: int) -> Optional[dict]:
     return dict(row) if row else None
 
 
-def append_soft_redaction_text(conn, doc_id: int, recovered_text: str) -> None:
+def append_soft_redaction_text(conn, doc_id: str, recovered_text: str) -> None:
     """Append recovered soft-redaction text to a document's extracted_text."""
     conn.execute(
         "UPDATE documents SET extracted_text = extracted_text || ? WHERE id = ?",
@@ -215,7 +215,7 @@ def append_soft_redaction_text(conn, doc_id: int, recovered_text: str) -> None:
     )
 
 
-def mark_pdf_processed(conn, doc_id: int) -> None:
+def mark_pdf_processed(conn, doc_id: str) -> None:
     """Mark a document's PDF as processed."""
     conn.execute("UPDATE documents SET pdf_processed = 1 WHERE id = ?", (doc_id,))
 
@@ -227,7 +227,7 @@ def get_merge_result(conn, group_id: int) -> Optional[dict]:
     return dict(row) if row else None
 
 
-def get_documents_by_ids(conn, doc_ids: list[int]) -> list[dict]:
+def get_documents_by_ids(conn, doc_ids: list[str]) -> list[dict]:
     if not doc_ids:
         return []
     placeholders = ",".join("?" * len(doc_ids))

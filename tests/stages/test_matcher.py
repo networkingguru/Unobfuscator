@@ -91,7 +91,7 @@ def test_phase0_groups_docs_with_matching_headers(conn):
     matched = run_phase0_email_fastpath(
         conn, min_header_matches=2
     )
-    assert matched == {1, 2}
+    assert matched == {"1", "2"}
     assert get_doc_group(conn, 1) is not None
     assert get_doc_group(conn, 1) == get_doc_group(conn, 2)
     assert get_doc_group(conn, 3) is None
@@ -124,8 +124,8 @@ def test_load_fingerprints_returns_doc_id_to_minhash_map(conn):
     upsert_fingerprint(conn, 1, make_fingerprint(EMAIL_TEXT_A), 50)
     conn.commit()
     fps = load_fingerprints(conn, num_perm=128)
-    assert 1 in fps
-    assert isinstance(fps[1], MinHash)
+    assert "1" in fps
+    assert isinstance(fps["1"], MinHash)
 
 
 def test_phase2_finds_similar_docs_as_candidates(conn):
@@ -138,9 +138,9 @@ def test_phase2_finds_similar_docs_as_candidates(conn):
     conn.commit()
     candidates = run_phase2_lsh_candidates(conn, threshold=0.3, num_perm=128)
     # docs 1 and 2 share most content — should be candidates
-    assert (1, 2) in candidates or (2, 1) in candidates
+    assert ("1", "2") in candidates or ("2", "1") in candidates
     # doc 3 is unrelated — should not be paired with 1 or 2
-    assert (1, 3) not in candidates and (3, 1) not in candidates
+    assert ("1", "3") not in candidates and ("3", "1") not in candidates
 
 
 # --- Phase 3 (Verification) ---

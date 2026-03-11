@@ -3,7 +3,6 @@ import io
 import fitz  # PyMuPDF
 from unittest.mock import patch, MagicMock
 from core.db import init_db, get_connection, upsert_document, create_match_group, add_group_member
-from core.api import build_pdf_url
 from stages.pdf_processor import extract_soft_redactions, process_pdf_for_document
 
 
@@ -51,14 +50,6 @@ def make_clean_pdf() -> bytes:
     page = doc.new_page()
     page.insert_text((50, 65), "This is fully visible public text.", fontsize=12)
     return doc.tobytes()
-
-
-# --- build_pdf_url ---
-
-def test_build_pdf_url_constructs_exact_expected_url():
-    url = build_pdf_url(doc_id=12345, source="doj", batch="VOL00008",
-                        original_filename="myfile.pdf")
-    assert url == "https://data.jmail.world/v1/files/doj/VOL00008/myfile.pdf"
 
 
 # --- extract_soft_redactions ---

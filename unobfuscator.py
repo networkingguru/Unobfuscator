@@ -224,7 +224,7 @@ def stop(ctx):
 
 
 @cli.command()
-@click.option("--doc", type=int, default=None, help="Show details for a specific document ID")
+@click.option("--doc", type=str, default=None, help="Show details for a specific document ID")
 @click.pass_context
 def status(ctx, doc):
     """Show processing progress across all stages."""
@@ -279,7 +279,7 @@ def status(ctx, doc):
 @click.option("--date", nargs=2, default=None, metavar="FROM TO",
               help="Filter by date range (YYYY-MM-DD YYYY-MM-DD)")
 @click.option("--batch", default=None, help="Target a specific release batch")
-@click.option("--doc", "doc_id", type=int, default=None, help="Process a specific document ID")
+@click.option("--doc", "doc_id", type=str, default=None, help="Process a specific document ID")
 @click.option("--wait", is_flag=True, help="Block until results are ready")
 @click.option("--output", default=None, help="Override output directory for this run")
 @click.pass_context

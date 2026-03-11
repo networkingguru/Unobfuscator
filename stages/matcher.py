@@ -117,15 +117,14 @@ def run_phase2_lsh_candidates(
     for doc_id, minhash in fingerprints.items():
         lsh.insert(str(doc_id), minhash)
 
-    candidates: list[tuple[int, int]] = []
-    seen: set[tuple[int, int]] = set()
+    candidates: list[tuple] = []
+    seen: set[tuple] = set()
     for doc_id, minhash in fingerprints.items():
         neighbors = lsh.query(minhash)
-        for neighbor_id_str in neighbors:
-            neighbor_id = int(neighbor_id_str)
-            if neighbor_id == doc_id:
+        for neighbor_id in neighbors:
+            if neighbor_id == str(doc_id):
                 continue
-            pair = (min(doc_id, neighbor_id), max(doc_id, neighbor_id))
+            pair = tuple(sorted([str(doc_id), neighbor_id]))
             if pair not in seen:
                 seen.add(pair)
                 candidates.append(pair)
@@ -248,16 +247,17 @@ def run_phase3_verify_and_group(
     Secondary: long common text (>500 chars) even without complementary redactions.
     Rejection: common text shorter than min_overlap_chars.
     """
+    # Normalize keys to str so candidates containing either int or str ids both work.
     texts = {
-        row["id"]: row["extracted_text"]
+        str(row["id"]): row["extracted_text"]
         for row in conn.execute(
             "SELECT id, extracted_text FROM documents WHERE extracted_text IS NOT NULL"
         ).fetchall()
     }
 
     for doc_a, doc_b in candidates:
-        text_a = texts.get(doc_a, "")
-        text_b = texts.get(doc_b, "")
+        text_a = texts.get(str(doc_a), "")
+        text_b = texts.get(str(doc_b), "")
 
         common = find_longest_common_substring(text_a, text_b, redaction_markers)
         if len(common) < min_overlap_chars:

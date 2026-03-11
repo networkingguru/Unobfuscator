@@ -20,7 +20,7 @@ def test_fetch_release_batches_returns_batch_ids(mock_connect):
     mock_connect.return_value.__enter__ = lambda s: mock_conn
     mock_connect.return_value.__exit__ = MagicMock(return_value=False)
     mock_conn.execute.return_value.fetchdf.return_value = pd.DataFrame(
-        {"batch_id": ["VOL00008", "VOL00009"]}
+        {"release_batch": ["VOL00008", "VOL00009"]}
     )
     batches = fetch_release_batches()
     assert "VOL00008" in batches
@@ -34,14 +34,14 @@ def test_fetch_documents_metadata_returns_list_of_dicts(mock_connect):
     mock_connect.return_value.__enter__ = lambda s: mock_conn
     mock_connect.return_value.__exit__ = MagicMock(return_value=False)
     mock_conn.execute.return_value.fetchdf.return_value = pd.DataFrame([{
-        "id": 1, "source": "doj", "release_batch": "VOL00008",
-        "original_filename": "test.pdf", "page_count": 3,
+        "id": "EFTA00001.pdf", "source": "doj", "release_batch": "VOL00008",
+        "original_filename": "EFTA00001.pdf", "page_count": 3,
         "size": 1000, "document_description": "A document",
-        "has_thumbnail": False
+        "has_thumbnail": False, "source_url": "https://example.com/doc.pdf"
     }])
     docs = fetch_documents_metadata(batch_id="VOL00008")
     assert len(docs) == 1
-    assert docs[0]["id"] == 1
+    assert docs[0]["id"] == "EFTA00001.pdf"
     assert docs[0]["source"] == "doj"
 
 
@@ -54,7 +54,7 @@ def test_fetch_documents_metadata_uses_parameterized_query(mock_connect):
     mock_connect.return_value.__exit__ = MagicMock(return_value=False)
     mock_conn.execute.return_value.fetchdf.return_value = pd.DataFrame(
         columns=["id", "source", "release_batch", "original_filename",
-                 "page_count", "size", "document_description", "has_thumbnail"]
+                 "page_count", "size", "document_description", "has_thumbnail", "source_url"]
     )
     fetch_documents_metadata(batch_id="VOL00008")
     call_args = mock_conn.execute.call_args
@@ -78,7 +78,7 @@ def test_fetch_documents_metadata_no_filter_passes_empty_params(mock_connect):
     mock_connect.return_value.__exit__ = MagicMock(return_value=False)
     mock_conn.execute.return_value.fetchdf.return_value = pd.DataFrame(
         columns=["id", "source", "release_batch", "original_filename",
-                 "page_count", "size", "document_description", "has_thumbnail"]
+                 "page_count", "size", "document_description", "has_thumbnail", "source_url"]
     )
     fetch_documents_metadata()
     call_args = mock_conn.execute.call_args
@@ -95,16 +95,17 @@ def test_fetch_document_text_uses_parameterized_query(mock_connect):
     mock_connect.return_value.__enter__ = lambda s: mock_conn
     mock_connect.return_value.__exit__ = MagicMock(return_value=False)
     mock_conn.execute.return_value.fetchdf.return_value = pd.DataFrame([{
-        "id": 42, "extracted_text": "Some text"
+        "id": "EFTA00042.pdf", "extracted_text": "Some text"
     }])
-    fetch_document_text(doc_id=42)
+    fetch_document_text(doc_id="EFTA00042.pdf")
     call_args = mock_conn.execute.call_args
     args = call_args[0]
     assert len(args) == 2, "execute() must be called with (query, params)"
     params = args[1]
     assert isinstance(params, (list, tuple))
-    assert 42 in params
-    assert "42" not in args[0]
+    assert "EFTA00042.pdf" in params
+    # doc_id must NOT be interpolated into the query string
+    assert "EFTA00042.pdf" not in args[0]
 
 
 @patch("core.api.duckdb.connect")
@@ -114,9 +115,9 @@ def test_fetch_document_text_returns_extracted_text(mock_connect):
     mock_connect.return_value.__enter__ = lambda s: mock_conn
     mock_connect.return_value.__exit__ = MagicMock(return_value=False)
     mock_conn.execute.return_value.fetchdf.return_value = pd.DataFrame([{
-        "id": 1, "extracted_text": "This is the full document text."
+        "id": "EFTA00001.pdf", "extracted_text": "This is the full document text."
     }])
-    result = fetch_document_text(doc_id=1)
+    result = fetch_document_text(doc_id="EFTA00001.pdf")
     assert result == "This is the full document text."
 
 
@@ -129,7 +130,7 @@ def test_fetch_document_text_returns_none_for_missing(mock_connect):
     mock_conn.execute.return_value.fetchdf.return_value = pd.DataFrame(
         columns=["id", "extracted_text"]
     )
-    result = fetch_document_text(doc_id=9999)
+    result = fetch_document_text(doc_id="MISSING.pdf")
     assert result is None
 
 
@@ -140,11 +141,11 @@ def test_fetch_documents_text_batch_returns_id_to_text_map(mock_connect):
     mock_connect.return_value.__enter__ = lambda s: mock_conn
     mock_connect.return_value.__exit__ = MagicMock(return_value=False)
     mock_conn.execute.return_value.fetchdf.return_value = pd.DataFrame([
-        {"id": 1, "extracted_text": "Text of doc 1"},
-        {"id": 2, "extracted_text": "Text of doc 2"},
+        {"id": "EFTA00001.pdf", "extracted_text": "Text of doc 1"},
+        {"id": "EFTA00002.pdf", "extracted_text": "Text of doc 2"},
     ])
-    result = fetch_documents_text_batch([1, 2])
-    assert result == {1: "Text of doc 1", 2: "Text of doc 2"}
+    result = fetch_documents_text_batch(["EFTA00001.pdf", "EFTA00002.pdf"])
+    assert result == {"EFTA00001.pdf": "Text of doc 1", "EFTA00002.pdf": "Text of doc 2"}
 
 
 def test_fetch_documents_text_batch_empty_list_returns_empty_dict():
@@ -153,10 +154,10 @@ def test_fetch_documents_text_batch_empty_list_returns_empty_dict():
     assert result == {}
 
 
-def test_fetch_documents_text_batch_rejects_non_integer_ids():
-    """Non-integer IDs must raise ValueError before any query is executed."""
+def test_fetch_documents_text_batch_rejects_non_string_ids():
+    """Non-string IDs (e.g. integers) must raise TypeError before any query is executed."""
     with pytest.raises((ValueError, TypeError)):
-        fetch_documents_text_batch(["1 OR 1=1", 2])  # type: ignore[list-item]
+        fetch_documents_text_batch(["EFTA00001.pdf", 2])  # type: ignore[list-item]
 
 
 @patch("core.api.duckdb.connect")
@@ -166,13 +167,13 @@ def test_search_documents_by_keyword_returns_matching_docs(mock_connect):
     mock_connect.return_value.__enter__ = lambda s: mock_conn
     mock_connect.return_value.__exit__ = MagicMock(return_value=False)
     mock_conn.execute.return_value.fetchdf.return_value = pd.DataFrame([{
-        "id": 5, "source": "doj", "release_batch": "VOL00008",
-        "original_filename": "flight.pdf", "page_count": 2,
+        "id": "FLIGHT001.pdf", "source": "doj", "release_batch": "VOL00008",
+        "original_filename": "FLIGHT001.pdf", "page_count": 2,
         "size": 900, "document_description": "Flight log"
     }])
     docs = search_documents_by_keyword("flight")
     assert len(docs) == 1
-    assert docs[0]["id"] == 5
+    assert docs[0]["id"] == "FLIGHT001.pdf"
 
 
 @patch("core.api.duckdb.connect")
@@ -205,10 +206,10 @@ def test_fetch_person_document_ids_returns_list(mock_connect):
     mock_connect.return_value.__enter__ = lambda s: mock_conn
     mock_connect.return_value.__exit__ = MagicMock(return_value=False)
     mock_conn.execute.return_value.fetchdf.return_value = pd.DataFrame(
-        {"document_id": [10, 20, 30]}
+        {"doc_id": ["EFTA00010.pdf", "EFTA00020.pdf", "EFTA00030.pdf"]}
     )
     result = fetch_person_document_ids("Trump")
-    assert result == [10, 20, 30]
+    assert result == ["EFTA00010.pdf", "EFTA00020.pdf", "EFTA00030.pdf"]
 
 
 @patch("core.api.duckdb.connect")
@@ -219,7 +220,7 @@ def test_fetch_person_document_ids_uses_parameterized_query(mock_connect):
     mock_connect.return_value.__enter__ = lambda s: mock_conn
     mock_connect.return_value.__exit__ = MagicMock(return_value=False)
     mock_conn.execute.return_value.fetchdf.return_value = pd.DataFrame(
-        {"document_id": [10]}
+        {"doc_id": ["EFTA00010.pdf"]}
     )
     fetch_person_document_ids("Trump")
     call_args = mock_conn.execute.call_args

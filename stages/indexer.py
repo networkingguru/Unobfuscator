@@ -7,7 +7,7 @@ import re
 import numpy as np
 from typing import Optional
 from datasketch import MinHash
-from core.api import fetch_documents_metadata, fetch_documents_text_batch, build_pdf_url
+from core.api import fetch_documents_metadata, fetch_documents_text_batch
 from core.db import (
     upsert_document, upsert_fingerprint, mark_text_processed
 )
@@ -77,9 +77,7 @@ def run_indexer_batch(conn, batch_id: Optional[str],
         doc = {
             **meta,
             "extracted_text": text_map.get(meta["id"]) or "",
-            "pdf_url": build_pdf_url(
-                meta["id"], meta["source"], meta["release_batch"], meta["original_filename"]
-            ),
+            "pdf_url": meta.get("source_url"),
         }
         index_document(conn, doc, redaction_markers, num_perm)
         conn.commit()
