@@ -68,14 +68,16 @@ def test_find_redaction_positions_returns_empty_for_clean_text():
 def test_extract_anchors_returns_text_around_position():
     text = "before context HERE after context"
     pos = text.index("HERE")
-    left, right = extract_anchors(text, pos, length=7)
+    marker_len = len("HERE")
+    left, right = extract_anchors(text, pos, marker_len, length=20)
     assert "before" in left
     assert "after" in right
 
 
 def test_extract_anchors_handles_start_of_text():
     text = "HERE after context"
-    left, right = extract_anchors(text, 0, length=10)
+    marker_len = len("HERE")
+    left, right = extract_anchors(text, 0, marker_len, length=10)
     assert left == ""
     assert "after" in right
 

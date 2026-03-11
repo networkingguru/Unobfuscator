@@ -21,15 +21,15 @@ def find_redaction_positions(text: str, redaction_markers: list[str]) -> list[tu
     return sorted(positions, key=lambda x: x[0])
 
 
-def extract_anchors(text: str, pos: int, length: int = 50) -> tuple[str, str]:
-    """Extract left and right anchor phrases around a position in text.
+def extract_anchors(text: str, pos: int, marker_len: int, length: int = 50) -> tuple[str, str]:
+    """Return (left_anchor, right_anchor) of up to `length` chars each around a redaction.
 
-    Returns the full text before pos as left and full text after pos as right.
-    The length parameter controls how many chars to use as anchor for matching.
+    left_anchor: up to `length` chars immediately before pos.
+    right_anchor: up to `length` chars immediately after pos + marker_len.
     """
-    left = text[:pos].strip()
-    right = text[pos:].strip()
-    return left, right
+    left_anchor = text[max(0, pos - length):pos].strip()
+    right_anchor = text[pos + marker_len:pos + marker_len + length].strip()
+    return left_anchor, right_anchor
 
 
 def find_text_between_anchors(
@@ -98,12 +98,7 @@ def merge_group(
 
     # Process in reverse order so string positions remain valid after substitution
     for pos, marker in reversed(positions):
-        full_left, _ = extract_anchors(base_text, pos, anchor_length)
-        # Use last anchor_length chars of left context for matching
-        left_anchor = full_left[-anchor_length:].strip() if full_left else ""
-        # Right anchor: text after the marker, limited to anchor_length chars
-        right_start = pos + len(marker)
-        right_anchor = base_text[right_start:right_start + anchor_length].strip()
+        left_anchor, right_anchor = extract_anchors(base_text, pos, len(marker), anchor_length)
 
         for donor_id, donor_text in donors:
             recovered = find_text_between_anchors(donor_text, left_anchor, right_anchor)
