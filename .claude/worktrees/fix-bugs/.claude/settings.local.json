@@ -1,8 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "WebFetch(domain:github.com)",
-      "WebFetch(domain:data.jmail.world)"
-    ]
-  }
-}

@@ -2,40 +2,9 @@
   "permissions": {
     "allow": [
       "WebFetch(domain:jmail.world)",
-      "Bash(py -3 chunk6_replace.py)",
-      "Bash(git -C /Users/brianhill/Scripts/Unobfuscator log --oneline)",
-      "Bash(git -C /Users/brianhill/Scripts/Unobfuscator branch -a)",
-      "Bash(pip install:*)",
-      "Bash(which python3:*)",
-      "Bash(python3 -m venv venv && source venv/bin/activate && python3 -m pip install -r requirements.txt)",
-      "Bash(ls /Users/brianhill/Scripts/Unobfuscator/venv/bin/python* 2>/dev/null && /Users/brianhill/Scripts/Unobfuscator/venv/bin/python -c \"import click, duckdb, datasketch, fitz, yaml, httpx, rich, pytest; print\\('all imports OK'\\)\" 2>&1)",
-      "Bash(git add:*)",
-      "Bash(venv/bin/pytest tests/core/test_config.py -v 2>&1 | tail -10)",
-      "Bash(venv/bin/pytest tests/core/test_queue.py tests/core/test_api.py -v 2>&1 | tail -20)",
-      "Bash(venv/bin/pytest tests/core/test_queue.py::test_get_queue_stats_counts_by_status -v 2>&1 | tail -20)",
-      "Bash(venv/bin/pip install:*)",
-      "Bash(venv/bin/pytest tests/ --collect-only 2>&1 | tail -15)",
-      "Bash(venv/bin/python unobfuscator.py --help 2>&1 | head -10 && venv/bin/python unobfuscator.py status 2>&1 && venv/bin/python unobfuscator.py config show 2>&1 | head -5)",
-      "Bash(venv/bin/pytest tests/stages/test_indexer.py -v 2>&1 | head -15)",
-      "Bash(venv/bin/pytest tests/stages/test_indexer.py -v 2>&1)",
-      "Bash(venv/bin/pytest tests/stages/test_matcher.py -v 2>&1 | head -15)",
-      "Bash(venv/bin/pytest tests/stages/test_matcher.py -v 2>&1)",
-      "Bash(venv/bin/python3 -c \"print\\(len\\(' and Prince Andrew.'\\)\\)\")",
-      "Bash(venv/bin/pytest tests/stages/test_merger.py -v 2>&1 | head -10)",
-      "Bash(venv/bin/pytest tests/stages/test_merger.py -v 2>&1 | head -20)",
-      "Bash(venv/bin/pytest tests/stages/test_merger.py -v 2>&1)",
-      "Bash(venv/bin/pytest tests/stages/test_pdf_processor.py -v 2>&1 | head -15)",
-      "Bash(venv/bin/pytest tests/stages/test_pdf_processor.py -v 2>&1)",
-      "Bash(venv/bin/pytest tests/ -v 2>&1)",
-      "Bash(venv/bin/pytest tests/ -q 2>&1 | tail -5)",
-      "Bash(venv/bin/pytest tests/stages/test_output_generator.py -v 2>&1 | head -10)",
-      "Bash(venv/bin/pytest tests/stages/test_output_generator.py -v 2>&1 | grep -E \"ERROR|ImportError|error\" | head -10)",
-      "Bash(venv/bin/pytest tests/stages/test_output_generator.py -v 2>&1)",
       "Bash(python:*)",
-      "Bash(venv/Scripts/python:*)",
-      "Bash(venv/bin/python:*)",
-      "Bash(where python:*)",
-      "Bash(C:/Users/us2hib8/AppData/Local/Programs/Python/Python313/python.exe:*)"
+      "Bash(python -m pytest:*)",
+      "Bash(git add:*)"
     ]
   }
 }
