@@ -255,11 +255,12 @@ def get_pending_output_groups(conn) -> list[dict]:
     return [dict(r) for r in rows]
 
 
-def get_pending_pdf_document(conn) -> Optional[dict]:
-    row = conn.execute(
-        "SELECT id FROM documents WHERE pdf_processed = 0 AND pdf_url IS NOT NULL LIMIT 1"
-    ).fetchone()
-    return dict(row) if row else None
+def get_pending_pdf_documents(conn, limit: int = 10) -> list[dict]:
+    rows = conn.execute(
+        "SELECT id FROM documents WHERE pdf_processed = 0 AND pdf_url IS NOT NULL LIMIT ?",
+        (limit,)
+    ).fetchall()
+    return [dict(row) for row in rows]
 
 
 def get_known_batch_ids(conn) -> set:

@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Optional
 from core.db import (
     init_db, get_connection, get_known_batch_ids, insert_release_batch,
-    get_pending_pdf_document, get_documents_by_ids
+    get_pending_pdf_documents, get_documents_by_ids
 )
 from core.config import load_config, get as cfg_get
 from core.api import fetch_release_batches, fetch_person_document_ids
@@ -82,8 +82,10 @@ def _run_one_cycle(conn, cfg: dict) -> None:
     run_merger(conn, redaction_markers=markers)
 
     if not _shutdown_requested:
-        pdf_doc = get_pending_pdf_document(conn)
-        if pdf_doc:
+        pdf_limit = cfg_get(cfg, "workers.pdf", default=2)
+        for pdf_doc in get_pending_pdf_documents(conn, limit=pdf_limit):
+            if _shutdown_requested:
+                break
             process_pdf_for_document(conn, doc_id=pdf_doc["id"])
 
     if not _shutdown_requested:
