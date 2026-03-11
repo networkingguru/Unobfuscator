@@ -92,7 +92,7 @@ that documents with ≥70% overlap will share at least one bucket with
 
     FOR EACH match group with 2 or more members:
 
-      1. Pick the "base" document: the member with the fewest redaction markers.
+      1. Pick the "base" document: the member with the most redaction markers.
 
       2. FOR EACH redaction marker in the base document:
          a. Extract the 50 characters immediately BEFORE the marker ("left anchor")
