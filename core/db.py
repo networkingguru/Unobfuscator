@@ -274,3 +274,10 @@ def insert_release_batch(conn, batch_id: str) -> None:
         "INSERT OR IGNORE INTO release_batches (batch_id, fully_indexed) VALUES (?, 0)",
         (batch_id,)
     )
+
+
+def reset_group_merged(conn, group_id: int) -> None:
+    """Reset merged flag so run_merger will reprocess this group."""
+    conn.execute(
+        "UPDATE match_groups SET merged = 0 WHERE group_id = ?", (group_id,)
+    )

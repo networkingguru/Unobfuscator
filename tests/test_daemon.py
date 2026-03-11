@@ -125,6 +125,9 @@ def test_index_jobs_marked_done_after_cycle(mock_text_batch, mock_meta, conn, cf
     assert stats_after["pending"] == 0, (
         f"Expected 0 pending jobs after cycle, got {stats_after['pending']}"
     )
+    assert stats_after["running"] == 0, (
+        f"Expected 0 running jobs after cycle, got {stats_after['running']}"
+    )
     assert stats_after["done"] == 2, (
         f"Expected 2 done jobs after cycle, got {stats_after['done']}"
     )

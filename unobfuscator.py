@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Optional
 from core.db import (
     init_db, get_connection, get_known_batch_ids, insert_release_batch,
-    get_pending_pdf_documents, get_documents_by_ids
+    get_pending_pdf_documents, get_documents_by_ids, reset_group_merged
 )
 from core.config import load_config, get as cfg_get
 from core.api import fetch_release_batches, fetch_person_document_ids
@@ -85,18 +85,21 @@ def _run_one_cycle(conn, cfg: dict) -> None:
     # Process any pending merge queue jobs (e.g., from soft-redaction discoveries).
     merge_job = dequeue(conn, stage="merge")
     while merge_job:
+        if _shutdown_requested:
+            break
         payload = json.loads(merge_job["payload"])
         group_id = payload.get("group_id")
         if group_id is not None:
             # Reset merged flag so run_merger picks it up again.
-            conn.execute(
-                "UPDATE match_groups SET merged = 0 WHERE group_id = ?", (group_id,)
-            )
+            reset_group_merged(conn, group_id)
+        else:
+            console.print("[yellow]Merge job with no group_id skipped.[/yellow]")
         mark_done(conn, merge_job["job_id"])
         merge_job = dequeue(conn, stage="merge")
 
     # Re-run merger to process any groups that were just reset.
-    run_merger(conn, redaction_markers=markers)
+    if not _shutdown_requested:
+        run_merger(conn, redaction_markers=markers)
 
     if not _shutdown_requested:
         pdf_limit = cfg_get(cfg, "workers.pdf", default=2)
@@ -111,6 +114,8 @@ def _run_one_cycle(conn, cfg: dict) -> None:
     # Mark pending index jobs done — the cycle already processed all DB state.
     index_job = dequeue(conn, stage="index")
     while index_job:
+        if _shutdown_requested:
+            break
         mark_done(conn, index_job["job_id"])
         index_job = dequeue(conn, stage="index")
 
@@ -302,11 +307,14 @@ def search(ctx, query, person, date, batch, doc_id, wait, output):
 
     if wait:
         console.print("[dim]Waiting for daemon to process...[/dim]")
-        while True:
+        deadline = time.time() + 300  # 5-minute timeout
+        while time.time() < deadline:
             stats = get_queue_stats(conn)
             if stats.get("pending", 0) == 0 and stats.get("running", 0) == 0:
                 break
             time.sleep(2)
+        else:
+            console.print("[yellow]Timed out waiting for daemon.[/yellow]")
         ctx.invoke(status)
 
 
