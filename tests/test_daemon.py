@@ -3,12 +3,13 @@ import pytest
 import yaml
 import fitz
 from unittest.mock import patch, call
+from click.testing import CliRunner
 from core.db import (
     init_db, get_connection, insert_release_batch, upsert_document,
-    create_match_group, add_group_member,
+    create_match_group, add_group_member, get_config,
 )
 from core.queue import enqueue, get_queue_stats
-from unobfuscator import _run_one_cycle
+from unobfuscator import _run_one_cycle, cli
 
 
 @pytest.fixture
@@ -182,3 +183,50 @@ def test_merge_job_resets_group_and_reruns_merger(mock_text_batch, mock_meta, co
     assert merge_row["recovered_count"] >= 1, (
         f"Expected at least 1 recovered redaction, got {merge_row['recovered_count']}"
     )
+
+
+def test_config_set_persists_value(tmp_path):
+    """config set stores a key/value in the DB and can be retrieved via get_config."""
+    db_path = str(tmp_path / "cfg_test.db")
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(
+        yaml.dump({"db_path": db_path})
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        ["--config", str(config_file), "config", "set", "output_dir", "/tmp/out"],
+        catch_exceptions=False,
+    )
+    assert result.exit_code == 0, f"CLI exited with {result.exit_code}:\n{result.output}"
+    assert "Config set:" in result.output
+
+    conn = get_connection(db_path)
+    stored = get_config(conn, "output_dir")
+    conn.close()
+    assert stored == "/tmp/out", f"Expected '/tmp/out', got {stored!r}"
+
+
+def test_config_set_overwrites_existing_value(tmp_path):
+    """config set on an existing key replaces the previous value."""
+    db_path = str(tmp_path / "cfg_test.db")
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(yaml.dump({"db_path": db_path}))
+
+    runner = CliRunner()
+    runner.invoke(
+        cli,
+        ["--config", str(config_file), "config", "set", "some_key", "first_value"],
+        catch_exceptions=False,
+    )
+    runner.invoke(
+        cli,
+        ["--config", str(config_file), "config", "set", "some_key", "second_value"],
+        catch_exceptions=False,
+    )
+
+    conn = get_connection(db_path)
+    stored = get_config(conn, "some_key")
+    conn.close()
+    assert stored == "second_value", f"Expected 'second_value', got {stored!r}"

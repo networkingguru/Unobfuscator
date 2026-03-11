@@ -12,7 +12,8 @@ from pathlib import Path
 from typing import Optional
 from core.db import (
     init_db, get_connection, get_known_batch_ids, insert_release_batch,
-    get_pending_pdf_documents, get_documents_by_ids, reset_group_merged
+    get_pending_pdf_documents, get_documents_by_ids, reset_group_merged,
+    set_config
 )
 from core.config import load_config, get as cfg_get
 from core.api import fetch_release_batches, fetch_person_document_ids
@@ -339,7 +340,14 @@ def config_show(ctx):
 @click.pass_context
 def config_set(ctx, key, value):
     """Set a configuration value (dot notation supported)."""
-    console.print(f"[yellow]Config set {key}={value} (DB integration added in Chunk 2)[/yellow]")
+    cfg = load_config(ctx.obj["config_path"])
+    db_path = cfg_get(cfg, "db_path", default="./data/unobfuscator.db")
+    init_db(db_path)
+    conn = get_connection(db_path)
+    set_config(conn, key, value)
+    conn.commit()
+    conn.close()
+    console.print(f"[green]Config set: {key} = {value}[/green]")
 
 
 if __name__ == "__main__":
