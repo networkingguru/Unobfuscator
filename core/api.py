@@ -29,7 +29,7 @@ def fetch_release_batches() -> list[str]:
 def fetch_documents_metadata(batch_id: Optional[str] = None) -> list[dict]:
     """Return document metadata records, optionally filtered by batch."""
     query = f"""
-        SELECT id, source, release_batch, original_filename,
+        SELECT TRY_CAST(id AS BIGINT) AS id, source, release_batch, original_filename,
                page_count, size, document_description, has_thumbnail
         FROM read_parquet('{JMAIL_DOCS_META_URL}')
     """
@@ -50,10 +50,11 @@ def fetch_documents_metadata(batch_id: Optional[str] = None) -> list[dict]:
 def fetch_document_text(doc_id: int) -> Optional[str]:
     """Return extracted text for a single document ID."""
     with duckdb.connect() as conn:
+        conn.execute("SET allow_asterisks_in_http_paths = true")
         df = conn.execute(f"""
-            SELECT id, extracted_text
+            SELECT TRY_CAST(id AS BIGINT) AS id, extracted_text
             FROM read_parquet('{JMAIL_DOCS_TEXT_URL}')
-            WHERE id = $1
+            WHERE TRY_CAST(id AS BIGINT) = $1
         """, [doc_id]).fetchdf()
     if df.empty:
         return None
@@ -77,12 +78,13 @@ def fetch_documents_text_batch(doc_ids: list[int]) -> dict[int, str]:
         return {}
     ids_str = ", ".join(str(i) for i in safe_ids)
     with duckdb.connect() as conn:
+        conn.execute("SET allow_asterisks_in_http_paths = true")
         df = conn.execute(f"""
-            SELECT id, extracted_text
+            SELECT TRY_CAST(id AS BIGINT) AS id, extracted_text
             FROM read_parquet('{JMAIL_DOCS_TEXT_URL}')
-            WHERE id IN ({ids_str})
+            WHERE TRY_CAST(id AS BIGINT) IN ({ids_str})
         """).fetchdf()
-    return dict(zip(df["id"], df["extracted_text"]))
+    return {int(k): v for k, v in zip(df["id"], df["extracted_text"])}
 
 
 def search_documents_by_keyword(keyword: str) -> list[dict]:
