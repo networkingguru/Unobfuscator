@@ -39,13 +39,13 @@ def fetch_documents_metadata(batch_id: Optional[str] = None) -> list[dict]:
     }).to_dict(orient="records")
 
 
-def fetch_document_text(doc_id: str) -> Optional[str]:
-    """Return extracted text for a single document ID."""
+def fetch_document_text(doc_id: str, batch_id: str) -> Optional[str]:
+    """Return extracted text for a single document ID within a batch."""
+    url = f"https://data.jmail.world/v1/documents-full/{batch_id}.parquet"
     with duckdb.connect() as conn:
-        conn.execute("SET allow_asterisks_in_http_paths = true")
         df = conn.execute(f"""
             SELECT id, extracted_text
-            FROM read_parquet('{JMAIL_DOCS_FULL_GLOB}')
+            FROM read_parquet('{url}')
             WHERE id = $1
         """, [doc_id]).fetchdf()
     if df.empty:
@@ -53,8 +53,8 @@ def fetch_document_text(doc_id: str) -> Optional[str]:
     return df.iloc[0]["extracted_text"]
 
 
-def fetch_documents_text_batch(doc_ids: list[str]) -> dict[str, str]:
-    """Return {doc_id: extracted_text} for a list of document IDs.
+def fetch_documents_text_batch(doc_ids: list[str], batch_id: str) -> dict[str, str]:
+    """Return {doc_id: extracted_text} for a list of document IDs within a batch.
 
     NOTE: This function builds the IN-list clause by quoting string IDs rather than
     using DuckDB's $1 parameterized syntax. DuckDB does not support a single parameter
@@ -70,12 +70,12 @@ def fetch_documents_text_batch(doc_ids: list[str]) -> dict[str, str]:
             )
     if not doc_ids:
         return {}
+    url = f"https://data.jmail.world/v1/documents-full/{batch_id}.parquet"
     ids_str = ", ".join(f"'{i}'" for i in doc_ids)
     with duckdb.connect() as conn:
-        conn.execute("SET allow_asterisks_in_http_paths = true")
         df = conn.execute(f"""
             SELECT id, extracted_text
-            FROM read_parquet('{JMAIL_DOCS_FULL_GLOB}')
+            FROM read_parquet('{url}')
             WHERE id IN ({ids_str})
         """).fetchdf()
     return dict(zip(df["id"], df["extracted_text"]))
@@ -99,6 +99,7 @@ def search_documents_by_keyword(keyword: str) -> list[dict]:
 def fetch_person_document_ids(name: str) -> list[str]:
     """Return document IDs from emails where the person appears as a participant."""
     with duckdb.connect() as conn:
+        conn.execute("SET force_download=true")
         df = conn.execute(f"""
             SELECT DISTINCT doc_id
             FROM read_parquet('{JMAIL_EMAILS_URL}')

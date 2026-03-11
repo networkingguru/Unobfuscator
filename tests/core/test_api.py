@@ -97,7 +97,7 @@ def test_fetch_document_text_uses_parameterized_query(mock_connect):
     mock_conn.execute.return_value.fetchdf.return_value = pd.DataFrame([{
         "id": "EFTA00042.pdf", "extracted_text": "Some text"
     }])
-    fetch_document_text(doc_id="EFTA00042.pdf")
+    fetch_document_text(doc_id="EFTA00042.pdf", batch_id="VOL00001")
     call_args = mock_conn.execute.call_args
     args = call_args[0]
     assert len(args) == 2, "execute() must be called with (query, params)"
@@ -117,7 +117,7 @@ def test_fetch_document_text_returns_extracted_text(mock_connect):
     mock_conn.execute.return_value.fetchdf.return_value = pd.DataFrame([{
         "id": "EFTA00001.pdf", "extracted_text": "This is the full document text."
     }])
-    result = fetch_document_text(doc_id="EFTA00001.pdf")
+    result = fetch_document_text(doc_id="EFTA00001.pdf", batch_id="VOL00001")
     assert result == "This is the full document text."
 
 
@@ -130,7 +130,7 @@ def test_fetch_document_text_returns_none_for_missing(mock_connect):
     mock_conn.execute.return_value.fetchdf.return_value = pd.DataFrame(
         columns=["id", "extracted_text"]
     )
-    result = fetch_document_text(doc_id="MISSING.pdf")
+    result = fetch_document_text(doc_id="MISSING.pdf", batch_id="VOL00001")
     assert result is None
 
 
@@ -144,20 +144,20 @@ def test_fetch_documents_text_batch_returns_id_to_text_map(mock_connect):
         {"id": "EFTA00001.pdf", "extracted_text": "Text of doc 1"},
         {"id": "EFTA00002.pdf", "extracted_text": "Text of doc 2"},
     ])
-    result = fetch_documents_text_batch(["EFTA00001.pdf", "EFTA00002.pdf"])
+    result = fetch_documents_text_batch(["EFTA00001.pdf", "EFTA00002.pdf"], "VOL00001")
     assert result == {"EFTA00001.pdf": "Text of doc 1", "EFTA00002.pdf": "Text of doc 2"}
 
 
 def test_fetch_documents_text_batch_empty_list_returns_empty_dict():
     """Empty input must return {} immediately without touching DuckDB."""
-    result = fetch_documents_text_batch([])
+    result = fetch_documents_text_batch([], "VOL00001")
     assert result == {}
 
 
 def test_fetch_documents_text_batch_rejects_non_string_ids():
     """Non-string IDs (e.g. integers) must raise TypeError before any query is executed."""
     with pytest.raises((ValueError, TypeError)):
-        fetch_documents_text_batch(["EFTA00001.pdf", 2])  # type: ignore[list-item]
+        fetch_documents_text_batch(["EFTA00001.pdf", 2], "VOL00001")  # type: ignore[list-item]
 
 
 @patch("core.api.duckdb.connect")

@@ -132,7 +132,7 @@ def test_run_indexer_batch_uses_batch_text_fetch(mock_text_batch, mock_meta, con
     run_indexer_batch(conn, batch_id="VOL00002",
                       redaction_markers=REDACTION_MARKERS, num_perm=128)
     # Must be called exactly once with both IDs
-    mock_text_batch.assert_called_once_with([20, 21])
+    mock_text_batch.assert_called_once_with([20, 21], "VOL00002")
 
 
 @patch("stages.indexer.fetch_documents_metadata")

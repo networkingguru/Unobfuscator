@@ -71,7 +71,7 @@ def run_indexer_batch(conn, batch_id: Optional[str],
     if not docs:
         return 0
     doc_ids = [meta["id"] for meta in docs]
-    text_map = fetch_documents_text_batch(doc_ids)
+    text_map = fetch_documents_text_batch(doc_ids, batch_id) if batch_id else {}
     count = 0
     for meta in docs:
         doc = {
