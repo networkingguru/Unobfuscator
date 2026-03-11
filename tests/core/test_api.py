@@ -147,6 +147,18 @@ def test_fetch_documents_text_batch_returns_id_to_text_map(mock_connect):
     assert result == {1: "Text of doc 1", 2: "Text of doc 2"}
 
 
+def test_fetch_documents_text_batch_empty_list_returns_empty_dict():
+    """Empty input must return {} immediately without touching DuckDB."""
+    result = fetch_documents_text_batch([])
+    assert result == {}
+
+
+def test_fetch_documents_text_batch_rejects_non_integer_ids():
+    """Non-integer IDs must raise ValueError before any query is executed."""
+    with pytest.raises((ValueError, TypeError)):
+        fetch_documents_text_batch(["1 OR 1=1", 2])  # type: ignore[list-item]
+
+
 @patch("core.api.duckdb.connect")
 def test_search_documents_by_keyword_returns_matching_docs(mock_connect):
     import pandas as pd

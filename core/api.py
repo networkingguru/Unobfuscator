@@ -52,8 +52,21 @@ def fetch_document_text(doc_id: int) -> Optional[str]:
 
 
 def fetch_documents_text_batch(doc_ids: list[int]) -> dict[int, str]:
-    """Return {doc_id: extracted_text} for a list of document IDs."""
-    ids_str = ", ".join(str(i) for i in doc_ids)
+    """Return {doc_id: extracted_text} for a list of document IDs.
+
+    NOTE: This function builds the IN-list clause via f-string rather than using
+    DuckDB's $1 parameterized syntax.  DuckDB does not support a single parameter
+    placeholder for a variable-length IN list, so manual construction is the only
+    option.  To prevent SQL injection we coerce every element to a plain Python int
+    first — any non-integer value will raise ValueError before a query is issued.
+    """
+    # Coerce to int to prevent injection — IN-list parameterization isn't
+    # supported for variable-length lists in DuckDB, so we build the clause
+    # manually but guarantee all values are safe integers.
+    safe_ids = [int(i) for i in doc_ids]
+    if not safe_ids:
+        return {}
+    ids_str = ", ".join(str(i) for i in safe_ids)
     with duckdb.connect() as conn:
         df = conn.execute(f"""
             SELECT id, extracted_text
