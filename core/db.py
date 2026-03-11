@@ -255,7 +255,7 @@ def get_pending_output_groups(conn) -> list[dict]:
     return [dict(r) for r in rows]
 
 
-def get_pending_pdf_documents(conn, limit: int = 10) -> list[dict]:
+def get_pending_pdf_documents(conn, limit: int) -> list[dict]:
     rows = conn.execute(
         "SELECT id FROM documents WHERE pdf_processed = 0 AND pdf_url IS NOT NULL LIMIT ?",
         (limit,)

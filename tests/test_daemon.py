@@ -1,5 +1,6 @@
 import pytest
 import yaml
+import fitz
 from unittest.mock import patch, call
 from core.db import init_db, get_connection, insert_release_batch, upsert_document
 from unobfuscator import _run_one_cycle
@@ -75,7 +76,6 @@ def test_run_one_cycle_processes_multiple_pdfs(mock_text_batch, mock_meta, mock_
     conn.commit()
 
     # Return a minimal clean PDF so process_pdf_for_document succeeds without errors.
-    import fitz
     doc = fitz.open()
     doc.new_page()
     clean_pdf = doc.tobytes()
