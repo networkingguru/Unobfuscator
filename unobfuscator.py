@@ -5,6 +5,8 @@ import json
 import logging
 import os
 import signal
+import subprocess
+import sys
 import time
 import click
 from rich.console import Console
@@ -191,9 +193,38 @@ def cli(ctx, config):
 
 
 @cli.command()
+@click.option("--foreground", "-f", is_flag=True, help="Run daemon in the foreground (default: background)")
 @click.pass_context
-def start(ctx):
+def start(ctx, foreground):
     """Start the background daemon (all 5 stages)."""
+    # Unless --foreground, re-launch ourselves as a detached subprocess and exit.
+    if not foreground:
+        existing = _read_pid()
+        if existing is not None:
+            try:
+                os.kill(existing, 0)
+                console.print(f"[red]Daemon already running (PID {existing}).[/red]")
+                return
+            except ProcessLookupError:
+                _remove_pid()
+
+        cfg = load_config(ctx.obj["config_path"])
+        log_path = cfg_get(cfg, "log_path", default="./data/unobfuscator.log")
+        Path(log_path).parent.mkdir(parents=True, exist_ok=True)
+        log_fh = open(log_path, "a")
+        proc = subprocess.Popen(
+            [sys.executable, __file__, "--config", ctx.obj["config_path"], "start"],
+            stdout=log_fh,
+            stderr=log_fh,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        console.print(
+            f"[green]Daemon launched in background (PID {proc.pid}).[/green]\n"
+            f"Logs: {log_path}"
+        )
+        return
+
     global _shutdown_requested
     cfg = load_config(ctx.obj["config_path"])
     db_path = cfg_get(cfg, "db_path", default="./data/unobfuscator.db")
@@ -205,13 +236,13 @@ def start(ctx):
 
     log_path = cfg_get(cfg, "log_path", default="./data/unobfuscator.log")
     Path(log_path).parent.mkdir(parents=True, exist_ok=True)
+    handlers = [logging.FileHandler(log_path)]
+    if sys.stdout.isatty():
+        handlers.append(logging.StreamHandler())
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(name)s %(levelname)s %(message)s",
-        handlers=[
-            logging.FileHandler(log_path),
-            logging.StreamHandler(),
-        ],
+        handlers=handlers,
     )
 
     global _daemon_conn
@@ -260,44 +291,40 @@ def start(ctx):
 
 
 @cli.command()
-@click.option("--force", is_flag=True, help="Force-kill if graceful stop fails within 10s")
+@click.option("--timeout", "-t", default=30, show_default=True,
+              help="Seconds to wait for graceful shutdown before force-killing")
 @click.pass_context
-def stop(ctx, force):
-    """Stop the background daemon gracefully (or forcefully with --force)."""
+def stop(ctx, timeout):
+    """Stop the background daemon (waits for graceful shutdown, then force-kills)."""
     pid = _read_pid()
     if pid is None:
         console.print("[red]No daemon running.[/red]")
         return
     try:
         os.kill(pid, signal.SIGTERM)
-        console.print(
-            f"[yellow]Stop signal sent to PID {pid}.[/yellow]"
-        )
+        console.print(f"[yellow]Stop signal sent to PID {pid}. Waiting up to {timeout}s...[/yellow]")
     except ProcessLookupError:
         console.print("[red]Daemon not found — cleaning up.[/red]")
         _remove_pid()
         return
 
-    if not force:
-        return
-
-    # Wait up to 10s for graceful shutdown, then SIGKILL.
-    for _ in range(20):
+    # Wait for graceful shutdown, then force-kill.
+    for i in range(timeout * 2):
         time.sleep(0.5)
         try:
-            os.kill(pid, 0)  # check if alive
+            os.kill(pid, 0)
         except ProcessLookupError:
-            console.print("[green]Daemon stopped.[/green]")
+            console.print("[green]Daemon stopped gracefully.[/green]")
             _remove_pid()
             return
 
-    console.print(f"[red]Daemon still alive — force-killing PID {pid}.[/red]")
+    console.print(f"[red]Daemon still alive after {timeout}s — force-killing PID {pid}.[/red]")
     try:
         os.kill(pid, signal.SIGKILL)
     except ProcessLookupError:
         pass
     _remove_pid()
-    console.print("[green]Done.[/green]")
+    console.print("[green]Daemon killed.[/green]")
 
 
 @cli.command()
