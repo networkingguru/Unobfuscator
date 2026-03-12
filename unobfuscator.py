@@ -14,7 +14,7 @@ from typing import Optional
 from core.db import (
     init_db, get_connection, get_known_batch_ids, insert_release_batch,
     get_pending_pdf_documents, get_documents_by_ids, reset_group_merged,
-    set_config
+    set_config, get_config
 )
 from core.config import load_config, get as cfg_get
 from core.api import fetch_release_batches, fetch_person_document_ids
@@ -33,6 +33,17 @@ logger = logging.getLogger(__name__)
 
 PID_FILE = ".unobfuscator.pid"
 _shutdown_requested = False
+_daemon_conn = None  # set during start, used by _set_activity
+
+
+def _set_activity(msg: str) -> None:
+    """Write current daemon activity to DB so 'status' can display it."""
+    if _daemon_conn is None:
+        return
+    from datetime import datetime, timezone
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    set_config(_daemon_conn, "daemon_activity", f"{ts} | {msg}")
+    _daemon_conn.commit()
 
 
 def _write_pid() -> None:
@@ -67,22 +78,28 @@ def _run_one_cycle(conn, cfg: dict) -> None:
     if _shutdown_requested:
         return
 
-    for batch_id in get_known_batch_ids(conn):
+    batch_ids = get_known_batch_ids(conn)
+    for i, batch_id in enumerate(batch_ids, 1):
         if _shutdown_requested:
             return
+        _set_activity(f"Stage 1 Indexer: batch {i}/{len(batch_ids)} ({batch_id})")
         run_indexer_batch(conn, batch_id=batch_id, redaction_markers=markers)
 
     if _shutdown_requested:
         return
 
+    _set_activity("Stage 2 Matcher: email fastpath")
     run_phase0_email_fastpath(conn, min_header_matches=min_headers)
+    _set_activity("Stage 2 Matcher: LSH candidates")
     candidates = run_phase2_lsh_candidates(conn, threshold=threshold)
+    _set_activity(f"Stage 2 Matcher: verifying {len(candidates)} candidates")
     run_phase3_verify_and_group(conn, candidates, redaction_markers=markers,
                                 min_overlap_chars=min_overlap)
 
     if _shutdown_requested:
         return
 
+    _set_activity("Stage 3 Merger: merging groups")
     run_merger(conn, redaction_markers=markers)
 
     # Process any pending merge queue jobs (e.g., from soft-redaction discoveries).
@@ -106,12 +123,15 @@ def _run_one_cycle(conn, cfg: dict) -> None:
 
     if not _shutdown_requested:
         pdf_limit = cfg_get(cfg, "workers.pdf", default=2)
-        for pdf_doc in get_pending_pdf_documents(conn, limit=pdf_limit):
+        pdf_docs = get_pending_pdf_documents(conn, limit=pdf_limit)
+        for i, pdf_doc in enumerate(pdf_docs, 1):
             if _shutdown_requested:
                 break
+            _set_activity(f"Stage 4 PDF: processing {i}/{len(pdf_docs)}")
             process_pdf_for_document(conn, doc_id=pdf_doc["id"])
 
     if not _shutdown_requested:
+        _set_activity("Stage 5 Output: generating files")
         run_output_generator(conn, output_dir=output_dir, redaction_markers=markers)
 
     # Mark pending index jobs done — the cycle already processed all DB state.
@@ -125,19 +145,39 @@ def _run_one_cycle(conn, cfg: dict) -> None:
     conn.commit()
 
 
-def _poll_for_new_batches(conn, cfg: dict) -> None:
-    """Check Jmail for new release batches and queue indexing for any new ones."""
+def _poll_for_new_batches(conn, cfg: dict) -> bool:
+    """Check Jmail for new release batches and queue indexing for any new ones.
+
+    Returns True on success, False if the fetch failed after retries.
+    """
     known = get_known_batch_ids(conn)
-    try:
-        current = set(fetch_release_batches())
-    except Exception as e:
-        logger.warning("Failed to fetch release batches: %s", e)
-        return  # Network failure — try again next poll
+    max_retries = 3
+    for attempt in range(1, max_retries + 1):
+        try:
+            current = set(fetch_release_batches())
+            break
+        except Exception as e:
+            if attempt < max_retries:
+                wait = 30 * attempt
+                logger.warning(
+                    "Failed to fetch release batches (attempt %d/%d): %s — "
+                    "retrying in %ds", attempt, max_retries, e, wait,
+                )
+                time.sleep(wait)
+            else:
+                logger.warning(
+                    "Failed to fetch release batches after %d attempts: %s",
+                    max_retries, e,
+                )
+                return False
+    else:
+        return False  # shouldn't reach here, but be safe
 
     for batch_id in current - known:
         insert_release_batch(conn, batch_id)
         enqueue(conn, stage="index", payload={"batch_id": batch_id})
     conn.commit()
+    return True
 
 
 @click.group()
@@ -166,7 +206,7 @@ def start(ctx):
     log_path = cfg_get(cfg, "log_path", default="./data/unobfuscator.log")
     Path(log_path).parent.mkdir(parents=True, exist_ok=True)
     logging.basicConfig(
-        level=logging.WARNING,
+        level=logging.INFO,
         format="%(asctime)s %(name)s %(levelname)s %(message)s",
         handlers=[
             logging.FileHandler(log_path),
@@ -174,6 +214,8 @@ def start(ctx):
         ],
     )
 
+    global _daemon_conn
+    _daemon_conn = conn
     _write_pid()
     console.print(f"[green]Daemon started (PID {os.getpid()})[/green]")
 
@@ -184,30 +226,44 @@ def start(ctx):
     signal.signal(signal.SIGINT, _handle_signal)
     signal.signal(signal.SIGTERM, _handle_signal)
 
+    retry_interval = 5 * 60  # 5 min retry on poll failure
     try:
+        _set_activity("Polling for new batches (initial)")
+        _poll_for_new_batches(conn, cfg)
         while not _shutdown_requested:
             _run_one_cycle(conn, cfg)
             stats = get_queue_stats(conn)
             if stats.get("pending", 0) == 0 and not _shutdown_requested:
+                _set_activity("Polling for new batches")
+                poll_ok = _poll_for_new_batches(conn, cfg)
+                wait = poll_interval if poll_ok else retry_interval
+                from datetime import datetime, timezone, timedelta
+                wake = datetime.now(timezone.utc) + timedelta(seconds=wait)
+                reason = "" if poll_ok else " (poll failed, retrying sooner)"
+                _set_activity(
+                    f"Idle — sleeping {wait // 60:.0f}m until "
+                    f"{wake.astimezone().strftime('%H:%M')}{reason}"
+                )
                 console.print(
                     f"[dim]All tasks complete. Checking for updates in "
-                    f"{poll_interval // 60:.0f} min...[/dim]"
+                    f"{wait // 60:.0f} min...[/dim]"
                 )
-                for _ in range(int(poll_interval)):
+                for _ in range(int(wait)):
                     if _shutdown_requested:
                         break
                     time.sleep(1)
-                if not _shutdown_requested:
-                    _poll_for_new_batches(conn, cfg)
     finally:
+        _set_activity("Stopped")
+        _daemon_conn = None
         _remove_pid()
         console.print("[yellow]Daemon stopped.[/yellow]")
 
 
 @cli.command()
+@click.option("--force", is_flag=True, help="Force-kill if graceful stop fails within 10s")
 @click.pass_context
-def stop(ctx):
-    """Stop the background daemon gracefully."""
+def stop(ctx, force):
+    """Stop the background daemon gracefully (or forcefully with --force)."""
     pid = _read_pid()
     if pid is None:
         console.print("[red]No daemon running.[/red]")
@@ -215,12 +271,33 @@ def stop(ctx):
     try:
         os.kill(pid, signal.SIGTERM)
         console.print(
-            f"[yellow]Stop signal sent to PID {pid}. "
-            "Daemon will finish its current stage then exit.[/yellow]"
+            f"[yellow]Stop signal sent to PID {pid}.[/yellow]"
         )
     except ProcessLookupError:
         console.print("[red]Daemon not found — cleaning up.[/red]")
         _remove_pid()
+        return
+
+    if not force:
+        return
+
+    # Wait up to 10s for graceful shutdown, then SIGKILL.
+    for _ in range(20):
+        time.sleep(0.5)
+        try:
+            os.kill(pid, 0)  # check if alive
+        except ProcessLookupError:
+            console.print("[green]Daemon stopped.[/green]")
+            _remove_pid()
+            return
+
+    console.print(f"[red]Daemon still alive — force-killing PID {pid}.[/red]")
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    _remove_pid()
+    console.print("[green]Done.[/green]")
 
 
 @cli.command()
@@ -242,6 +319,7 @@ def status(ctx, doc):
 
     pid = _read_pid()
     daemon_label = f"running (PID {pid})" if pid else "stopped"
+    activity = get_config(conn, "daemon_activity", default="unknown")
 
     total = conn.execute("SELECT COUNT(*) FROM documents").fetchone()[0]
     indexed = conn.execute("SELECT COUNT(*) FROM documents WHERE text_processed=1").fetchone()[0]
@@ -263,6 +341,8 @@ def status(ctx, doc):
     t.add_column("", style="bold")
     t.add_column("")
     t.add_row("Daemon", daemon_label)
+    if pid:
+        t.add_row("Activity", activity)
     t.add_row("Stage 1 Indexer", f"{indexed:,} / {total:,} docs")
     t.add_row("Stage 2 Matcher", f"{fps:,} fingerprints built")
     t.add_row("Stage 3 Merger", f"{groups:,} groups merged")
@@ -332,6 +412,28 @@ def search(ctx, query, person, date, batch, doc_id, wait, output):
         else:
             console.print("[yellow]Timed out waiting for daemon.[/yellow]")
         ctx.invoke(status)
+
+
+@cli.command()
+@click.option("-n", "--lines", default=50, show_default=True, help="Number of lines to show")
+@click.option("-f", "--follow", is_flag=True, help="Follow log output (like tail -f)")
+@click.pass_context
+def log(ctx, lines, follow):
+    """Show the daemon log."""
+    cfg = load_config(ctx.obj["config_path"])
+    log_path = cfg_get(cfg, "log_path", default="./data/unobfuscator.log")
+    if not os.path.exists(log_path):
+        console.print("[red]No log file found.[/red]")
+        return
+    import subprocess
+    cmd = ["tail", f"-n{lines}"]
+    if follow:
+        cmd.append("-f")
+    cmd.append(log_path)
+    try:
+        subprocess.run(cmd)
+    except KeyboardInterrupt:
+        pass
 
 
 @cli.group()

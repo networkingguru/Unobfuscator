@@ -1,5 +1,12 @@
+import math
 import duckdb
 from typing import Optional
+
+
+def _nan_to_none(record: dict) -> dict:
+    """Replace float NaN values (from pandas null strings) with None for sqlite3."""
+    return {k: (None if isinstance(v, float) and math.isnan(v) else v)
+            for k, v in record.items()}
 
 # Jmail API Parquet URLs (read-only via DuckDB — no local download needed)
 JMAIL_DOCS_META_URL = "https://data.jmail.world/v1/documents.parquet"
@@ -11,6 +18,7 @@ JMAIL_PEOPLE_URL = "https://data.jmail.world/v1/people.parquet"
 def fetch_release_batches() -> list[str]:
     """Return list of all known release batch IDs from Jmail documents metadata."""
     with duckdb.connect() as conn:
+        conn.execute("SET force_download=true")
         df = conn.execute(
             f"SELECT DISTINCT release_batch FROM read_parquet('{JMAIL_DOCS_META_URL}') "
             "WHERE release_batch IS NOT NULL"
@@ -31,18 +39,20 @@ def fetch_documents_metadata(batch_id: Optional[str] = None) -> list[dict]:
         params = [batch_id]
 
     with duckdb.connect() as conn:
+        conn.execute("SET force_download=true")
         df = conn.execute(query, params).fetchdf()
 
-    return df.rename(columns={
+    return [_nan_to_none(r) for r in df.rename(columns={
         "size": "size_bytes",
         "document_description": "description"
-    }).to_dict(orient="records")
+    }).to_dict(orient="records")]
 
 
 def fetch_document_text(doc_id: str, batch_id: str) -> Optional[str]:
     """Return extracted text for a single document ID within a batch."""
     url = f"https://data.jmail.world/v1/documents-full/{batch_id}.parquet"
     with duckdb.connect() as conn:
+        conn.execute("SET force_download=true")
         df = conn.execute(f"""
             SELECT id, extracted_text
             FROM read_parquet('{url}')
@@ -72,28 +82,36 @@ def fetch_documents_text_batch(doc_ids: list[str], batch_id: str) -> dict[str, s
         return {}
     url = f"https://data.jmail.world/v1/documents-full/{batch_id}.parquet"
     ids_str = ", ".join(f"'{i}'" for i in doc_ids)
-    with duckdb.connect() as conn:
-        df = conn.execute(f"""
-            SELECT id, extracted_text
-            FROM read_parquet('{url}')
-            WHERE id IN ({ids_str})
-        """).fetchdf()
-    return dict(zip(df["id"], df["extracted_text"]))
+    try:
+        with duckdb.connect() as conn:
+            conn.execute("SET force_download=true")
+            df = conn.execute(f"""
+                SELECT id, extracted_text
+                FROM read_parquet('{url}')
+                WHERE id IN ({ids_str})
+            """).fetchdf()
+    except duckdb.IOException as e:
+        if "HTTP 404" in str(e):
+            return {}
+        raise
+    return {k: (None if isinstance(v, float) and math.isnan(v) else v)
+            for k, v in zip(df["id"], df["extracted_text"])}
 
 
 def search_documents_by_keyword(keyword: str) -> list[dict]:
     """Return document metadata where description contains keyword."""
     with duckdb.connect() as conn:
+        conn.execute("SET force_download=true")
         df = conn.execute(f"""
             SELECT id, source, release_batch, original_filename,
                    page_count, size, document_description
             FROM read_parquet('{JMAIL_DOCS_META_URL}')
             WHERE LOWER(document_description) LIKE LOWER($1)
         """, [f"%{keyword}%"]).fetchdf()
-    return df.rename(columns={
+    return [_nan_to_none(r) for r in df.rename(columns={
         "size": "size_bytes",
         "document_description": "description"
-    }).to_dict(orient="records")
+    }).to_dict(orient="records")]
 
 
 def fetch_person_document_ids(name: str) -> list[str]:
