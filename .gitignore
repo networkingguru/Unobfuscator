@@ -9,3 +9,5 @@ build/
 .pytest_cache/
 venv/
 .claude/worktrees/
+.DS_Store
+*.pid
