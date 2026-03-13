@@ -223,3 +223,70 @@ def test_aggregate_case_number_exact_dedup():
     cases = [e for e in result if e["category"] == "case_number"]
     assert len(cases) == 1
     assert cases[0]["count"] == 2
+
+
+# ── Task 4: PDF Builder ──
+
+import fitz
+from stages.summary_generator import generate_summary_pdf
+
+
+def test_generate_summary_pdf_creates_file(conn, tmp_path):
+    output_dir = str(tmp_path / "output")
+    seed_group(conn,
+               group_docs=[("doc-a", "base text [REDACTED] here"), ("doc-b", "donor")],
+               merged_text="base text SARAH KELLEN here",
+               recovered_count=1,
+               segments=[{"text": "SARAH KELLEN", "source_doc_id": "doc-b", "stage": "merge"}])
+
+    path = generate_summary_pdf(conn, output_dir)
+    assert path is not None
+    from pathlib import Path
+    assert Path(path).exists()
+    assert path.endswith("summary_report.pdf")
+
+
+def test_generate_summary_pdf_contains_entity(conn, tmp_path):
+    output_dir = str(tmp_path / "output")
+    seed_group(conn,
+               group_docs=[("doc-a", "base"), ("doc-b", "donor")],
+               merged_text="merged",
+               recovered_count=1,
+               segments=[{"text": "SARAH KELLEN", "source_doc_id": "doc-b", "stage": "merge"}])
+
+    path = generate_summary_pdf(conn, output_dir)
+    doc = fitz.open(path)
+    full_text = "".join(page.get_text() for page in doc)
+    assert "SARAH KELLEN" in full_text
+    assert "Unobfuscator Summary Report" in full_text
+    doc.close()
+
+
+def test_generate_summary_pdf_empty_corpus(conn, tmp_path):
+    output_dir = str(tmp_path / "output")
+    path = generate_summary_pdf(conn, output_dir)
+    # Should still generate a PDF with zero stats
+    assert path is not None
+    doc = fitz.open(path)
+    full_text = "".join(page.get_text() for page in doc)
+    assert "recovered segments: 0" in full_text.lower()
+    doc.close()
+
+
+def test_generate_summary_pdf_has_stats(conn, tmp_path):
+    output_dir = str(tmp_path / "output")
+    seed_group(conn,
+               group_docs=[("doc-a", "base"), ("doc-b", "donor")],
+               merged_text="merged",
+               recovered_count=2,
+               segments=[
+                   {"text": "SARAH KELLEN", "source_doc_id": "doc-b", "stage": "merge"},
+                   {"text": "test@example.com", "source_doc_id": "doc-b", "stage": "merge"},
+               ])
+
+    path = generate_summary_pdf(conn, output_dir)
+    doc = fitz.open(path)
+    full_text = "".join(page.get_text() for page in doc)
+    # Should contain stats
+    assert "People" in full_text or "Email" in full_text
+    doc.close()

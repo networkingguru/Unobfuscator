@@ -3,7 +3,14 @@
 Logic reference: docs/superpowers/specs/2026-03-13-summary-pdf-design.md
 """
 
+import json
 import re
+from datetime import date
+from pathlib import Path
+
+import fitz
+
+from core.db import get_all_recovery_groups, get_documents_by_ids
 
 # Stopwords for people extraction — common legal/geographic phrases
 _PEOPLE_STOPWORDS = {
@@ -174,3 +181,233 @@ def aggregate_entities(raw_entities: list[dict]) -> list[dict]:
     # Sort by count descending within each category
     result.sort(key=lambda e: (-e["count"], e["text"]))
     return result
+
+
+# Category display order and labels
+_CATEGORY_ORDER = [
+    ("people", "People"),
+    ("email", "Email Addresses"),
+    ("phone", "Phone Numbers"),
+    ("case_number", "Case Numbers"),
+    ("organization", "Organizations"),
+    ("other", "Other Recoveries"),
+]
+
+
+def _collect_raw_entities(conn) -> list[dict]:
+    """Parse all recovered segments and extract entities with group context.
+
+    Segments that yield no categorized entities are added as "other" category
+    (truncated to 80 chars).
+    """
+    groups = get_all_recovery_groups(conn)
+    raw = []
+    for g in groups:
+        segments = json.loads(g["recovered_segments"] or "[]")
+        for seg in segments:
+            text = seg.get("text", "").strip()
+            if not text or len(text) < 4:
+                continue
+            entities = extract_entities(text)
+            if entities:
+                for e in entities:
+                    e["group_id"] = g["group_id"]
+                    raw.append(e)
+            else:
+                # "Other" category — truncated raw text
+                display = text.replace("\n", " ")[:80]
+                raw.append({
+                    "text": display,
+                    "category": "other",
+                    "group_id": g["group_id"],
+                })
+    return raw
+
+
+def _write_title_page(pdf: fitz.Document, conn, entity_count: int,
+                      segment_count: int) -> None:
+    """Write page 1: title and high-level stats."""
+    page = pdf.new_page()
+    margin = 40
+    y = margin
+    fontsize = 16
+
+    page.insert_text((margin, y + fontsize), "Unobfuscator Summary Report",
+                     fontsize=fontsize)
+    y += fontsize * 2
+
+    fontsize = 10
+    line_height = fontsize * 1.8
+    today = date.today().isoformat()
+
+    total_docs = conn.execute("SELECT COUNT(*) FROM documents").fetchone()[0]
+    total_groups = conn.execute(
+        "SELECT COUNT(*) FROM merge_results WHERE recovered_count > 0"
+    ).fetchone()[0]
+    recovered_sum = conn.execute(
+        "SELECT COALESCE(SUM(recovered_count), 0) FROM merge_results"
+    ).fetchone()[0]
+    redacted_sum = conn.execute(
+        "SELECT COALESCE(SUM(total_redacted), 0) FROM merge_results"
+    ).fetchone()[0]
+    rate = f"{recovered_sum/redacted_sum:.1%}" if redacted_sum > 0 else "N/A"
+
+    stats = [
+        f"Generated: {today}",
+        f"Documents indexed: {total_docs:,}",
+        f"Match groups with recoveries: {total_groups:,}",
+        f"Total recovered segments: {segment_count:,}",
+        f"Unique entities extracted: {entity_count:,}",
+        f"Recovery rate: {rate} ({recovered_sum:,} / {redacted_sum:,} redactions)",
+    ]
+    page.insert_text((margin, y + fontsize), "=" * 60, fontsize=9)
+    y += line_height
+    for line in stats:
+        page.insert_text((margin, y + fontsize), line, fontsize=fontsize)
+        y += line_height
+    page.insert_text((margin, y + fontsize), "=" * 60, fontsize=9)
+
+
+def _write_top_findings(pdf: fitz.Document, entities: list[dict]) -> None:
+    """Write page 2: top 20 entities across all categories."""
+    page = pdf.new_page()
+    margin = 40
+    fontsize = 12
+    y = margin
+
+    page.insert_text((margin, y + fontsize), "Top Findings", fontsize=fontsize)
+    y += fontsize * 2
+
+    fontsize = 10
+    line_height = fontsize * 1.5
+    page.insert_text((margin, y + fontsize), "=" * 60, fontsize=9)
+    y += line_height
+
+    top = entities[:20]
+    for i, e in enumerate(top, 1):
+        label = f"{i:>2}. [{e['category'].upper()}] {e['text']} — {e['count']}x"
+        if y + line_height > page.rect.height - 60:
+            page = pdf.new_page()
+            y = margin
+        page.insert_text((margin, y + fontsize), label, fontsize=fontsize)
+        y += line_height
+
+
+def _write_category_section(pdf: fitz.Document, label: str,
+                            entities: list[dict], conn,
+                            output_dir: str) -> None:
+    """Write a category section with entity table and links."""
+    page = pdf.new_page()
+    margin = 40
+    fontsize = 12
+    y = margin
+
+    page.insert_text((margin, y + fontsize),
+                     f"{label} ({len(entities)} unique)", fontsize=fontsize)
+    y += fontsize * 2
+
+    fontsize = 9
+    line_height = fontsize * 1.6
+
+    for e in entities:
+        # Entity line
+        group_str = ", ".join(str(g) for g in e["group_ids"][:10])
+        if len(e["group_ids"]) > 10:
+            group_str += f" (+{len(e['group_ids']) - 10} more)"
+        line = f"{e['text']}  —  {e['count']}x  —  groups: {group_str}"
+
+        if y + line_height * 2 > page.rect.height - 60:
+            page = pdf.new_page()
+            y = margin
+
+        page.insert_text((margin, y + fontsize), line[:100], fontsize=fontsize)
+        y += line_height
+
+        # Links for first 3 groups
+        for gid in e["group_ids"][:3]:
+            source_doc_ids = _get_source_doc_ids(conn, gid)
+            if source_doc_ids:
+                base_id = source_doc_ids[0]
+                docs = get_documents_by_ids(conn, [base_id])
+                if docs:
+                    d = docs[0]
+                    local_path = str(
+                        Path(output_dir) / d.get("source", "unknown")
+                        / d.get("release_batch", "unknown")
+                        / f"{base_id}_merged.pdf"
+                    )
+                    url = d.get("pdf_url") or ""
+                    if y + line_height * 2 > page.rect.height - 60:
+                        page = pdf.new_page()
+                        y = margin
+                    # Local file link
+                    local_label = f"    Local: {local_path}"
+                    page.insert_text((margin + 10, y + fontsize),
+                                     local_label[:90], fontsize=fontsize)
+                    local_width = fitz.get_text_length(local_label[:90], fontsize=fontsize)
+                    page.insert_link({
+                        "kind": fitz.LINK_LAUNCH,
+                        "from": fitz.Rect(margin + 10, y,
+                                          margin + 10 + local_width, y + fontsize + 2),
+                        "file": local_path,
+                    })
+                    y += line_height
+                    # DOJ source URL link
+                    if url:
+                        url_label = f"    Source: {url}"
+                        page.insert_text((margin + 10, y + fontsize),
+                                         url_label[:90], fontsize=fontsize)
+                        url_width = fitz.get_text_length(url_label[:90], fontsize=fontsize)
+                        page.insert_link({
+                            "kind": fitz.LINK_URI,
+                            "from": fitz.Rect(margin + 10, y,
+                                              margin + 10 + url_width, y + fontsize + 2),
+                            "uri": url,
+                        })
+                        y += line_height
+
+        y += line_height * 0.5  # spacing between entities
+
+
+def _get_source_doc_ids(conn, group_id: int) -> list[str]:
+    """Get source_doc_ids for a group from merge_results."""
+    row = conn.execute(
+        "SELECT source_doc_ids FROM merge_results WHERE group_id = ?",
+        (group_id,)
+    ).fetchone()
+    if row and row["source_doc_ids"]:
+        return json.loads(row["source_doc_ids"])
+    return []
+
+
+def generate_summary_pdf(conn, output_dir: str) -> str:
+    """Generate the summary report PDF. Returns the output path."""
+    raw = _collect_raw_entities(conn)
+    aggregated = aggregate_entities(raw)
+
+    # Count total segments
+    groups = get_all_recovery_groups(conn)
+    segment_count = sum(
+        len(json.loads(g["recovered_segments"] or "[]")) for g in groups
+    )
+
+    output_path = str(Path(output_dir) / "summary_report.pdf")
+    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+
+    pdf = fitz.open()
+
+    # Page 1: Title and stats
+    _write_title_page(pdf, conn, len(aggregated), segment_count)
+
+    # Page 2: Top findings
+    _write_top_findings(pdf, aggregated)
+
+    # Category sections
+    for cat_key, cat_label in _CATEGORY_ORDER:
+        cat_entities = [e for e in aggregated if e["category"] == cat_key]
+        if cat_entities:
+            _write_category_section(pdf, cat_label, cat_entities, conn, output_dir)
+
+    pdf.save(output_path)
+    pdf.close()
+    return output_path
