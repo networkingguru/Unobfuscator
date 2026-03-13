@@ -12,19 +12,41 @@ import fitz
 
 from core.db import get_all_recovery_groups, get_documents_by_ids
 
-# Stopwords for people extraction — common legal/geographic phrases
+# Stopwords for people extraction — common legal/geographic/email phrases
 _PEOPLE_STOPWORDS = {
-    "united states", "new york", "district court", "southern district",
-    "northern district", "eastern district", "western district",
-    "palm beach", "this report", "the united", "the honorable",
-    "air france", "royal air", "american express", "flight information",
-    "other information", "hotel information", "travel service",
-    "privacy statement", "entry and exit",
+    # Geographic
+    "united states", "new york", "palm beach", "west palm beach",
+    "south florida", "north florida",
+    # Legal/court
+    "district court", "southern district", "northern district",
+    "eastern district", "western district", "judicial circuit",
+    "this report", "the united", "the honorable",
+    "certificate of service", "trust agreement", "dispositive provisions",
+    "related touhy requests", "deposition attachment",
+    # Travel/business
+    "air france", "royal air", "american express", "american express travel",
+    "flight information", "other information", "hotel information",
+    "travel service", "centurion travel service", "privacy statement",
+    "entry and exit", "economy class", "estimated time",
+    "ticket number", "detail sheet", "airline record locator",
+    "best regards", "original message",
+    # Email date headers (On Mon, On Tue, etc.)
+    "on jan", "on feb", "on mar", "on apr", "on may", "on jun",
+    "on jul", "on aug", "on sep", "on oct", "on nov", "on dec",
+    "on mon", "on tue", "on wed", "on thu", "on fri", "on sat", "on sun",
+    # Time zones / email artifacts
+    "pm edt", "am edt", "pm est", "am est", "pm pst", "am pst",
+    # Technical/data artifacts
+    "incl ticketno", "inquiry regarding", "amlcompliance inquiries",
+    "sec owb", "knight capital", "danya friedman on behalf",
+    "for palm beach county", "judicial circuit in and",
+    "behrend dr ste", "australian ave",
 }
 
 _ORG_SUFFIXES = re.compile(
     r'\b(?:LLC|Inc|Corp|Department|Agency|Bureau|Office|Court|FBI|DOJ|OIG|CIA'
-    r'|Police|Division|Commission|Authority|Association)\b',
+    r'|Police|Division|Commission|Authority|Association|Bank|Trust|Capital'
+    r'|Securities|Group|Partners|Services|Foundation)\b',
     re.IGNORECASE,
 )
 
@@ -119,8 +141,11 @@ def _extract_from_line(text: str) -> list[dict]:
         name = m.group(1) or m.group(2)
         if not name or _is_consumed(m.start(), m.end()):
             continue
-        # Check stopwords
-        if name.lower() in _PEOPLE_STOPWORDS:
+        # Check stopwords — exact match or any stopword is a substring
+        name_lower = name.lower()
+        if name_lower in _PEOPLE_STOPWORDS:
+            continue
+        if any(sw in name_lower for sw in _PEOPLE_STOPWORDS if len(sw) > 5):
             continue
         # Skip single-word matches (regex requires 2+, but verify)
         if len(name.split()) < 2:
