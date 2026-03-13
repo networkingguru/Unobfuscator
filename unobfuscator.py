@@ -156,7 +156,13 @@ def _run_one_cycle(conn, cfg: dict) -> None:
     if not _shutdown_requested:
         _set_activity("Stage 5 Output: generating files")
         logger.info("Stage 5: generating output PDFs")
-        output_count = run_output_generator(conn, output_dir=output_dir, redaction_markers=markers)
+        project_root = Path(__file__).resolve().parent
+        prov_path = str(project_root / "pdf_cache" / "provenance.json")
+        if not os.path.exists(prov_path):
+            prov_path = None
+        output_count = run_output_generator(conn, output_dir=output_dir,
+                                            redaction_markers=markers,
+                                            provenance_path=prov_path)
         logger.info("Stage 5: generated %d output files", output_count)
 
     # Mark pending index jobs done — the cycle already processed all DB state.
