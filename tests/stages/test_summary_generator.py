@@ -55,3 +55,97 @@ def test_get_all_recovery_groups_returns_groups_with_recoveries(conn):
 def test_get_all_recovery_groups_empty_db(conn):
     rows = get_all_recovery_groups(conn)
     assert rows == []
+
+
+# ── Task 2: Entity Extractors ──
+
+from stages.summary_generator import extract_entities
+
+
+def test_extract_people():
+    entities = extract_entities("The passenger list included SARAH KELLEN and others.")
+    people = [e for e in entities if e["category"] == "people"]
+    assert any(e["text"] == "SARAH KELLEN" for e in people)
+
+
+def test_extract_emails():
+    entities = extract_entities("Contact at sarah@example.com for details.")
+    emails = [e for e in entities if e["category"] == "email"]
+    assert any(e["text"] == "sarah@example.com" for e in emails)
+
+
+def test_extract_phones():
+    entities = extract_entities("Call (877) 877-0987 for info.")
+    phones = [e for e in entities if e["category"] == "phone"]
+    assert len(phones) == 1
+
+
+def test_extract_case_numbers():
+    entities = extract_entities("Reference case 72-MM-113327 filed today.")
+    cases = [e for e in entities if e["category"] == "case_number"]
+    assert any("72-MM-113327" in e["text"] for e in cases)
+
+
+def test_extract_organizations():
+    entities = extract_entities("Filed with the Department of Justice today.")
+    orgs = [e for e in entities if e["category"] == "organization"]
+    assert any("Department of Justice" in e["text"] for e in orgs)
+
+
+def test_no_double_counting_email_as_name():
+    """Email addresses should not also be extracted as people names."""
+    entities = extract_entities("From: Sarah Kellen <sarah@example.com>")
+    names = [e["text"] for e in entities if e["category"] == "people"]
+    assert "Sarah Kellen" in names
+    # The email should be in email category, not duplicated as a name
+    email_texts = [e["text"] for e in entities if e["category"] == "email"]
+    assert "sarah@example.com" in email_texts
+
+
+def test_people_stopwords_excluded():
+    entities = extract_entities("The United States District Court ruled today.")
+    people = [e for e in entities if e["category"] == "people"]
+    people_texts = [e["text"] for e in people]
+    assert "United States" not in people_texts
+    assert "District Court" not in people_texts
+
+
+def test_short_junk_skipped():
+    entities = extract_entities(")OOO{XXXXX")
+    assert len(entities) == 0
+
+
+def test_block_chars_stripped():
+    entities = extract_entities("████████ some real content here")
+    # Should not crash; block chars stripped before extraction
+    for e in entities:
+        assert "█" not in e["text"]
+
+
+def test_multi_category_from_single_segment():
+    """A segment with both a name and phone should produce entities in both categories."""
+    entities = extract_entities("Contact SARAH KELLEN at (877) 877-0987")
+    categories = {e["category"] for e in entities}
+    assert "people" in categories
+    assert "phone" in categories
+
+
+def test_multiline_segment_extracted_per_line():
+    """Newlines should not cause cross-line false matches."""
+    entities = extract_entities("SARAH KELLEN\n(877) 877-0987\ntest@example.com")
+    categories = {e["category"] for e in entities}
+    assert "people" in categories
+    assert "phone" in categories
+    assert "email" in categories
+
+
+def test_phone_dot_separator():
+    entities = extract_entities("Call 877.877.0987 today.")
+    phones = [e for e in entities if e["category"] == "phone"]
+    assert len(phones) == 1
+
+
+def test_phone_bare_digits():
+    entities = extract_entities("Call 8778770987 today.")
+    phones = [e for e in entities if e["category"] == "phone"]
+    assert len(phones) == 1
