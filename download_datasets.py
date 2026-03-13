@@ -9,6 +9,7 @@ Usage:
     python download_datasets.py [--cache-dir ./pdf_cache] [--dry-run]
 """
 
+import hashlib
 import json
 import logging
 import os
@@ -286,7 +287,6 @@ def main(cache_dir: str, dry_run: bool):
 
         # Verify SHA-256 if available
         if ds.get("sha256"):
-            import hashlib
             sha = hashlib.sha256()
             with open(zip_path, "rb") as f:
                 for block in iter(lambda: f.read(1_048_576), b""):

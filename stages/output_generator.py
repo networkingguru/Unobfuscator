@@ -168,7 +168,7 @@ def generate_output_pdf(
                 prov_data = _load_provenance(provenance_path)
                 if dataset_num in prov_data:
                     provenance_label = prov_data[dataset_num].get("source_label")
-            except (ValueError, Exception):
+            except Exception:
                 pass
 
     output_path = build_output_path(
