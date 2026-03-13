@@ -29,6 +29,7 @@ from stages.matcher import (
 from stages.merger import run_merger
 from stages.pdf_processor import process_pdf_for_document
 from stages.output_generator import run_output_generator
+from stages.summary_generator import generate_summary_pdf
 
 console = Console()
 logger = logging.getLogger(__name__)
@@ -514,6 +515,22 @@ def config_set(ctx, key, value):
     conn.commit()
     conn.close()
     console.print(f"[green]Config set: {key} = {value}[/green]")
+
+
+@cli.command()
+@click.pass_context
+def summary(ctx):
+    """Generate a summary PDF report of all recovered entities."""
+    cfg = load_config(ctx.obj["config_path"])
+    db_path = cfg_get(cfg, "db_path", default="./data/unobfuscator.db")
+    output_dir = cfg_get(cfg, "output_dir", default="./output")
+    if not os.path.exists(db_path):
+        console.print("[red]Database not found. Run 'unobfuscator start' first.[/red]")
+        return
+    conn = get_connection(db_path)
+    console.print("[dim]Generating summary report...[/dim]")
+    path = generate_summary_pdf(conn, output_dir)
+    console.print(f"[green]Summary report written to {path}[/green]")
 
 
 if __name__ == "__main__":
