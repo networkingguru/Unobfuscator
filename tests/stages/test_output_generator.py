@@ -123,3 +123,32 @@ def test_generate_output_pdf_marks_output_generated(conn, output_dir):
         "SELECT output_generated FROM merge_results WHERE group_id = ?", (g,)
     ).fetchone()
     assert row["output_generated"] == 1
+
+
+def test_metadata_page_includes_provenance_notice(conn, output_dir, tmp_path):
+    """Documents from non-DOJ sources should show provenance on metadata page."""
+    segments = [{"text": "secret name", "source_doc_id": 2, "stage": "merge"}]
+    g = seed_group(conn,
+                   base_text="Some text with [REDACTED] in it.",
+                   merged_text="Some text with secret name in it.",
+                   recovered_count=1, segments=segments,
+                   batch="VOL00008")
+
+    # Write provenance file
+    prov_path = str(tmp_path / "provenance.json")
+    with open(prov_path, "w") as f:
+        json.dump({"8": {
+            "source_label": "Source: Community mirror (GeekenDev) — DOJ original unavailable",
+            "source_type": "community-mirror:geeken",
+        }}, f)
+
+    path = generate_output_pdf(conn, g, output_dir, ["[REDACTED]"],
+                               provenance_path=prov_path)
+    assert path is not None
+
+    # Search all pages for provenance text (metadata may span pages)
+    doc = fitz.open(path)
+    full_text = "".join(page.get_text() for page in doc)
+    assert "Community mirror (GeekenDev)" in full_text
+    assert "DOJ original unavailable" in full_text
+    doc.close()

@@ -230,13 +230,15 @@ def get_merge_result(conn, group_id: int) -> Optional[dict]:
 def get_documents_by_ids(conn, doc_ids: list[str]) -> list[dict]:
     if not doc_ids:
         return []
-    placeholders = ",".join("?" * len(doc_ids))
+    # Coerce IDs to str to match TEXT PRIMARY KEY column type
+    str_ids = [str(d) for d in doc_ids]
+    placeholders = ",".join("?" * len(str_ids))
     rows = conn.execute(
         f"SELECT id, source, release_batch, original_filename, extracted_text, pdf_url "
-        f"FROM documents WHERE id IN ({placeholders})", doc_ids
+        f"FROM documents WHERE id IN ({placeholders})", str_ids
     ).fetchall()
     by_id = {r["id"]: dict(r) for r in rows}
-    return [by_id[did] for did in doc_ids if did in by_id]
+    return [by_id[sid] for sid in str_ids if sid in by_id]
 
 
 def mark_output_generated(conn, group_id: int) -> None:

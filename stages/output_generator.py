@@ -13,6 +13,7 @@ Logic reference: PIPELINE.md — Phase 6
 """
 
 import json
+import os
 from datetime import date
 from pathlib import Path
 from typing import Optional
@@ -119,11 +120,20 @@ def _write_section_header(pdf: fitz.Document, title: str) -> fitz.Page:
     return page
 
 
+def _load_provenance(path: str) -> dict:
+    """Load provenance data from JSON. Returns empty dict if file missing."""
+    if path and os.path.exists(path):
+        with open(path) as f:
+            return json.load(f)
+    return {}
+
+
 def generate_output_pdf(
     conn,
     group_id: int,
     output_dir: str,
     redaction_markers: list[str],
+    provenance_path: str = None,
 ) -> Optional[str]:
     """Generate a highlighted output PDF for a merge group.
 
@@ -147,6 +157,19 @@ def generate_output_pdf(
     # source_docs[0] is the base (destination), rest are donors
     base_doc = source_docs[0] if source_docs else {}
     donor_docs = source_docs[1:] if len(source_docs) > 1 else []
+
+    # Check provenance for non-DOJ sources
+    provenance_label = None
+    if provenance_path:
+        batch = base_doc.get("release_batch", "")
+        if batch.startswith("VOL"):
+            try:
+                dataset_num = str(int(batch[3:]))  # VOL00008 → "8"
+                prov_data = _load_provenance(provenance_path)
+                if dataset_num in prov_data:
+                    provenance_label = prov_data[dataset_num].get("source_label")
+            except (ValueError, Exception):
+                pass
 
     output_path = build_output_path(
         output_dir,
@@ -199,7 +222,8 @@ def generate_output_pdf(
     # ── SECTION 3: METADATA ──
     _write_metadata_page(
         pdf, base_doc, donor_docs,
-        recovered_count, soft_recovered_count
+        recovered_count, soft_recovered_count,
+        provenance_label=provenance_label,
     )
 
     pdf.save(output_path)
@@ -215,6 +239,7 @@ def _write_metadata_page(
     donor_docs: list[dict],
     recovered_count: int,
     soft_recovered_count: int,
+    provenance_label: str = None,
 ) -> None:
     """Write the final metadata page with links and stats."""
     page = pdf.new_page()
@@ -245,6 +270,11 @@ def _write_metadata_page(
     write("=" * 70)
     write("")
 
+    if provenance_label:
+        write("")
+        write(f"\u26a0 {provenance_label}")
+        write("")
+
     # Destination document
     base_url = base_doc.get("pdf_url") or ""
     write("DESTINATION DOCUMENT (redacted):")
@@ -269,11 +299,13 @@ def _write_metadata_page(
     write("=" * 70)
 
 
-def run_output_generator(conn, output_dir: str, redaction_markers: list[str]) -> int:
+def run_output_generator(conn, output_dir: str, redaction_markers: list[str],
+                         provenance_path: str = None) -> int:
     """Generate output PDFs for all pending merge results. Returns count generated."""
     count = 0
     for row in get_pending_output_groups(conn):
-        path = generate_output_pdf(conn, row["group_id"], output_dir, redaction_markers)
+        path = generate_output_pdf(conn, row["group_id"], output_dir, redaction_markers,
+                                   provenance_path=provenance_path)
         if path:
             count += 1
     conn.commit()
