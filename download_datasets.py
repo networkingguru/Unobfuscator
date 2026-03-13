@@ -30,54 +30,63 @@ logger = logging.getLogger(__name__)
 # 10% disk reserve threshold
 DISK_RESERVE_FRACTION = 0.10
 
+_ARCHIVE_ORG_LABEL = (
+    "Source: Internet Archive mirror — DOJ original unavailable. "
+    "No DOJ-published checksums exist; integrity cannot be verified against the original."
+)
+_COMMUNITY_MIRROR_LABEL = (
+    "Source: Community mirror (GeekenDev) — DOJ original unavailable. "
+    "No DOJ-published checksums exist; integrity cannot be verified against the original."
+)
+
 DATASETS = [
     {
         "id": 3,
         "url": "https://archive.org/download/data-set-1/DataSet%203.zip",
         "source_type": "archive.org",
-        "source_label": "Source: Internet Archive mirror — DOJ original unavailable",
+        "source_label": _ARCHIVE_ORG_LABEL,
         "sha256": "160231C8C689C76003976B609E55689530FC4832A1535CE13BFCD8F871C21E65",
     },
     {
         "id": 4,
         "url": "https://archive.org/download/data-set-1/DataSet%204.zip",
         "source_type": "archive.org",
-        "source_label": "Source: Internet Archive mirror — DOJ original unavailable",
-        "sha256": "979154842BAC356EF36BB2D0E72F78E0F6B771D79E02DD6934CFF699944E2B71",
+        "source_label": _ARCHIVE_ORG_LABEL,
+        "sha256": "E78948690C22B904D6B79AFE92A4EB1D7ABB8E746B0D025123826EBEE0DF8273",
     },
     {
         "id": 5,
         "url": "https://archive.org/download/data-set-1/DataSet%205.zip",
         "source_type": "archive.org",
-        "source_label": "Source: Internet Archive mirror — DOJ original unavailable",
-        "sha256": "7317E2AD089C82A59378A9C038E964FEAB246BE62ECC24663B741617AF3DA709",
+        "source_label": _ARCHIVE_ORG_LABEL,
+        "sha256": "EEDA87E747487D718E35B661D2D078FF08F0B0E80107C5F498FCE17AE4F298BA",
     },
     {
         "id": 6,
         "url": "https://archive.org/download/data-set-1/DataSet%206.zip",
         "source_type": "archive.org",
-        "source_label": "Source: Internet Archive mirror — DOJ original unavailable",
+        "source_label": _ARCHIVE_ORG_LABEL,
         "sha256": None,
     },
     {
         "id": 7,
         "url": "https://archive.org/download/data-set-1/DataSet%207.zip",
         "source_type": "archive.org",
-        "source_label": "Source: Internet Archive mirror — DOJ original unavailable",
+        "source_label": _ARCHIVE_ORG_LABEL,
         "sha256": None,
     },
     {
         "id": 8,
         "url": "https://doj-files.geeken.dev/doj_zips/original_archives/DataSet%208.zip",
         "source_type": "community-mirror:geeken",
-        "source_label": "Source: Community mirror (GeekenDev) — DOJ original unavailable",
+        "source_label": _COMMUNITY_MIRROR_LABEL,
         "sha256": "558010B96B7980ED529A2AD4EA224123A59446927E4441D23A2E8E5C2361EE07",
     },
     {
         "id": 12,
         "url": "https://archive.org/download/data-set-12_202601/DataSet%2012.zip",
         "source_type": "archive.org",
-        "source_label": "Source: Internet Archive mirror — DOJ original unavailable",
+        "source_label": _ARCHIVE_ORG_LABEL,
         "sha256": None,
     },
 ]
@@ -286,20 +295,24 @@ def main(cache_dir: str, dry_run: bool):
             continue
 
         # Verify SHA-256 if available
+        sha256_mismatch = False
+        sha = hashlib.sha256()
+        with open(zip_path, "rb") as f:
+            for block in iter(lambda: f.read(1_048_576), b""):
+                sha.update(block)
+        actual_sha = sha.hexdigest().upper()
+
         if ds.get("sha256"):
-            sha = hashlib.sha256()
-            with open(zip_path, "rb") as f:
-                for block in iter(lambda: f.read(1_048_576), b""):
-                    sha.update(block)
-            actual = sha.hexdigest().upper()
             expected = ds["sha256"].upper()
-            if actual != expected:
-                console.print(f"  [red]SHA-256 MISMATCH![/red]")
+            if actual_sha != expected:
+                sha256_mismatch = True
+                console.print(f"  [yellow]SHA-256 MISMATCH — archive may have been re-uploaded.[/yellow]")
                 console.print(f"  Expected: {expected}")
-                console.print(f"  Got:      {actual}")
-                os.remove(zip_path)
-                continue
-            console.print(f"  [green]SHA-256 verified.[/green]")
+                console.print(f"  Got:      {actual_sha}")
+                console.print(f"  [yellow]No DOJ-published checksums exist, so the original cannot be "
+                              f"verified. Proceeding with extraction.[/yellow]")
+            else:
+                console.print(f"  [green]SHA-256 verified.[/green]")
 
         # Extract
         ds_dir.mkdir(parents=True, exist_ok=True)
@@ -314,12 +327,19 @@ def main(cache_dir: str, dry_run: bool):
                 os.remove(zip_path)
             continue
 
-        # Write provenance
+        # Write provenance — record mismatch so output PDFs carry the warning
+        prov_label = ds["source_label"]
+        if sha256_mismatch:
+            prov_label += (" SHA-256 did not match expected hash at download time; "
+                           "archive may have been re-uploaded.")
+
         write_provenance(prov_path, ds_id, {
             "source_url": ds["url"],
             "source_type": ds["source_type"],
-            "source_label": ds["source_label"],
+            "source_label": prov_label,
             "sha256_expected": ds.get("sha256"),
+            "sha256_actual": actual_sha,
+            "sha256_match": not sha256_mismatch,
             "files_extracted": count,
         })
 

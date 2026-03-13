@@ -9,13 +9,28 @@ Logic reference: PIPELINE.md — Phase 5
 
 import json
 import logging
+import os
 import fitz  # PyMuPDF
 import httpx
+from pathlib import Path
 from typing import Optional
 from core.db import get_doc_group, get_document_for_pdf, append_soft_redaction_text, mark_pdf_processed
 from core.queue import enqueue
 
 logger = logging.getLogger(__name__)
+
+_AGE_VERIFY_COOKIE = ("justiceGovAgeVerified", "true")
+_CACHE_DIR = Path(__file__).resolve().parent.parent / "pdf_cache"
+
+
+def _download_pdf(url: str) -> httpx.Response:
+    """Download a PDF, handling the DOJ age-verification gate if needed."""
+    cookies = {}
+    if "justice.gov" in url:
+        cookies[_AGE_VERIFY_COOKIE[0]] = _AGE_VERIFY_COOKIE[1]
+    response = httpx.get(url, timeout=30, follow_redirects=True, cookies=cookies)
+    response.raise_for_status()
+    return response
 
 
 def extract_soft_redactions(pdf_bytes: bytes) -> list[dict]:
@@ -65,13 +80,27 @@ def process_pdf_for_document(conn, doc_id: int) -> None:
     if not doc or not doc["pdf_url"]:
         return  # No PDF URL — skip silently
 
-    try:
-        response = httpx.get(doc["pdf_url"], timeout=30)
-        response.raise_for_status()
-        pdf_bytes = response.content
-    except Exception as e:
-        logger.warning("Failed to download PDF for doc %s (%s): %s", doc_id, doc.get("pdf_url"), e)
-        return  # Network failure — will be retried by the job queue on next run
+    # Check local pdf_cache before downloading from the network.
+    # Cached files live at pdf_cache/{release_batch}/{original_filename}.
+    pdf_bytes = None
+    batch = doc.get("release_batch", "")
+    filename = doc.get("original_filename", "")
+    if batch and filename:
+        local_path = _CACHE_DIR / batch / filename
+        if local_path.is_file():
+            pdf_bytes = local_path.read_bytes()
+            logger.debug("Loaded PDF from local cache: %s", local_path)
+
+    if pdf_bytes is None:
+        try:
+            response = _download_pdf(doc["pdf_url"])
+            pdf_bytes = response.content
+        except Exception as e:
+            logger.warning("Failed to download PDF for doc %s (%s): %s", doc_id, doc.get("pdf_url"), e)
+            # Mark as processed so permanently broken URLs don't block the queue.
+            # If the URL becomes available later, reset pdf_processed via a manual query.
+            mark_pdf_processed(conn, doc_id)
+            return
 
     soft_redactions = extract_soft_redactions(pdf_bytes)
 

@@ -139,9 +139,23 @@ def run_phase2_lsh_candidates(
     Only queries docs that contain redaction markers (since pairs of clean docs
     can't produce any recoveries). This dramatically reduces candidate count.
     Returns list of (doc_id_a, doc_id_b) candidate pairs for Phase 3 verification.
+
+    Skips the expensive LSH rebuild when the fingerprint count and group count
+    haven't changed since the last run (nothing new to match).
     """
     import logging
+    from core.db import get_config, set_config
     logger = logging.getLogger(__name__)
+
+    # Skip if nothing has changed since the last LSH run
+    fp_count = conn.execute("SELECT COUNT(*) FROM document_fingerprints").fetchone()[0]
+    group_count = conn.execute("SELECT COUNT(*) FROM match_group_members").fetchone()[0]
+    last_fp_count = get_config(conn, "lsh_last_fp_count", default=0)
+    last_group_count = get_config(conn, "lsh_last_group_count", default=0)
+    if fp_count == last_fp_count and group_count == last_group_count and fp_count > 0:
+        logger.info("Skipping LSH rebuild — no new fingerprints or groups since last run "
+                     "(%d fingerprints, %d group members)", fp_count, group_count)
+        return []
 
     fingerprints = load_fingerprints(conn, num_perm=num_perm)
     if len(fingerprints) < 2:
@@ -198,6 +212,12 @@ def run_phase2_lsh_candidates(
                 candidates.append(pair)
 
     logger.info("LSH produced %d candidate pairs", len(candidates))
+
+    # Remember current counts so we can skip the rebuild next cycle if nothing changed
+    set_config(conn, "lsh_last_fp_count", fp_count)
+    set_config(conn, "lsh_last_group_count", group_count)
+    conn.commit()
+
     return candidates
 
 

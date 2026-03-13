@@ -145,8 +145,7 @@ def _run_one_cycle(conn, cfg: dict) -> None:
         run_merger(conn, redaction_markers=markers)
 
     if not _shutdown_requested:
-        pdf_limit = cfg_get(cfg, "workers.pdf", default=2)
-        pdf_docs = get_pending_pdf_documents(conn, limit=pdf_limit)
+        pdf_docs = get_pending_pdf_documents(conn, limit=-1)
         for i, pdf_doc in enumerate(pdf_docs, 1):
             if _shutdown_requested:
                 break
@@ -293,7 +292,10 @@ def start(ctx, foreground):
         while not _shutdown_requested:
             _run_one_cycle(conn, cfg)
             stats = get_queue_stats(conn)
-            if stats.get("pending", 0) == 0 and not _shutdown_requested:
+            pending_pdfs = conn.execute(
+                "SELECT COUNT(*) FROM documents WHERE pdf_processed = 0 AND pdf_url IS NOT NULL"
+            ).fetchone()[0]
+            if stats.get("pending", 0) == 0 and pending_pdfs == 0 and not _shutdown_requested:
                 _set_activity("Polling for new batches")
                 poll_ok = _poll_for_new_batches(conn, cfg)
                 wait = poll_interval if poll_ok else retry_interval
