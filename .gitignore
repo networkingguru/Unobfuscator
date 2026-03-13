@@ -1,4 +1,7 @@
 data/
+pdf_cache/
+output/
+*.part
 __pycache__/
 *.pyc
 *.pyo
