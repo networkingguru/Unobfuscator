@@ -297,3 +297,14 @@ def reset_group_merged(conn, group_id: int) -> None:
     conn.execute(
         "UPDATE match_groups SET merged = 0 WHERE group_id = ?", (group_id,)
     )
+
+
+def get_all_recovery_groups(conn) -> list[dict]:
+    """Return all merge results that have at least one recovery."""
+    rows = conn.execute("""
+        SELECT group_id, recovered_count, total_redacted,
+               recovered_segments, source_doc_ids
+        FROM merge_results
+        WHERE recovered_count > 0
+    """).fetchall()
+    return [dict(r) for r in rows]
