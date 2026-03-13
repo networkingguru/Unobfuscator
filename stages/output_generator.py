@@ -73,16 +73,40 @@ def _insert_text_multipage(pdf: fitz.Document, text: str, fontsize: int = 10) ->
 
 
 def _apply_highlights(page: fitz.Page, texts: list[str], color: tuple) -> None:
-    """Highlight occurrences of each text string on the page."""
+    """Highlight occurrences of each text string on the page.
+
+    Splits multi-line recovered text into individual lines and searches for
+    each line separately, since search_for works within contiguous text runs.
+    Deduplicates search strings and rects to avoid double-annotating.
+    Strips block-redaction characters (█■) since they render as dots in PDFs.
+    """
+    highlighted_rects: set[tuple] = set()
+    seen_searches: set[str] = set()
     for text in texts:
         text = text.strip()
         if not text:
             continue
-        search_text = text[:70]
-        for rect in page.search_for(search_text):
-            annot = page.add_highlight_annot(rect)
-            annot.set_colors(stroke=color)
-            annot.update()
+        for line in text.split("\n"):
+            line = line.strip()
+            if not line:
+                continue
+            # Strip block chars that don't survive insert_text rendering
+            clean_line = line.replace("█", "").replace("■", "").strip()
+            if len(clean_line) < 4:
+                continue
+            search_text = clean_line[:70]
+            if search_text in seen_searches:
+                continue
+            seen_searches.add(search_text)
+            for rect in page.search_for(search_text):
+                rect_key = (round(rect.x0, 1), round(rect.y0, 1),
+                            round(rect.x1, 1), round(rect.y1, 1))
+                if rect_key in highlighted_rects:
+                    continue
+                highlighted_rects.add(rect_key)
+                annot = page.add_highlight_annot(rect)
+                annot.set_colors(stroke=color)
+                annot.update()
 
 
 def _write_section_header(pdf: fitz.Document, title: str) -> fitz.Page:

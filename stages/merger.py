@@ -161,6 +161,9 @@ def _is_real_recovery(text: str, redaction_markers: list[str]) -> bool:
         return False
 
     # Block characters and X-runs — strip them and check if anything real remains
+    block_count = sum(1 for c in stripped if c in '█■')
+    if block_count > 0 and block_count / len(stripped) > 0.10:
+        return False
     clean = re.sub(r'[█■]+', '', stripped).strip()
     # Also strip punctuation wrappers: <>, (), "", etc.
     clean_alpha = re.sub(r'[<>()"\'\s,;:+\-]+', '', clean).strip()
