@@ -94,9 +94,9 @@ def test_generate_output_pdf_footnote_has_sources_and_recovery_method(conn, outp
                                redaction_markers=["[REDACTED]"])
     doc = fitz.open(path)
     last_page_text = doc[-1].get_text()
-    assert "SOURCES" in last_page_text
+    assert "SOURCE DOCUMENT" in last_page_text
     assert "Unobfuscator" in last_page_text
-    assert "Recovery method" in last_page_text
+    assert "Method:" in last_page_text
     doc.close()
 
 

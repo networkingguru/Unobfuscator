@@ -16,7 +16,7 @@ from typing import Optional
 from core.db import (
     init_db, get_connection, get_known_batch_ids, insert_release_batch,
     get_pending_pdf_documents, get_documents_by_ids, reset_group_merged,
-    set_config, get_config
+    set_config, get_config, get_unindexed_batch_ids, mark_batch_fully_indexed
 )
 from core.config import load_config, get as cfg_get
 from core.api import fetch_release_batches, fetch_person_document_ids
@@ -80,20 +80,38 @@ def _run_one_cycle(conn, cfg: dict) -> None:
     if _shutdown_requested:
         return
 
-    batch_ids = get_known_batch_ids(conn)
+    batch_ids = get_unindexed_batch_ids(conn)
     for i, batch_id in enumerate(batch_ids, 1):
         if _shutdown_requested:
             return
         _set_activity(f"Stage 1 Indexer: batch {i}/{len(batch_ids)} ({batch_id})")
         run_indexer_batch(conn, batch_id=batch_id, redaction_markers=markers)
+        mark_batch_fully_indexed(conn, batch_id)
+        conn.commit()
 
     if _shutdown_requested:
         return
 
-    _set_activity("Stage 2 Matcher: email fastpath")
-    run_phase0_email_fastpath(conn, min_header_matches=min_headers)
+    # Phase 0 email fastpath: only run if new docs have been added since last run.
+    last_phase0_count = get_config(conn, "phase0_doc_count", default=0)
+    current_count = conn.execute("SELECT COUNT(*) FROM documents").fetchone()[0]
+    if current_count > last_phase0_count:
+        _set_activity("Stage 2 Matcher: email fastpath")
+        logger.info("Stage 2: starting email fastpath (%d new docs since last run)",
+                     current_count - last_phase0_count)
+        matched = run_phase0_email_fastpath(conn, min_header_matches=min_headers)
+        logger.info("Stage 2: email fastpath matched %d docs", len(matched))
+        set_config(conn, "phase0_doc_count", current_count)
+        conn.commit()
+    else:
+        logger.info("Stage 2: skipping email fastpath (no new docs)")
+
     _set_activity("Stage 2 Matcher: LSH candidates")
-    candidates = run_phase2_lsh_candidates(conn, threshold=threshold)
+    logger.info("Stage 2: building LSH index")
+    candidates = run_phase2_lsh_candidates(conn, threshold=threshold,
+                                            redaction_markers=markers)
+    logger.info("Stage 2: LSH found %d candidate pairs", len(candidates))
+
     _set_activity(f"Stage 2 Matcher: verifying {len(candidates)} candidates")
     run_phase3_verify_and_group(conn, candidates, redaction_markers=markers,
                                 min_overlap_chars=min_overlap)
@@ -102,7 +120,9 @@ def _run_one_cycle(conn, cfg: dict) -> None:
         return
 
     _set_activity("Stage 3 Merger: merging groups")
-    run_merger(conn, redaction_markers=markers)
+    logger.info("Stage 3: starting merger")
+    merged_count = run_merger(conn, redaction_markers=markers)
+    logger.info("Stage 3: merged %d groups", merged_count)
 
     # Process any pending merge queue jobs (e.g., from soft-redaction discoveries).
     merge_job = dequeue(conn, stage="merge")
@@ -134,7 +154,9 @@ def _run_one_cycle(conn, cfg: dict) -> None:
 
     if not _shutdown_requested:
         _set_activity("Stage 5 Output: generating files")
-        run_output_generator(conn, output_dir=output_dir, redaction_markers=markers)
+        logger.info("Stage 5: generating output PDFs")
+        output_count = run_output_generator(conn, output_dir=output_dir, redaction_markers=markers)
+        logger.info("Stage 5: generated %d output files", output_count)
 
     # Mark pending index jobs done — the cycle already processed all DB state.
     index_job = dequeue(conn, stage="index")
@@ -213,7 +235,7 @@ def start(ctx, foreground):
         Path(log_path).parent.mkdir(parents=True, exist_ok=True)
         log_fh = open(log_path, "a")
         proc = subprocess.Popen(
-            [sys.executable, __file__, "--config", ctx.obj["config_path"], "start"],
+            [sys.executable, __file__, "--config", ctx.obj["config_path"], "start", "--foreground"],
             stdout=log_fh,
             stderr=log_fh,
             stdin=subprocess.DEVNULL,

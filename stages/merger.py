@@ -3,8 +3,31 @@
 Logic reference: PIPELINE.md — Phase 4 (Merging)
 """
 
+import re
 from typing import Optional
 from core.db import upsert_merge_result
+
+
+def _normalize_for_anchor(text: str) -> str:
+    """Normalize text for anchor matching by stripping formatting differences.
+
+    Different OCR/extraction passes may produce Markdown tables, headers, etc.
+    while others produce plain text. This strips those differences so anchors
+    can match across formatting variants.
+    """
+    # Strip Markdown table separators and pipes
+    text = re.sub(r'\|[-—–]+\|', ' ', text)
+    text = re.sub(r'[-—–]{3,}', ' ', text)
+    text = text.replace('|', ' ')
+    # Strip Markdown headers
+    text = re.sub(r'^#{1,6}\s+', '', text, flags=re.MULTILINE)
+    # Strip bold/italic markers
+    text = text.replace('**', '').replace('__', '').replace('*', '')
+    # Strip list markers
+    text = re.sub(r'^\s*[-•*]\s+', '', text, flags=re.MULTILINE)
+    # Collapse whitespace
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text
 
 
 def find_redaction_positions(text: str, redaction_markers: list[str]) -> list[tuple[int, str]]:
@@ -21,14 +44,34 @@ def find_redaction_positions(text: str, redaction_markers: list[str]) -> list[tu
     return sorted(positions, key=lambda x: x[0])
 
 
-def extract_anchors(text: str, pos: int, marker_len: int, length: int = 50) -> tuple[str, str]:
+def extract_anchors(
+    text: str, pos: int, marker_len: int, length: int = 50,
+    redaction_markers: list[str] = None
+) -> tuple[str, str]:
     """Return (left_anchor, right_anchor) of up to `length` chars each around a redaction.
 
     left_anchor: up to `length` chars immediately before pos.
     right_anchor: up to `length` chars immediately after pos + marker_len.
+
+    If redaction_markers is provided, anchors are truncated at any embedded
+    redaction marker (since those won't appear in donor text that has real content).
     """
     left_anchor = text[max(0, pos - length):pos].strip()
     right_anchor = text[pos + marker_len:pos + marker_len + length].strip()
+
+    if redaction_markers:
+        # Truncate left anchor: keep only text AFTER the last redaction marker
+        for m in redaction_markers:
+            idx = left_anchor.rfind(m)
+            if idx >= 0:
+                left_anchor = left_anchor[idx + len(m):].strip()
+
+        # Truncate right anchor: keep only text BEFORE the first redaction marker
+        for m in redaction_markers:
+            idx = right_anchor.find(m)
+            if idx >= 0:
+                right_anchor = right_anchor[:idx].strip()
+
     return left_anchor, right_anchor
 
 
@@ -38,9 +81,44 @@ def find_text_between_anchors(
     """Search text for left_anchor, then find right_anchor after it.
 
     Returns the text between them if both anchors are found, else None.
+    First tries exact matching, then normalized matching, then progressively
+    shorter anchors for cross-format compatibility.
     """
+    result = _find_between_exact(text, left_anchor, right_anchor)
+    if result is not None:
+        return result
+
+    # Fallback: normalize both text and anchors to handle formatting differences
+    norm_text = _normalize_for_anchor(text)
+    norm_left = _normalize_for_anchor(left_anchor)
+    norm_right = _normalize_for_anchor(right_anchor)
+    result = _find_between_exact(norm_text, norm_left, norm_right)
+    if result is not None:
+        return result
+
+    # Progressive shortening: drop words from outer edges of each anchor
+    # until we find a match, but keep at least 3 words per anchor
+    left_words = norm_left.split()
+    right_words = norm_right.split()
+    min_words = 3
+
+    for drop in range(1, max(len(left_words), len(right_words)) - min_words + 1):
+        shortened_left = " ".join(left_words[drop:]) if len(left_words) > min_words + drop - 1 else norm_left
+        shortened_right = " ".join(right_words[:-drop]) if len(right_words) > min_words + drop - 1 else norm_right
+        if shortened_left == norm_left and shortened_right == norm_right:
+            continue
+        result = _find_between_exact(norm_text, shortened_left, shortened_right)
+        if result is not None and len(result) < 2000:  # sanity check on recovered length
+            return result
+
+    return None
+
+
+def _find_between_exact(
+    text: str, left_anchor: str, right_anchor: str
+) -> Optional[str]:
+    """Exact string search for text between two anchors."""
     if not left_anchor:
-        # No left anchor — look for right anchor from start
         right_pos = text.find(right_anchor)
         if right_pos == -1:
             return None
@@ -56,6 +134,71 @@ def find_text_between_anchors(
         return None
 
     return text[search_from:right_pos].strip()
+
+
+def _is_real_recovery(text: str, redaction_markers: list[str]) -> bool:
+    """Return True only if the recovered text contains genuinely new content.
+
+    Rejects:
+    - Other redaction markers or case variants
+    - Block redaction characters (█, X runs, ■ runs)
+    - Pure formatting artifacts (table separators, markdown headers, HTML tags)
+    - Generic placeholder text (Redacted, Unspecified, etc.)
+    - Very short or whitespace-only text
+    """
+    stripped = text.strip()
+    if len(stripped) < 2:
+        return False
+
+    # Check against known redaction markers (case-insensitive)
+    lower = stripped.lower()
+    for m in redaction_markers:
+        if m.lower() in lower:
+            return False
+
+    # Escaped redaction markers like \[Redacted\]
+    if "\\[" in stripped and "redact" in lower:
+        return False
+
+    # Block characters and X-runs — strip them and check if anything real remains
+    clean = re.sub(r'[█■]+', '', stripped).strip()
+    # Also strip punctuation wrappers: <>, (), "", etc.
+    clean_alpha = re.sub(r'[<>()"\'\s,;:+\-]+', '', clean).strip()
+    if len(clean_alpha) < 4:
+        return False
+
+    # Any text that contains "redact" in any form
+    if "redact" in lower:
+        return False
+
+    # Generic placeholders
+    placeholders = {
+        "unspecified", "recipient name", "sender name",
+        "name redacted", "n/a", "unknown", "withheld",
+    }
+    if lower in placeholders:
+        return False
+
+    # Pure formatting artifacts
+    formatting_only = re.sub(r'[-—–|#*_:\s\\]+', '', stripped)
+    if not formatting_only:
+        return False
+
+    # Lone HTML tags
+    if re.match(r'^</?[a-z]+/?>$', stripped, re.IGNORECASE):
+        return False
+
+    # Table column headers / generic labels that aren't real content
+    if lower in {"item", "description", "field", "value", "date", "details",
+                 "name", "notes", "type", "status", "number", "e-ticket number",
+                 "category", "[blank]", "blank", "(usanys)"}:
+        return False
+
+    # Very short text that's just a year or generic word
+    if re.match(r'^\d{4}$', stripped):
+        return False
+
+    return True
 
 
 def merge_group(
@@ -98,11 +241,11 @@ def merge_group(
 
     # Process in reverse order so string positions remain valid after substitution
     for pos, marker in reversed(positions):
-        left_anchor, right_anchor = extract_anchors(base_text, pos, len(marker), anchor_length)
+        left_anchor, right_anchor = extract_anchors(base_text, pos, len(marker), anchor_length, redaction_markers)
 
         for donor_id, donor_text in donors:
             recovered = find_text_between_anchors(donor_text, left_anchor, right_anchor)
-            if recovered and recovered not in redaction_markers and len(recovered) > 0:
+            if recovered and _is_real_recovery(recovered, redaction_markers):
                 merged = merged[:pos] + recovered + merged[pos + len(marker):]
                 recovered_count += 1
                 recovered_segments.append({

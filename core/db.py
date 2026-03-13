@@ -232,10 +232,11 @@ def get_documents_by_ids(conn, doc_ids: list[str]) -> list[dict]:
         return []
     placeholders = ",".join("?" * len(doc_ids))
     rows = conn.execute(
-        f"SELECT id, source, release_batch, original_filename, extracted_text "
+        f"SELECT id, source, release_batch, original_filename, extracted_text, pdf_url "
         f"FROM documents WHERE id IN ({placeholders})", doc_ids
     ).fetchall()
-    return [dict(r) for r in rows]
+    by_id = {r["id"]: dict(r) for r in rows}
+    return [by_id[did] for did in doc_ids if did in by_id]
 
 
 def mark_output_generated(conn, group_id: int) -> None:
@@ -267,6 +268,21 @@ def get_known_batch_ids(conn) -> set:
     return {r["batch_id"] for r in conn.execute(
         "SELECT batch_id FROM release_batches"
     ).fetchall()}
+
+
+def get_unindexed_batch_ids(conn) -> list:
+    """Return batch IDs that haven't been fully indexed yet."""
+    return [r["batch_id"] for r in conn.execute(
+        "SELECT batch_id FROM release_batches WHERE fully_indexed = 0"
+    ).fetchall()]
+
+
+def mark_batch_fully_indexed(conn, batch_id: str) -> None:
+    """Mark a batch as fully indexed so it's skipped in future cycles."""
+    conn.execute(
+        "UPDATE release_batches SET fully_indexed = 1 WHERE batch_id = ?",
+        (batch_id,)
+    )
 
 
 def insert_release_batch(conn, batch_id: str) -> None:

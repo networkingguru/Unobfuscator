@@ -16,8 +16,10 @@ polling:
 
 redaction_markers:
   - "[REDACTED]"
+  - "[Redacted]"
   - "[REDACTED TEXT]"
   - "[REDACTED PER]"
+  - "[Sender information redacted]"
   - "[b(6)]"
   - "[b(7)(c)]"
   - "[b(7)(e)]"
