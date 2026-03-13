@@ -41,7 +41,7 @@ def test_get_all_recovery_groups_returns_groups_with_recoveries(conn):
     seed_group(conn,
                group_docs=[("doc-a", "base"), ("doc-b", "donor")],
                merged_text="merged", recovered_count=1,
-               segments=[{"text": "SARAH KELLEN", "source_doc_id": "doc-b", "stage": "merge"}])
+               segments=[{"text": "Sarah Kellen", "source_doc_id": "doc-b", "stage": "merge"}])
     # Group with zero recoveries should be excluded
     seed_group(conn,
                group_docs=[("doc-c", "base2"), ("doc-d", "donor2")],
@@ -63,9 +63,9 @@ from stages.summary_generator import extract_entities
 
 
 def test_extract_people():
-    entities = extract_entities("The passenger list included SARAH KELLEN and others.")
+    entities = extract_entities("The passenger list included Sarah Kellen and others.")
     people = [e for e in entities if e["category"] == "people"]
-    assert any(e["text"] == "SARAH KELLEN" for e in people)
+    assert any(e["text"] == "Sarah Kellen" for e in people)
 
 
 def test_extract_emails():
@@ -124,7 +124,7 @@ def test_block_chars_stripped():
 
 def test_multi_category_from_single_segment():
     """A segment with both a name and phone should produce entities in both categories."""
-    entities = extract_entities("Contact SARAH KELLEN at (877) 877-0987")
+    entities = extract_entities("Contact Sarah Kellen at (877) 877-0987")
     categories = {e["category"] for e in entities}
     assert "people" in categories
     assert "phone" in categories
@@ -132,7 +132,7 @@ def test_multi_category_from_single_segment():
 
 def test_multiline_segment_extracted_per_line():
     """Newlines should not cause cross-line false matches."""
-    entities = extract_entities("SARAH KELLEN\n(877) 877-0987\ntest@example.com")
+    entities = extract_entities("Sarah Kellen\n(877) 877-0987\ntest@example.com")
     categories = {e["category"] for e in entities}
     assert "people" in categories
     assert "phone" in categories
@@ -158,7 +158,7 @@ from stages.summary_generator import aggregate_entities
 
 def test_aggregate_deduplicates_case_insensitive():
     raw = [
-        {"text": "SARAH KELLEN", "category": "people", "group_id": 1},
+        {"text": "Sarah Kellen", "category": "people", "group_id": 1},
         {"text": "Sarah Kellen", "category": "people", "group_id": 2},
     ]
     result = aggregate_entities(raw)
@@ -192,14 +192,14 @@ def test_aggregate_deduplicates_emails_by_lowercase():
 
 def test_aggregate_sorts_by_frequency():
     raw = [
-        {"text": "SARAH KELLEN", "category": "people", "group_id": 1},
-        {"text": "SARAH KELLEN", "category": "people", "group_id": 2},
-        {"text": "SARAH KELLEN", "category": "people", "group_id": 3},
+        {"text": "Sarah Kellen", "category": "people", "group_id": 1},
+        {"text": "Sarah Kellen", "category": "people", "group_id": 2},
+        {"text": "Sarah Kellen", "category": "people", "group_id": 3},
         {"text": "BILL CLINTON", "category": "people", "group_id": 4},
     ]
     result = aggregate_entities(raw)
     people = [e for e in result if e["category"] == "people"]
-    assert people[0]["text"] == "SARAH KELLEN"
+    assert people[0]["text"] == "Sarah Kellen"
     assert people[0]["count"] == 3
 
 
@@ -235,9 +235,9 @@ def test_generate_summary_pdf_creates_file(conn, tmp_path):
     output_dir = str(tmp_path / "output")
     seed_group(conn,
                group_docs=[("doc-a", "base text [REDACTED] here"), ("doc-b", "donor")],
-               merged_text="base text SARAH KELLEN here",
+               merged_text="base text Sarah Kellen here",
                recovered_count=1,
-               segments=[{"text": "SARAH KELLEN", "source_doc_id": "doc-b", "stage": "merge"}])
+               segments=[{"text": "Sarah Kellen", "source_doc_id": "doc-b", "stage": "merge"}])
 
     path = generate_summary_pdf(conn, output_dir)
     assert path is not None
@@ -252,12 +252,12 @@ def test_generate_summary_pdf_contains_entity(conn, tmp_path):
                group_docs=[("doc-a", "base"), ("doc-b", "donor")],
                merged_text="merged",
                recovered_count=1,
-               segments=[{"text": "SARAH KELLEN", "source_doc_id": "doc-b", "stage": "merge"}])
+               segments=[{"text": "Sarah Kellen", "source_doc_id": "doc-b", "stage": "merge"}])
 
     path = generate_summary_pdf(conn, output_dir)
     doc = fitz.open(path)
     full_text = "".join(page.get_text() for page in doc)
-    assert "SARAH KELLEN" in full_text
+    assert "Sarah Kellen" in full_text
     assert "Unobfuscator Summary Report" in full_text
     doc.close()
 
@@ -280,7 +280,7 @@ def test_generate_summary_pdf_has_stats(conn, tmp_path):
                merged_text="merged",
                recovered_count=2,
                segments=[
-                   {"text": "SARAH KELLEN", "source_doc_id": "doc-b", "stage": "merge"},
+                   {"text": "Sarah Kellen", "source_doc_id": "doc-b", "stage": "merge"},
                    {"text": "test@example.com", "source_doc_id": "doc-b", "stage": "merge"},
                ])
 
