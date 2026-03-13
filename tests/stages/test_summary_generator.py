@@ -149,3 +149,77 @@ def test_phone_bare_digits():
     entities = extract_entities("Call 8778770987 today.")
     phones = [e for e in entities if e["category"] == "phone"]
     assert len(phones) == 1
+
+
+# ── Task 3: Entity Aggregation ──
+
+from stages.summary_generator import aggregate_entities
+
+
+def test_aggregate_deduplicates_case_insensitive():
+    raw = [
+        {"text": "SARAH KELLEN", "category": "people", "group_id": 1},
+        {"text": "Sarah Kellen", "category": "people", "group_id": 2},
+    ]
+    result = aggregate_entities(raw)
+    people = [e for e in result if e["category"] == "people"]
+    assert len(people) == 1
+    assert people[0]["count"] == 2
+    assert set(people[0]["group_ids"]) == {1, 2}
+
+
+def test_aggregate_deduplicates_phones_by_digits():
+    raw = [
+        {"text": "(877) 877-0987", "category": "phone", "group_id": 1},
+        {"text": "877-877-0987", "category": "phone", "group_id": 2},
+    ]
+    result = aggregate_entities(raw)
+    phones = [e for e in result if e["category"] == "phone"]
+    assert len(phones) == 1
+    assert phones[0]["count"] == 2
+
+
+def test_aggregate_deduplicates_emails_by_lowercase():
+    raw = [
+        {"text": "Sarah@Example.com", "category": "email", "group_id": 1},
+        {"text": "sarah@example.com", "category": "email", "group_id": 2},
+    ]
+    result = aggregate_entities(raw)
+    emails = [e for e in result if e["category"] == "email"]
+    assert len(emails) == 1
+    assert emails[0]["count"] == 2
+
+
+def test_aggregate_sorts_by_frequency():
+    raw = [
+        {"text": "SARAH KELLEN", "category": "people", "group_id": 1},
+        {"text": "SARAH KELLEN", "category": "people", "group_id": 2},
+        {"text": "SARAH KELLEN", "category": "people", "group_id": 3},
+        {"text": "BILL CLINTON", "category": "people", "group_id": 4},
+    ]
+    result = aggregate_entities(raw)
+    people = [e for e in result if e["category"] == "people"]
+    assert people[0]["text"] == "SARAH KELLEN"
+    assert people[0]["count"] == 3
+
+
+def test_aggregate_deduplicates_orgs_by_lowercase():
+    raw = [
+        {"text": "Department of Justice", "category": "organization", "group_id": 1},
+        {"text": "department of justice", "category": "organization", "group_id": 2},
+    ]
+    result = aggregate_entities(raw)
+    orgs = [e for e in result if e["category"] == "organization"]
+    assert len(orgs) == 1
+    assert orgs[0]["count"] == 2
+
+
+def test_aggregate_case_number_exact_dedup():
+    raw = [
+        {"text": "72-MM-113327", "category": "case_number", "group_id": 1},
+        {"text": "72-MM-113327", "category": "case_number", "group_id": 2},
+    ]
+    result = aggregate_entities(raw)
+    cases = [e for e in result if e["category"] == "case_number"]
+    assert len(cases) == 1
+    assert cases[0]["count"] == 2

@@ -122,3 +122,55 @@ def _extract_from_line(text: str) -> list[dict]:
         consumed.add((m.start(), m.end()))
 
     return entities
+
+
+def _normalize_key(text: str, category: str) -> str:
+    """Normalize entity text for deduplication."""
+    if category == "email":
+        return text.lower()
+    if category == "phone":
+        return re.sub(r'\D', '', text)
+    if category == "case_number":
+        return text  # exact match per spec
+    return text.lower()
+
+
+def aggregate_entities(raw_entities: list[dict]) -> list[dict]:
+    """Deduplicate and count entities. Returns sorted list per category.
+
+    Input: list of {"text": str, "category": str, "group_id": int}
+    Output: list of {"text": str, "category": str, "count": int, "group_ids": list[int]}
+    """
+    buckets: dict[str, dict] = {}  # key -> {text, category, count, group_ids, casing_counts}
+
+    for e in raw_entities:
+        key = f"{e['category']}:{_normalize_key(e['text'], e['category'])}"
+        if key not in buckets:
+            buckets[key] = {
+                "text": e["text"],
+                "category": e["category"],
+                "count": 0,
+                "group_ids": [],
+                "casing_counts": {},
+            }
+        bucket = buckets[key]
+        bucket["count"] += 1
+        if e["group_id"] not in bucket["group_ids"]:
+            bucket["group_ids"].append(e["group_id"])
+        # Track casing to pick the most common form
+        bucket["casing_counts"][e["text"]] = bucket["casing_counts"].get(e["text"], 0) + 1
+
+    result = []
+    for bucket in buckets.values():
+        # Use the most common casing
+        best_text = max(bucket["casing_counts"], key=bucket["casing_counts"].get)
+        result.append({
+            "text": best_text,
+            "category": bucket["category"],
+            "count": bucket["count"],
+            "group_ids": sorted(bucket["group_ids"]),
+        })
+
+    # Sort by count descending within each category
+    result.sort(key=lambda e: (-e["count"], e["text"]))
+    return result
