@@ -105,6 +105,38 @@ _ORG_SUFFIXES = re.compile(
     re.IGNORECASE,
 )
 
+# Generic org references that aren't proper noun organization names
+_ORG_STOPWORDS = {
+    # Generic [adj] + bank/office/court/trust
+    "swiss bank", "us bank", "private bank", "foreign bank", "principal bank",
+    "fbi office", "sis office", "his office", "her office", "our office",
+    "your office", "my office", "tom pritzkcrs office", "research office",
+    "family office", "sec ig office",
+    "america court", "a court", "contempt of court",
+    "this trust", "in trust", "first trust", "second trust", "third trust",
+    "financial trust", "southern trust", "my will and trust",
+    "national association",
+    # Generic service/group references
+    "need passport or visa services", "financial services",
+    "s financial services", "cancellation of services",
+    "concept restaurant group",
+    # Fragments / sentence pieces
+    "sec or doj", "no sec or doj", "doj and sec",
+    "physics department", "human trafficking fbi",
+    "after the doj", "bank of new",
+    "berger securities",
+    # Sentence fragment patterns
+    "assistant united states attorney in the office",
+    "office and the federal bureau",
+    "central park blvd in denver and the fbi",
+    "credit suisse and deutsche bank",
+    "ansu banerjee in the secla office",
+    "visa services", "will and trust",
+    "rict new york united states district court",
+    "caia director deutsche bank",
+    "rob robert aquadro group",
+}
+
 # Email metadata suffixes — "Lesley Groff Sent", "Name Cc", etc.
 _EMAIL_META_SUFFIXES = {"sent", "cc", "from", "to", "subject", "bcc"}
 
@@ -293,15 +325,20 @@ def _extract_from_line(text: str) -> list[dict]:
             entities.append({"text": m.group(), "category": "case_number"})
             consumed.add((m.start(), m.end()))
 
-    # 4. Organizations (suffix match)
+    # 4. Organizations (proper noun + suffix match)
     for m in _ORG_SUFFIXES.finditer(text):
-        # Build org name: look backward for preceding words and forward for "of X" phrases
-        prefix_start = max(0, m.start() - 60)
+        # Look backward up to 40 chars for a proper noun org name
+        prefix_start = max(0, m.start() - 40)
         prefix = text[prefix_start:m.end()]
-        # Find capitalized words leading into the suffix
+        # Match: optional articles, then capitalized proper nouns (with articles
+        # between them), then the suffix. No IGNORECASE — only true proper nouns.
+        # \b ensures we don't start mid-word in ALL CAPS text.
         org_match = re.search(
-            r'(?:(?:the|of|for|and|in)\s+)*(?:[A-Z][a-zA-Z]*\s+)*' + re.escape(m.group()),
-            prefix, re.IGNORECASE
+            r'\b(?:(?:[Tt]he|[Oo]f|[Ff]or|[Aa]nd|[Ii]n)\s+)*'
+            r'(?:[A-Z][a-zA-Z]{2,}\s+(?:(?:the|of|for|and|in|&)\s+)*)*'
+            r'(?:(?:the|of|for|and|in)\s+)?'
+            + re.escape(m.group()),
+            prefix
         )
         if not org_match:
             continue
@@ -314,9 +351,23 @@ def _extract_from_line(text: str) -> list[dict]:
         if tail_match:
             org_name += tail_match.group()
             abs_end += tail_match.end()
-        # Strip leading articles
-        org_name = re.sub(r'^(?:the|of|for)\s+', '', org_name, flags=re.IGNORECASE).strip()
-        if len(org_name) > 3 and not _is_consumed(abs_start, abs_end):
+        # Strip leading articles/conjunctions
+        org_name = re.sub(
+            r'^(?:the|of|for|and|in|or|see|at)\s+', '',
+            org_name, flags=re.IGNORECASE,
+        ).strip()
+        # Must start with a capital letter (proper noun)
+        if not org_name or not org_name[0].isupper():
+            continue
+        # Reject generic org references (adjective/pronoun + suffix)
+        org_lower = org_name.lower()
+        if org_lower in _ORG_STOPWORDS:
+            continue
+        if any(sw in org_lower for sw in _ORG_STOPWORDS if len(sw) > 8):
+            continue
+        # Must have at least 2 words (proper noun + suffix) and be a reasonable length
+        if (len(org_name.split()) >= 2 and len(org_name) <= 60
+                and not _is_consumed(abs_start, abs_end)):
             entities.append({"text": org_name, "category": "organization"})
             consumed.add((abs_start, abs_end))
 
@@ -473,6 +524,9 @@ def _collect_raw_entities(conn) -> list[dict]:
             else:
                 # "Other" category — truncated raw text
                 display = text.replace("\n", " ")[:80]
+                # Skip redaction artifacts
+                if re.search(r'black(?:ed|ened)\s*ou', display, re.IGNORECASE):
+                    continue
                 raw.append({
                     "text": display,
                     "category": "other",
