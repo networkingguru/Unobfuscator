@@ -378,8 +378,8 @@ def run_phase3_verify_and_group(
         if confirmed % 100 == 0:
             conn.commit()
 
-    logger.info("Phase 3: verified %d/%d candidates → %d confirmed matches",
-                len(candidates), len(candidates), confirmed)
+    logger.info("Phase 3: verified %d candidates → %d confirmed matches",
+                len(candidates), confirmed)
     conn.commit()
 
 
