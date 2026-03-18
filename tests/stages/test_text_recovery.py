@@ -73,3 +73,65 @@ def test_extract_text_empty_pdf():
 def test_extract_text_corrupt_pdf():
     result = extract_text_from_pdf(b"not a pdf", min_words_per_page=50)
     assert result is None
+
+
+# ---------------------------------------------------------------------------
+# Task 5: OCR Engine
+# ---------------------------------------------------------------------------
+
+from PIL import Image
+from stages.text_recovery import ocr_pdf, ocr_image, _is_tesseract_available
+
+
+def test_ocr_pdf_skips_redacted_pages():
+    doc = fitz.open()
+    p0 = doc.new_page()
+    p0.insert_text((72, 72), "Hello world " * 20, fontsize=12)
+    p1 = doc.new_page()
+    rect = fitz.Rect(0, 0, p1.rect.width, p1.rect.height)
+    p1.draw_rect(rect, color=(0, 0, 0), fill=(0, 0, 0))
+    pdf_bytes = doc.tobytes()
+    doc.close()
+
+    text, source, tags_json = ocr_pdf(pdf_bytes)
+    tags = json.loads(tags_json)
+    assert tags["1"] == "redacted"
+    assert source == "ocr"
+
+def test_ocr_pdf_skips_photo_pages():
+    doc = fitz.open()
+    page = doc.new_page(width=100, height=100)
+    gradient = np.linspace(50, 200, 100 * 100, dtype=np.uint8).reshape(100, 100)
+    rgb = np.stack([gradient, gradient, gradient], axis=2)
+    img_pil = Image.fromarray(rgb, "RGB")
+    import io
+    buf = io.BytesIO()
+    img_pil.save(buf, format="PNG")
+    buf.seek(0)
+    page.insert_image(page.rect, stream=buf.getvalue())
+    pdf_bytes = doc.tobytes()
+    doc.close()
+
+    text, source, tags_json = ocr_pdf(pdf_bytes)
+    tags = json.loads(tags_json)
+    assert tags["0"] == "photo"
+
+def test_ocr_image_skips_all_black():
+    img = Image.new("L", (100, 100), color=0)
+    text, tag = ocr_image(img)
+    assert tag == "redacted"
+    assert text == ""
+
+def test_is_tesseract_available_returns_bool():
+    result = _is_tesseract_available()
+    assert isinstance(result, bool)
+
+def test_ocr_image_returns_text_for_text_image():
+    if not _is_tesseract_available():
+        pytest.skip("Tesseract not installed")
+    img = Image.new("L", (400, 100), color=240)
+    from PIL import ImageDraw
+    draw = ImageDraw.Draw(img)
+    draw.text((10, 30), "Hello World Test Document", fill=0)
+    text, tag = ocr_image(img)
+    assert tag == "text"
