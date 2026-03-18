@@ -201,6 +201,15 @@ def _is_real_recovery(text: str, redaction_markers: list[str]) -> bool:
     if re.match(r'^\d{4}$', stripped):
         return False
 
+    # AI image descriptions — OCR artifacts from redacted pages, not real content
+    ai_description_prefixes = (
+        "the image ", "this image ", "this page ",
+        "the image is ", "this image is ", "this is an image",
+        "this appears to be",
+    )
+    if any(lower.startswith(p) for p in ai_description_prefixes):
+        return False
+
     return True
 
 
