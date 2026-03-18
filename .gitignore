@@ -12,5 +12,6 @@ build/
 .pytest_cache/
 venv/
 .claude/worktrees/
+.worktrees/
 .DS_Store
 *.pid
