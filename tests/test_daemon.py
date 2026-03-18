@@ -208,6 +208,33 @@ def test_config_set_persists_value(tmp_path):
     assert stored == "/tmp/out", f"Expected '/tmp/out', got {stored!r}"
 
 
+def test_run_one_cycle_calls_text_recovery(tmp_path):
+    """Phase 5.5 must be called between PDF processing and output generation."""
+    db_path = str(tmp_path / "test.db")
+    init_db(db_path)
+    conn = get_connection(db_path)
+    cfg = {
+        "redaction_markers": ["[REDACTED]"],
+        "matching": {"min_overlap_chars": 200, "similarity_threshold": 0.70,
+                     "email_header_min_matches": 2},
+        "output_dir": str(tmp_path / "output"),
+        "ocr": {"min_words_per_page": 50},
+    }
+    with patch("unobfuscator.run_indexer_batch"), \
+         patch("unobfuscator.run_phase0_email_fastpath", return_value=[]), \
+         patch("unobfuscator.run_phase2_lsh_candidates", return_value=[]), \
+         patch("unobfuscator.run_phase3_verify_and_group"), \
+         patch("unobfuscator.run_merger", return_value=0), \
+         patch("unobfuscator.dequeue", return_value=None), \
+         patch("unobfuscator.process_pdf_for_document"), \
+         patch("unobfuscator.run_text_recovery") as mock_tr, \
+         patch("unobfuscator.run_output_generator", return_value=0), \
+         patch("unobfuscator.get_pending_pdf_documents", return_value=[]):
+        from unobfuscator import _run_one_cycle
+        _run_one_cycle(conn, cfg)
+        mock_tr.assert_called_once()
+
+
 def test_config_set_overwrites_existing_value(tmp_path):
     """config set on an existing key replaces the previous value."""
     db_path = str(tmp_path / "cfg_test.db")

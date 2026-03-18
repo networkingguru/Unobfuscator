@@ -32,6 +32,7 @@ from stages.merger import run_merger
 from stages.pdf_processor import process_pdf_for_document
 from stages.output_generator import run_output_generator
 from stages.summary_generator import generate_summary_pdf
+from stages.text_recovery import run_text_recovery
 
 console = Console()
 logger = logging.getLogger(__name__)
@@ -154,6 +155,15 @@ def _run_one_cycle(conn, cfg: dict) -> None:
                 break
             _set_activity(f"Stage 4 PDF: processing {i}/{len(pdf_docs)}")
             process_pdf_for_document(conn, doc_id=pdf_doc["id"])
+
+    # Phase 5.5: Text recovery (Jmail backfill + OCR)
+    if not _shutdown_requested:
+        _set_activity("Stage 4.5 Text Recovery: backfill + OCR")
+        logger.info("Stage 4.5: starting text recovery")
+        min_wpp = cfg_get(cfg, "ocr.min_words_per_page", default=50)
+        tr_count = run_text_recovery(conn, redaction_markers=markers,
+                                     min_words_per_page=min_wpp)
+        logger.info("Stage 4.5: recovered text for %d documents", tr_count)
 
     if not _shutdown_requested:
         _set_activity("Stage 5 Output: generating files")
@@ -296,7 +306,11 @@ def start(ctx, foreground):
             pending_pdfs = conn.execute(
                 "SELECT COUNT(*) FROM documents WHERE pdf_processed = 0 AND pdf_url IS NOT NULL"
             ).fetchone()[0]
-            if stats.get("pending", 0) == 0 and pending_pdfs == 0 and not _shutdown_requested:
+            pending_ocr = conn.execute(
+                "SELECT COUNT(*) FROM documents "
+                "WHERE ocr_processed = 0 AND (extracted_text IS NULL OR extracted_text = '')"
+            ).fetchone()[0]
+            if stats.get("pending", 0) == 0 and pending_pdfs == 0 and pending_ocr == 0 and not _shutdown_requested:
                 _set_activity("Polling for new batches")
                 poll_ok = _poll_for_new_batches(conn, cfg)
                 wait = poll_interval if poll_ok else retry_interval
@@ -387,6 +401,18 @@ def status(ctx, doc):
     pdf_total = conn.execute(
         "SELECT COUNT(*) FROM documents WHERE pdf_url IS NOT NULL"
     ).fetchone()[0]
+    ocr_done = conn.execute(
+        "SELECT COUNT(*) FROM documents WHERE ocr_processed=1"
+    ).fetchone()[0]
+    ocr_pending = conn.execute(
+        "SELECT COUNT(*) FROM documents WHERE ocr_processed=0 "
+        "AND (extracted_text IS NULL OR extracted_text = '')"
+    ).fetchone()[0]
+    text_sources = conn.execute(
+        "SELECT text_source, COUNT(*) FROM documents "
+        "WHERE text_source IS NOT NULL GROUP BY text_source"
+    ).fetchall()
+    source_str = ", ".join(f"{r[0]}: {r[1]:,}" for r in text_sources)
     output_count = conn.execute(
         "SELECT COUNT(*) FROM merge_results WHERE output_generated=1"
     ).fetchone()[0]
@@ -405,6 +431,9 @@ def status(ctx, doc):
     t.add_row("Stage 2 Matcher", f"{fps:,} fingerprints built")
     t.add_row("Stage 3 Merger", f"{groups:,} groups merged")
     t.add_row("Stage 4 PDF Processor", f"{pdf_done:,} / {pdf_total:,} PDFs done")
+    t.add_row("Text Recovery", f"{ocr_done:,} processed, {ocr_pending:,} pending")
+    if source_str:
+        t.add_row("Text Sources", source_str)
     t.add_row("Stage 5 Output", f"{output_count:,} files written")
     t.add_row("Recovered redactions", f"{recovered:,} total")
     t.add_row("Output directory", output_dir)
@@ -538,6 +567,28 @@ def summary(ctx):
     console.print("[dim]Generating summary report...[/dim]")
     path = generate_summary_pdf(conn, output_dir)
     console.print(f"[green]Summary report written to {path}[/green]")
+
+
+@cli.command()
+@click.pass_context
+def backfill(ctx):
+    """One-shot: backfill text from Jmail shards and run OCR on docs missing text."""
+    cfg = load_config(ctx.obj["config_path"])
+    db_path = cfg_get(cfg, "db_path", default="./data/unobfuscator.db")
+    markers = cfg_get(cfg, "redaction_markers", default=[])
+    min_wpp = cfg_get(cfg, "ocr.min_words_per_page", default=50)
+
+    init_db(db_path)
+    conn = get_connection(db_path)
+
+    logging.basicConfig(level=logging.INFO,
+                        format="%(asctime)s %(name)s %(levelname)s %(message)s")
+
+    console.print("[dim]Running text recovery (Jmail backfill + OCR)...[/dim]")
+    count = run_text_recovery(conn, redaction_markers=markers,
+                              min_words_per_page=min_wpp)
+    console.print(f"[green]Text recovery complete: {count} documents recovered.[/green]")
+    conn.close()
 
 
 if __name__ == "__main__":
