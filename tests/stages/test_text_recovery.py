@@ -135,3 +135,122 @@ def test_ocr_image_returns_text_for_text_image():
     draw.text((10, 30), "Hello World Test Document", fill=0)
     text, tag = ocr_image(img)
     assert tag == "text"
+
+
+# ---------------------------------------------------------------------------
+# Task 6: run_text_recovery orchestrator
+# ---------------------------------------------------------------------------
+
+from core.db import (
+    init_db, get_connection, upsert_document, mark_text_processed,
+    get_all_fingerprints, update_extracted_text, mark_ocr_processed
+)
+from stages.text_recovery import run_text_recovery
+
+
+@pytest.fixture
+def db_conn(tmp_path):
+    path = str(tmp_path / "test.db")
+    init_db(path)
+    c = get_connection(path)
+    yield c
+    c.close()
+
+
+def test_run_text_recovery_backfills_from_jmail(db_conn):
+    doc = {
+        "id": "EFTA00000001.pdf", "source": "doj",
+        "release_batch": "VOL00001", "original_filename": "EFTA00000001.pdf",
+        "page_count": 1, "size_bytes": 1000,
+        "description": "Test", "extracted_text": "",
+    }
+    upsert_document(db_conn, doc)
+    mark_text_processed(db_conn, doc["id"])
+    db_conn.commit()
+
+    with patch("stages.text_recovery.fetch_documents_text_batch") as mock_fetch:
+        mock_fetch.return_value = {"EFTA00000001.pdf": "Backfilled text content here"}
+        count = run_text_recovery(db_conn, redaction_markers=["[REDACTED]"])
+
+    assert count > 0
+    row = db_conn.execute(
+        "SELECT extracted_text, text_source FROM documents WHERE id = ?",
+        (doc["id"],)
+    ).fetchone()
+    assert row["extracted_text"] == "Backfilled text content here"
+    assert row["text_source"] == "jmail"
+
+
+def test_run_text_recovery_builds_fingerprint_after_backfill(db_conn):
+    doc = {
+        "id": "EFTA00000001.pdf", "source": "doj",
+        "release_batch": "VOL00001", "original_filename": "EFTA00000001.pdf",
+        "page_count": 1, "size_bytes": 1000,
+        "description": "Test", "extracted_text": "",
+    }
+    upsert_document(db_conn, doc)
+    mark_text_processed(db_conn, doc["id"])
+    db_conn.commit()
+
+    long_text = "word " * 100
+    with patch("stages.text_recovery.fetch_documents_text_batch") as mock_fetch:
+        mock_fetch.return_value = {"EFTA00000001.pdf": long_text}
+        run_text_recovery(db_conn, redaction_markers=["[REDACTED]"])
+
+    fps = get_all_fingerprints(db_conn)
+    assert any(f["doc_id"] == "EFTA00000001.pdf" for f in fps)
+
+
+def test_run_text_recovery_skips_already_backfilled(db_conn):
+    doc = {
+        "id": "already_done", "source": "doj",
+        "release_batch": "VOL00001", "original_filename": "done.pdf",
+        "page_count": 1, "size_bytes": 1000,
+        "description": "Test", "extracted_text": "existing text",
+    }
+    upsert_document(db_conn, doc)
+    mark_text_processed(db_conn, doc["id"])
+    db_conn.commit()
+
+    with patch("stages.text_recovery.fetch_documents_text_batch") as mock_fetch:
+        mock_fetch.return_value = {}
+        run_text_recovery(db_conn, redaction_markers=["[REDACTED]"])
+    mock_fetch.assert_not_called()
+
+
+def test_run_text_recovery_processes_pdf_with_text_layer(db_conn, tmp_path):
+    """A doc with a cached PDF should get text from the text layer."""
+    cache_dir = tmp_path / "pdf_cache" / "VOL00001"
+    cache_dir.mkdir(parents=True)
+
+    import fitz
+    doc = fitz.open()
+    page = doc.new_page()
+    # Use insert_textbox to ensure enough text
+    rect = fitz.Rect(50, 50, 500, 700)
+    page.insert_textbox(rect, "This is a test document with many words. " * 20, fontsize=11)
+    pdf_path = cache_dir / "scan.pdf"
+    doc.save(str(pdf_path))
+    doc.close()
+
+    db_doc = {
+        "id": "scan.pdf", "source": "doj",
+        "release_batch": "VOL00001", "original_filename": "scan.pdf",
+        "page_count": 1, "size_bytes": 1000,
+        "description": "Test", "extracted_text": "",
+    }
+    upsert_document(db_conn, db_doc)
+    mark_text_processed(db_conn, db_doc["id"])
+    db_conn.commit()
+
+    with patch("stages.text_recovery.fetch_documents_text_batch") as mock_fetch:
+        mock_fetch.return_value = {}
+        with patch("stages.text_recovery._CACHE_DIR", tmp_path / "pdf_cache"):
+            run_text_recovery(db_conn, redaction_markers=["[REDACTED]"])
+
+    row = db_conn.execute(
+        "SELECT extracted_text, text_source, ocr_processed FROM documents WHERE id = ?",
+        ("scan.pdf",)
+    ).fetchone()
+    assert row["extracted_text"] != ""
+    assert row["ocr_processed"] == 1
