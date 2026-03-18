@@ -8,11 +8,13 @@ import signal
 import subprocess
 import sys
 import time
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
+from typing import Optional
+
 import click
 from rich.console import Console
 from rich.table import Table
-from pathlib import Path
-from typing import Optional
 from core.db import (
     init_db, get_connection, get_known_batch_ids, insert_release_batch,
     get_pending_pdf_documents, get_documents_by_ids, reset_group_merged,
@@ -43,7 +45,6 @@ def _set_activity(msg: str) -> None:
     """Write current daemon activity to DB so 'status' can display it."""
     if _daemon_conn is None:
         return
-    from datetime import datetime, timezone
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     set_config(_daemon_conn, "daemon_activity", f"{ts} | {msg}")
     _daemon_conn.commit()
@@ -55,18 +56,18 @@ def _write_pid() -> None:
 
 
 def _read_pid() -> Optional[int]:
-    if not os.path.exists(PID_FILE):
-        return None
     try:
         with open(PID_FILE) as f:
             return int(f.read().strip())
-    except (ValueError, OSError):
+    except (FileNotFoundError, ValueError, OSError):
         return None
 
 
 def _remove_pid() -> None:
-    if os.path.exists(PID_FILE):
+    try:
         os.remove(PID_FILE)
+    except FileNotFoundError:
+        pass
 
 
 def _run_one_cycle(conn, cfg: dict) -> None:
@@ -127,6 +128,7 @@ def _run_one_cycle(conn, cfg: dict) -> None:
 
     # Process any pending merge queue jobs (e.g., from soft-redaction discoveries).
     merge_job = dequeue(conn, stage="merge")
+    remerge_needed = False
     while merge_job:
         if _shutdown_requested:
             break
@@ -135,13 +137,14 @@ def _run_one_cycle(conn, cfg: dict) -> None:
         if group_id is not None:
             # Reset merged flag so run_merger picks it up again.
             reset_group_merged(conn, group_id)
+            remerge_needed = True
         else:
             console.print("[yellow]Merge job with no group_id skipped.[/yellow]")
         mark_done(conn, merge_job["job_id"])
         merge_job = dequeue(conn, stage="merge")
 
-    # Re-run merger to process any groups that were just reset.
-    if not _shutdown_requested:
+    # Re-run merger only if groups were actually reset above.
+    if remerge_needed and not _shutdown_requested:
         run_merger(conn, redaction_markers=markers)
 
     if not _shutdown_requested:
@@ -157,8 +160,6 @@ def _run_one_cycle(conn, cfg: dict) -> None:
         logger.info("Stage 5: generating output PDFs")
         project_root = Path(__file__).resolve().parent
         prov_path = str(project_root / "pdf_cache" / "provenance.json")
-        if not os.path.exists(prov_path):
-            prov_path = None
         output_count = run_output_generator(conn, output_dir=output_dir,
                                             redaction_markers=markers,
                                             provenance_path=prov_path)
@@ -299,7 +300,6 @@ def start(ctx, foreground):
                 _set_activity("Polling for new batches")
                 poll_ok = _poll_for_new_batches(conn, cfg)
                 wait = poll_interval if poll_ok else retry_interval
-                from datetime import datetime, timezone, timedelta
                 wake = datetime.now(timezone.utc) + timedelta(seconds=wait)
                 reason = "" if poll_ok else " (poll failed, retrying sooner)"
                 _set_activity(
@@ -483,7 +483,6 @@ def log(ctx, lines, follow):
     if not os.path.exists(log_path):
         console.print("[red]No log file found.[/red]")
         return
-    import subprocess
     cmd = ["tail", f"-n{lines}"]
     if follow:
         cmd.append("-f")

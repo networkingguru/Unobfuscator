@@ -502,13 +502,14 @@ _CATEGORY_ORDER = [
 ]
 
 
-def _collect_raw_entities(conn) -> list[dict]:
+def _collect_raw_entities(conn, groups=None) -> list[dict]:
     """Parse all recovered segments and extract entities with group context.
 
     Segments that yield no categorized entities are added as "other" category
     (truncated to 80 chars).
     """
-    groups = get_all_recovery_groups(conn)
+    if groups is None:
+        groups = get_all_recovery_groups(conn)
     raw = []
     for g in groups:
         segments = json.loads(g["recovered_segments"] or "[]")
@@ -694,11 +695,11 @@ def _get_source_doc_ids(conn, group_id: int) -> list[str]:
 
 def generate_summary_pdf(conn, output_dir: str) -> str:
     """Generate the summary report PDF. Returns the output path."""
-    raw = _collect_raw_entities(conn)
+    groups = get_all_recovery_groups(conn)
+    raw = _collect_raw_entities(conn, groups=groups)
     aggregated = aggregate_entities(raw)
 
     # Count total segments
-    groups = get_all_recovery_groups(conn)
     segment_count = sum(
         len(json.loads(g["recovered_segments"] or "[]")) for g in groups
     )

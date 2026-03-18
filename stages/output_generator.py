@@ -134,6 +134,7 @@ def generate_output_pdf(
     output_dir: str,
     redaction_markers: list[str],
     provenance_path: str = None,
+    _prov_data: dict = None,
 ) -> Optional[str]:
     """Generate a highlighted output PDF for a merge group.
 
@@ -160,14 +161,16 @@ def generate_output_pdf(
 
     # Check provenance for non-DOJ sources
     provenance_label = None
-    if provenance_path:
+    prov = _prov_data if _prov_data is not None else (
+        _load_provenance(provenance_path) if provenance_path else {}
+    )
+    if prov:
         batch = base_doc.get("release_batch", "")
         if batch.startswith("VOL"):
             try:
                 dataset_num = str(int(batch[3:]))  # VOL00008 → "8"
-                prov_data = _load_provenance(provenance_path)
-                if dataset_num in prov_data:
-                    provenance_label = prov_data[dataset_num].get("source_label")
+                if dataset_num in prov:
+                    provenance_label = prov[dataset_num].get("source_label")
             except Exception:
                 pass
 
@@ -302,10 +305,13 @@ def _write_metadata_page(
 def run_output_generator(conn, output_dir: str, redaction_markers: list[str],
                          provenance_path: str = None) -> int:
     """Generate output PDFs for all pending merge results. Returns count generated."""
+    # Load provenance once for all groups instead of re-reading per group.
+    prov_data = _load_provenance(provenance_path) if provenance_path else {}
     count = 0
     for row in get_pending_output_groups(conn):
         path = generate_output_pdf(conn, row["group_id"], output_dir, redaction_markers,
-                                   provenance_path=provenance_path)
+                                   provenance_path=provenance_path,
+                                   _prov_data=prov_data)
         if path:
             count += 1
     conn.commit()

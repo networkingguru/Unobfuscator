@@ -58,8 +58,7 @@ def extract_soft_redactions(pdf_bytes: bytes) -> list[dict]:
                 continue  # Too small to be a redaction
 
             # Extract text from the PDF stream in that rectangle area
-            clip_rect = fitz.Rect(drawing["rect"])
-            hidden_text = page.get_text("text", clip=clip_rect).strip()
+            hidden_text = page.get_text("text", clip=rect).strip()
             if hidden_text:
                 recovered.append({
                     "page": page_num,

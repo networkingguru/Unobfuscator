@@ -4,14 +4,17 @@ Logic reference: PIPELINE.md — Phases 0, 2, and 3
 (Phase 1 fingerprinting is done by the Indexer in Stage 1.)
 """
 
+import logging
 import re
 import numpy as np
 from collections import defaultdict
 from datasketch import MinHash, MinHashLSH
 from core.db import (
     get_connection, create_match_group, add_group_member,
-    get_doc_group, merge_groups
+    get_doc_group, merge_groups, get_config, set_config
 )
+
+logger = logging.getLogger(__name__)
 
 # Email header patterns to extract for Phase 0 fast-path
 _HEADER_PATTERNS = [
@@ -41,8 +44,6 @@ def run_phase0_email_fastpath(conn, min_header_matches: int = 2) -> set[int]:
     Returns the set of doc_ids that were matched and grouped.
     Processes in batches to avoid loading all document text into memory.
     """
-    import logging
-    logger = logging.getLogger(__name__)
 
     # Only process docs not already in a group
     already_grouped = {
@@ -102,8 +103,6 @@ def run_phase0_email_fastpath(conn, min_header_matches: int = 2) -> set[int]:
 
 def load_fingerprints(conn, num_perm: int = 128) -> dict[str, MinHash]:
     """Load all stored fingerprints from DB and reconstruct MinHash objects."""
-    import logging
-    logger = logging.getLogger(__name__)
 
     total = conn.execute("SELECT COUNT(*) FROM document_fingerprints").fetchone()[0]
     logger.info("Loading %d fingerprints from DB...", total)
@@ -143,9 +142,6 @@ def run_phase2_lsh_candidates(
     Skips the expensive LSH rebuild when the fingerprint count and group count
     haven't changed since the last run (nothing new to match).
     """
-    import logging
-    from core.db import get_config, set_config
-    logger = logging.getLogger(__name__)
 
     # Skip if nothing has changed since the last LSH run
     fp_count = conn.execute("SELECT COUNT(*) FROM document_fingerprints").fetchone()[0]
@@ -352,8 +348,6 @@ def run_phase3_verify_and_group(
     Secondary: long common text (>500 chars) even without complementary redactions.
     Rejection: common text shorter than min_overlap_chars.
     """
-    import logging
-    logger = logging.getLogger(__name__)
 
     # Clear text cache for fresh run
     _get_text.__defaults__[0].clear()
