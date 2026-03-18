@@ -4,6 +4,7 @@ from core.api import (
     fetch_release_batches, fetch_documents_metadata, fetch_document_text,
     fetch_documents_text_batch, search_documents_by_keyword, fetch_person_document_ids
 )
+from core.api import resolve_shard, SHARD_MAP, DEFAULT_SHARD
 
 
 def make_mock_relation(rows):
@@ -210,6 +211,53 @@ def test_fetch_person_document_ids_returns_list(mock_connect):
     )
     result = fetch_person_document_ids("Trump")
     assert result == ["EFTA00010.pdf", "EFTA00020.pdf", "EFTA00030.pdf"]
+
+
+def test_resolve_shard_known_batch():
+    assert resolve_shard("VOL00008-2") == "VOL00008"
+    assert resolve_shard("VOL00008-OFFICIAL-DOJ-LATEST") == "VOL00008"
+    assert resolve_shard("VOL00009") == "VOL00009"
+    assert resolve_shard("DataSet11") == "DataSet11"
+
+def test_resolve_shard_unknown_batch_returns_other():
+    assert resolve_shard("VOL00001") == "other"
+    assert resolve_shard("DOJ-COURT") == "other"
+    assert resolve_shard("batch-3") == "other"
+
+@patch("core.api.duckdb.connect")
+def test_fetch_documents_text_batch_uses_resolved_shard(mock_connect):
+    import pandas as pd
+    mock_conn = MagicMock()
+    mock_connect.return_value.__enter__ = lambda s: mock_conn
+    mock_connect.return_value.__exit__ = MagicMock(return_value=False)
+    mock_conn.execute.return_value.fetchdf.return_value = pd.DataFrame(columns=["id", "extracted_text"])
+    fetch_documents_text_batch(["doc1.pdf"], "VOL00001")
+    query = mock_conn.execute.call_args_list[-1][0][0]
+    assert "other.parquet" in query
+    assert "VOL00001.parquet" not in query
+
+@patch("core.api.duckdb.connect")
+def test_fetch_documents_text_batch_vol00008_2_uses_vol00008_shard(mock_connect):
+    import pandas as pd
+    mock_conn = MagicMock()
+    mock_connect.return_value.__enter__ = lambda s: mock_conn
+    mock_connect.return_value.__exit__ = MagicMock(return_value=False)
+    mock_conn.execute.return_value.fetchdf.return_value = pd.DataFrame(columns=["id", "extracted_text"])
+    fetch_documents_text_batch(["doc1.pdf"], "VOL00008-2")
+    query = mock_conn.execute.call_args_list[-1][0][0]
+    assert "VOL00008.parquet" in query
+    assert "VOL00008-2.parquet" not in query
+
+@patch("core.api.duckdb.connect")
+def test_fetch_document_text_uses_resolved_shard(mock_connect):
+    import pandas as pd
+    mock_conn = MagicMock()
+    mock_connect.return_value.__enter__ = lambda s: mock_conn
+    mock_connect.return_value.__exit__ = MagicMock(return_value=False)
+    mock_conn.execute.return_value.fetchdf.return_value = pd.DataFrame(columns=["id", "extracted_text"])
+    fetch_document_text(doc_id="doc1.pdf", batch_id="DOJ-COURT")
+    query = mock_conn.execute.call_args_list[-1][0][0]
+    assert "other.parquet" in query
 
 
 @patch("core.api.duckdb.connect")

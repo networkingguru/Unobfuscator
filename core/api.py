@@ -14,6 +14,21 @@ JMAIL_DOCS_FULL_GLOB = "https://data.jmail.world/v1/documents-full/*.parquet"
 JMAIL_EMAILS_URL = "https://data.jmail.world/v1/emails.parquet"
 JMAIL_PEOPLE_URL = "https://data.jmail.world/v1/people.parquet"
 
+SHARD_MAP = {
+    "VOL00008": "VOL00008",
+    "VOL00008-2": "VOL00008",
+    "VOL00008-OFFICIAL-DOJ-LATEST": "VOL00008",
+    "VOL00009": "VOL00009",
+    "VOL00010": "VOL00010",
+    "DataSet11": "DataSet11",
+}
+DEFAULT_SHARD = "other"
+
+
+def resolve_shard(batch_id: str) -> str:
+    """Map a release batch to its Jmail documents-full shard filename."""
+    return SHARD_MAP.get(batch_id, DEFAULT_SHARD)
+
 
 def fetch_release_batches() -> list[str]:
     """Return list of all known release batch IDs from Jmail documents metadata."""
@@ -50,7 +65,8 @@ def fetch_documents_metadata(batch_id: Optional[str] = None) -> list[dict]:
 
 def fetch_document_text(doc_id: str, batch_id: str) -> Optional[str]:
     """Return extracted text for a single document ID within a batch."""
-    url = f"https://data.jmail.world/v1/documents-full/{batch_id}.parquet"
+    shard = resolve_shard(batch_id)
+    url = f"https://data.jmail.world/v1/documents-full/{shard}.parquet"
     with duckdb.connect() as conn:
         conn.execute("SET force_download=true")
         df = conn.execute(f"""
@@ -80,7 +96,8 @@ def fetch_documents_text_batch(doc_ids: list[str], batch_id: str) -> dict[str, s
             )
     if not doc_ids:
         return {}
-    url = f"https://data.jmail.world/v1/documents-full/{batch_id}.parquet"
+    shard = resolve_shard(batch_id)
+    url = f"https://data.jmail.world/v1/documents-full/{shard}.parquet"
     ids_str = ", ".join(f"'{i}'" for i in doc_ids)
     try:
         with duckdb.connect() as conn:
