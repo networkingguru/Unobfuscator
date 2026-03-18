@@ -7,6 +7,10 @@ from core.db import (
     create_match_group, add_group_member, get_doc_group, merge_groups,
     upsert_merge_result, get_config, set_config
 )
+from core.db import (
+    get_docs_needing_text_recovery, get_docs_needing_backfill,
+    update_extracted_text, mark_ocr_processed
+)
 
 
 @pytest.fixture
@@ -141,3 +145,88 @@ def test_upsert_document_without_pdf_url_stores_null(conn):
     row = conn.execute("SELECT pdf_url FROM documents WHERE id = 99").fetchone()
     assert row is not None
     assert row["pdf_url"] is None
+
+
+def test_new_columns_exist_after_init(conn):
+    row = conn.execute("SELECT text_source, ocr_processed, page_tags FROM documents LIMIT 0").fetchone()
+
+
+def test_update_extracted_text_stores_text_and_source(conn):
+    upsert_document(conn, SAMPLE_DOC)
+    conn.commit()
+    update_extracted_text(conn, SAMPLE_DOC["id"], "Recovered text", "ocr")
+    conn.commit()
+    row = conn.execute("SELECT extracted_text, text_source FROM documents WHERE id = ?", (SAMPLE_DOC["id"],)).fetchone()
+    assert row["extracted_text"] == "Recovered text"
+    assert row["text_source"] == "ocr"
+
+
+def test_update_extracted_text_stores_page_tags(conn):
+    upsert_document(conn, SAMPLE_DOC)
+    conn.commit()
+    tags = '{"0": "text", "1": "photo"}'
+    update_extracted_text(conn, SAMPLE_DOC["id"], "text", "ocr", page_tags=tags)
+    conn.commit()
+    row = conn.execute("SELECT page_tags FROM documents WHERE id = ?", (SAMPLE_DOC["id"],)).fetchone()
+    assert row["page_tags"] == tags
+
+
+def test_mark_ocr_processed(conn):
+    upsert_document(conn, SAMPLE_DOC)
+    conn.commit()
+    mark_ocr_processed(conn, SAMPLE_DOC["id"])
+    conn.commit()
+    row = conn.execute("SELECT ocr_processed FROM documents WHERE id = ?", (SAMPLE_DOC["id"],)).fetchone()
+    assert row["ocr_processed"] == 1
+
+
+def test_get_docs_needing_text_recovery(conn):
+    doc_no_text = {**SAMPLE_DOC, "id": "no_text", "extracted_text": ""}
+    doc_has_text = {**SAMPLE_DOC, "id": "has_text", "extracted_text": "hello world"}
+    upsert_document(conn, doc_no_text)
+    upsert_document(conn, doc_has_text)
+    conn.commit()
+    docs = get_docs_needing_text_recovery(conn)
+    ids = [d["id"] for d in docs]
+    assert "no_text" in ids
+    assert "has_text" not in ids
+
+
+def test_get_docs_needing_text_recovery_excludes_ocr_processed(conn):
+    doc = {**SAMPLE_DOC, "id": "processed", "extracted_text": ""}
+    upsert_document(conn, doc)
+    mark_ocr_processed(conn, "processed")
+    conn.commit()
+    docs = get_docs_needing_text_recovery(conn)
+    ids = [d["id"] for d in docs]
+    assert "processed" not in ids
+
+
+def test_get_docs_needing_backfill(conn):
+    doc = {**SAMPLE_DOC, "id": "backfill_me", "extracted_text": "", "release_batch": "VOL00001"}
+    upsert_document(conn, doc)
+    mark_text_processed(conn, "backfill_me")
+    conn.commit()
+    docs = get_docs_needing_backfill(conn, known_batches={"VOL00001"})
+    ids = [d["id"] for d in docs]
+    assert "backfill_me" in ids
+
+
+def test_get_docs_needing_backfill_excludes_unknown_batch(conn):
+    doc = {**SAMPLE_DOC, "id": "unknown_batch", "extracted_text": "", "release_batch": "MYSTERY"}
+    upsert_document(conn, doc)
+    mark_text_processed(conn, "unknown_batch")
+    conn.commit()
+    docs = get_docs_needing_backfill(conn, known_batches={"VOL00001"})
+    ids = [d["id"] for d in docs]
+    assert "unknown_batch" not in ids
+
+
+def test_migration_sets_text_source_for_existing_docs(conn):
+    upsert_document(conn, SAMPLE_DOC)
+    conn.commit()
+    from core.db import _migrate_text_recovery_columns
+    _migrate_text_recovery_columns(conn)
+    conn.commit()
+    row = conn.execute("SELECT text_source FROM documents WHERE id = ?", (SAMPLE_DOC["id"],)).fetchone()
+    assert row["text_source"] == "jmail"

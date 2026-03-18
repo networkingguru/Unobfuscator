@@ -16,7 +16,10 @@ CREATE TABLE IF NOT EXISTS documents (
     pdf_url TEXT,
     indexed_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     text_processed BOOLEAN DEFAULT 0,
-    pdf_processed BOOLEAN DEFAULT 0
+    pdf_processed BOOLEAN DEFAULT 0,
+    text_source TEXT,
+    ocr_processed BOOLEAN DEFAULT 0,
+    page_tags TEXT
 );
 
 CREATE TABLE IF NOT EXISTS document_fingerprints (
@@ -90,6 +93,8 @@ def init_db(db_path: str) -> None:
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
     with get_connection(db_path) as conn:
         conn.executescript(SCHEMA)
+        _migrate_text_recovery_columns(conn)
+        conn.commit()
 
 
 def upsert_document(conn, doc: dict) -> None:
@@ -309,4 +314,60 @@ def get_all_recovery_groups(conn) -> list[dict]:
         FROM merge_results
         WHERE recovered_count > 0
     """).fetchall()
+    return [dict(r) for r in rows]
+
+
+def _migrate_text_recovery_columns(conn) -> None:
+    for col, typedef in [
+        ("text_source", "TEXT"),
+        ("ocr_processed", "BOOLEAN DEFAULT 0"),
+        ("page_tags", "TEXT"),
+    ]:
+        try:
+            conn.execute(f"ALTER TABLE documents ADD COLUMN {col} {typedef}")
+        except Exception:
+            pass
+    conn.execute("""
+        UPDATE documents SET text_source = 'jmail'
+        WHERE extracted_text IS NOT NULL AND extracted_text != ''
+          AND text_source IS NULL
+    """)
+
+
+def update_extracted_text(conn, doc_id: str, text: str, text_source: str,
+                          page_tags: str = None) -> None:
+    conn.execute("""
+        UPDATE documents SET extracted_text = ?, text_source = ?, page_tags = ?
+        WHERE id = ?
+    """, (text, text_source, page_tags, doc_id))
+
+
+def mark_ocr_processed(conn, doc_id: str) -> None:
+    conn.execute("UPDATE documents SET ocr_processed = 1 WHERE id = ?", (doc_id,))
+
+
+def get_docs_needing_text_recovery(conn, limit: int = 100) -> list[dict]:
+    rows = conn.execute("""
+        SELECT id, source, release_batch, original_filename, pdf_url
+        FROM documents
+        WHERE ocr_processed = 0
+          AND (extracted_text IS NULL OR extracted_text = '')
+        LIMIT ?
+    """, (limit,)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_docs_needing_backfill(conn, known_batches: set, limit: int = 1000) -> list[dict]:
+    if not known_batches:
+        return []
+    placeholders = ",".join("?" * len(known_batches))
+    rows = conn.execute(f"""
+        SELECT id, release_batch
+        FROM documents
+        WHERE text_processed = 1
+          AND (extracted_text IS NULL OR extracted_text = '')
+          AND text_source IS NULL
+          AND release_batch IN ({placeholders})
+        LIMIT ?
+    """, (*known_batches, limit)).fetchall()
     return [dict(r) for r in rows]
