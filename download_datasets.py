@@ -83,6 +83,13 @@ DATASETS = [
         "sha256": "558010B96B7980ED529A2AD4EA224123A59446927E4441D23A2E8E5C2361EE07",
     },
     {
+        "id": 9,
+        "url": "https://archive.org/download/data-set-9/DATA%20SET%209.zip",
+        "source_type": "archive.org",
+        "source_label": _ARCHIVE_ORG_LABEL,
+        "sha256": None,
+    },
+    {
         "id": 12,
         "url": "https://archive.org/download/data-set-12_202601/DataSet%2012.zip",
         "source_type": "archive.org",
