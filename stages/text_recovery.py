@@ -10,7 +10,7 @@ import fitz
 import numpy as np
 from PIL import Image
 
-from core.api import fetch_documents_text_batch, resolve_shard, SHARD_MAP, DEFAULT_SHARD
+from core.api import fetch_documents_text_batch, resolve_shard
 from core.db import (
     get_docs_needing_backfill, get_docs_needing_text_recovery,
     update_extracted_text, mark_ocr_processed, upsert_fingerprint
@@ -177,7 +177,10 @@ def _process_single_doc(conn, doc: dict, redaction_markers: list[str],
             logger.warning("Failed to open image %s: %s", file_path, e)
             mark_ocr_processed(conn, doc_id)
             return False
-        text, tag = ocr_image(img)
+        try:
+            text, tag = ocr_image(img)
+        finally:
+            img.close()
         tags_json = json.dumps({"0": tag})
         if text.strip():
             update_extracted_text(conn, doc_id, text, "ocr", page_tags=tags_json)

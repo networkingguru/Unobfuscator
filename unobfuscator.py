@@ -158,12 +158,12 @@ def _run_one_cycle(conn, cfg: dict) -> None:
 
     # Phase 5.5: Text recovery (Jmail backfill + OCR)
     if not _shutdown_requested:
-        _set_activity("Stage 4.5 Text Recovery: backfill + OCR")
-        logger.info("Stage 4.5: starting text recovery")
+        _set_activity("Stage 5.5 Text Recovery: backfill + OCR")
+        logger.info("Stage 5.5: starting text recovery")
         min_wpp = cfg_get(cfg, "ocr.min_words_per_page", default=50)
         tr_count = run_text_recovery(conn, redaction_markers=markers,
                                      min_words_per_page=min_wpp)
-        logger.info("Stage 4.5: recovered text for %d documents", tr_count)
+        logger.info("Stage 5.5: recovered text for %d documents", tr_count)
 
     if not _shutdown_requested:
         _set_activity("Stage 5 Output: generating files")

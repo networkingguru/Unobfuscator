@@ -218,6 +218,34 @@ def test_run_text_recovery_skips_already_backfilled(db_conn):
     mock_fetch.assert_not_called()
 
 
+def test_backfill_miss_marks_text_source_and_terminates(db_conn):
+    """Docs not found in Jmail should get text_source='backfill_miss' so
+    the backfill loop terminates instead of re-querying them forever."""
+    doc = {
+        "id": "missing_in_jmail", "source": "doj",
+        "release_batch": "VOL00001", "original_filename": "missing.pdf",
+        "page_count": 1, "size_bytes": 1000,
+        "description": "Test", "extracted_text": "",
+    }
+    upsert_document(db_conn, doc)
+    mark_text_processed(db_conn, doc["id"])
+    db_conn.commit()
+
+    with patch("stages.text_recovery.fetch_documents_text_batch") as mock_fetch:
+        # Jmail returns nothing for this doc
+        mock_fetch.return_value = {}
+        run_text_recovery(db_conn, redaction_markers=["[REDACTED]"])
+
+    row = db_conn.execute(
+        "SELECT text_source, extracted_text FROM documents WHERE id = ?",
+        ("missing_in_jmail",)
+    ).fetchone()
+    assert row["text_source"] == "backfill_miss"
+    assert row["extracted_text"] == ""
+    # Crucially: fetch was called exactly once (not in an infinite loop)
+    mock_fetch.assert_called_once()
+
+
 def test_run_text_recovery_processes_pdf_with_text_layer(db_conn, tmp_path):
     """A doc with a cached PDF should get text from the text layer."""
     cache_dir = tmp_path / "pdf_cache" / "VOL00001"
