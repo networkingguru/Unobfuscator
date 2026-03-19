@@ -235,8 +235,12 @@ def run_text_recovery(conn, redaction_markers: list[str],
     ).fetchall()
     backfill_batches = {row[0] for row in db_batches}
 
-    docs = get_docs_needing_backfill(conn, known_batches=backfill_batches)
-    if docs:
+    while True:
+        docs = get_docs_needing_backfill(conn, known_batches=backfill_batches,
+                                         limit=5000)
+        if not docs:
+            break
+
         by_shard: dict[str, list[dict]] = {}
         for doc in docs:
             shard = resolve_shard(doc["release_batch"])
@@ -244,6 +248,8 @@ def run_text_recovery(conn, redaction_markers: list[str],
 
         for shard, shard_docs in by_shard.items():
             doc_ids = [d["id"] for d in shard_docs]
+            # Any batch_id works here — resolve_shard inside
+            # fetch_documents_text_batch maps it to the same shard file.
             batch_id = shard_docs[0]["release_batch"]
             try:
                 text_map = fetch_documents_text_batch(doc_ids, batch_id)
@@ -255,8 +261,20 @@ def run_text_recovery(conn, redaction_markers: list[str],
                 text = text_map.get(doc["id"])
                 if text and text.strip():
                     update_extracted_text(conn, doc["id"], text, "jmail")
-                    _build_and_store_fingerprint(conn, doc["id"], text, redaction_markers)
+                    _build_and_store_fingerprint(
+                        conn, doc["id"], text, redaction_markers
+                    )
+                    mark_ocr_processed(conn, doc["id"])
                     recovered += 1
+                else:
+                    # Not found in Jmail — set text_source so this doc
+                    # won't be re-queried by get_docs_needing_backfill
+                    # (which filters on text_source IS NULL).
+                    # Leave extracted_text empty so OCR can still pick it up.
+                    conn.execute(
+                        "UPDATE documents SET text_source = 'backfill_miss' "
+                        "WHERE id = ?", (doc["id"],)
+                    )
             conn.commit()
 
     # --- Step 2 & 3: Text layer extraction + OCR ---
