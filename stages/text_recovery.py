@@ -3,14 +3,17 @@
 import json
 import logging
 import shutil
+import tempfile
 from pathlib import Path
 from typing import Optional
+
+import duckdb
 
 import fitz
 import numpy as np
 from PIL import Image
 
-from core.api import fetch_documents_text_batch, resolve_shard
+from core.api import resolve_shard
 from core.db import (
     get_docs_needing_backfill, get_docs_needing_text_recovery,
     update_extracted_text, mark_ocr_processed, upsert_fingerprint
@@ -233,59 +236,93 @@ def run_text_recovery(conn, redaction_markers: list[str],
     recovered = 0
 
     # --- Step 1: Jmail shard backfill ---
-    # Fetch in small batches (200 per API call) to keep memory bounded.
-    # DuckDB downloads remote parquet data per query, so large IN-lists
-    # cause proportionally large memory spikes.
-    _BACKFILL_BATCH = 200
+    # Download each needed shard parquet once to a temp file, then query
+    # locally in small batches.  Remote parquet queries via DuckDB load
+    # the full extracted_text column into memory (~1-2 GB per shard),
+    # so re-downloading per batch is prohibitively expensive.
+    _BACKFILL_QUERY_BATCH = 500
 
     db_batches = conn.execute(
         "SELECT DISTINCT release_batch FROM documents WHERE release_batch IS NOT NULL"
     ).fetchall()
     backfill_batches = {row[0] for row in db_batches}
 
-    while True:
-        docs = get_docs_needing_backfill(conn, known_batches=backfill_batches,
-                                         limit=_BACKFILL_BATCH)
-        if not docs:
-            break
+    # Determine which shards actually have docs needing backfill.
+    all_backfill_docs = get_docs_needing_backfill(
+        conn, known_batches=backfill_batches, limit=100_000
+    )
+    shards_needed: dict[str, list[dict]] = {}
+    for doc in all_backfill_docs:
+        shard = resolve_shard(doc["release_batch"])
+        shards_needed.setdefault(shard, []).append(doc)
+    del all_backfill_docs
 
-        by_shard: dict[str, list[dict]] = {}
-        for doc in docs:
-            shard = resolve_shard(doc["release_batch"])
-            by_shard.setdefault(shard, []).append(doc)
+    for shard, shard_docs in shards_needed.items():
+        url = f"https://data.jmail.world/v1/documents-full/{shard}.parquet"
+        logger.info("Backfill: downloading %s shard (%d docs to check)...",
+                     shard, len(shard_docs))
 
-        for shard, shard_docs in by_shard.items():
-            doc_ids = [d["id"] for d in shard_docs]
-            batch_id = shard_docs[0]["release_batch"]
-            try:
-                text_map = fetch_documents_text_batch(doc_ids, batch_id)
-            except Exception as e:
-                logger.warning("Failed to fetch text for shard %s: %s", shard, e)
-                # Mark these docs so we don't retry them this run
-                for doc in shard_docs:
-                    conn.execute(
-                        "UPDATE documents SET text_source = 'backfill_miss' "
-                        "WHERE id = ?", (doc["id"],)
-                    )
-                conn.commit()
-                continue
-
+        # Download shard to a temp file so we can query locally
+        # without re-downloading for each batch.
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".parquet",
+                                              delete=False) as tmp:
+                tmp_path = tmp.name
+            with duckdb.connect() as ddb:
+                ddb.execute("SET force_download=true")
+                ddb.execute(f"""
+                    COPY (SELECT id, extracted_text
+                          FROM read_parquet('{url}'))
+                    TO '{tmp_path}' (FORMAT PARQUET, COMPRESSION ZSTD)
+                """)
+        except Exception as e:
+            logger.warning("Failed to download shard %s: %s", shard, e)
             for doc in shard_docs:
-                text = text_map.get(doc["id"])
-                if text and text.strip():
-                    update_extracted_text(conn, doc["id"], text, "jmail")
-                    _build_and_store_fingerprint(
-                        conn, doc["id"], text, redaction_markers
-                    )
-                    mark_ocr_processed(conn, doc["id"])
-                    recovered += 1
-                else:
-                    conn.execute(
-                        "UPDATE documents SET text_source = 'backfill_miss' "
-                        "WHERE id = ?", (doc["id"],)
-                    )
+                conn.execute(
+                    "UPDATE documents SET text_source = 'backfill_miss' "
+                    "WHERE id = ?", (doc["id"],)
+                )
             conn.commit()
-            del text_map  # free memory before next shard
+            continue
+
+        logger.info("Backfill: shard %s downloaded, querying locally...", shard)
+
+        # Query the local file in batches to keep memory bounded.
+        try:
+            for i in range(0, len(shard_docs), _BACKFILL_QUERY_BATCH):
+                batch = shard_docs[i:i + _BACKFILL_QUERY_BATCH]
+                doc_ids = [d["id"] for d in batch]
+                ids_str = ", ".join(f"'{did}'" for did in doc_ids)
+                with duckdb.connect() as ddb:
+                    rows = ddb.execute(f"""
+                        SELECT id, extracted_text
+                        FROM read_parquet('{tmp_path}')
+                        WHERE id IN ({ids_str})
+                    """).fetchall()
+                text_map = {r[0]: r[1] for r in rows}
+                del rows
+
+                for doc in batch:
+                    text = text_map.get(doc["id"])
+                    if text and isinstance(text, str) and text.strip():
+                        update_extracted_text(conn, doc["id"], text, "jmail")
+                        _build_and_store_fingerprint(
+                            conn, doc["id"], text, redaction_markers
+                        )
+                        mark_ocr_processed(conn, doc["id"])
+                        recovered += 1
+                    else:
+                        conn.execute(
+                            "UPDATE documents SET text_source = 'backfill_miss' "
+                            "WHERE id = ?", (doc["id"],)
+                        )
+                conn.commit()
+                del text_map
+                logger.info("Backfill: %s — processed %d/%d docs",
+                            shard, min(i + _BACKFILL_QUERY_BATCH, len(shard_docs)),
+                            len(shard_docs))
+        finally:
+            Path(tmp_path).unlink(missing_ok=True)
 
     # --- Step 2 & 3: Text layer extraction + OCR ---
     while True:

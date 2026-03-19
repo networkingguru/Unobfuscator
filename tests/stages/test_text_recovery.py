@@ -141,6 +141,8 @@ def test_ocr_image_returns_text_for_text_image():
 # Task 6: run_text_recovery orchestrator
 # ---------------------------------------------------------------------------
 
+import duckdb
+
 from core.db import (
     init_db, get_connection, upsert_document, mark_text_processed,
     get_all_fingerprints, update_extracted_text, mark_ocr_processed
@@ -157,7 +159,82 @@ def db_conn(tmp_path):
     c.close()
 
 
-def test_run_text_recovery_backfills_from_jmail(db_conn):
+def _write_shard_parquet(tmp_path, shard_name, rows):
+    """Write a local parquet file mimicking a Jmail shard.
+
+    rows: list of (id, extracted_text) tuples.
+    Returns the directory containing the parquet (used to patch the URL).
+    """
+    shard_dir = tmp_path / "shards"
+    shard_dir.mkdir(exist_ok=True)
+    path = shard_dir / f"{shard_name}.parquet"
+    with duckdb.connect() as ddb:
+        ddb.execute("CREATE TABLE shard (id VARCHAR, extracted_text VARCHAR)")
+        for doc_id, text in rows:
+            ddb.execute("INSERT INTO shard VALUES (?, ?)", [doc_id, text])
+        ddb.execute(f"COPY shard TO '{path}' (FORMAT PARQUET)")
+    return str(shard_dir)
+
+
+@pytest.fixture
+def _patch_shard_url(tmp_path):
+    """Context manager that patches the shard download URL to use local files.
+
+    Usage:
+        shard_dir = _write_shard_parquet(tmp_path, "other", [...])
+        with _patch_shard_url(shard_dir):
+            run_text_recovery(...)
+    """
+    from contextlib import contextmanager
+
+    @contextmanager
+    def _patcher(shard_dir):
+        orig = "https://data.jmail.world/v1/documents-full/{shard}.parquet"
+        # The backfill code constructs f-strings with {shard} interpolated.
+        # We can't patch f-strings, but we can patch duckdb.connect to
+        # intercept the COPY ... FROM query and redirect the URL.
+        # Simpler: just monkey-patch the URL template used in the code.
+        # Actually simplest: patch the COPY step by intercepting duckdb at
+        # the module level so read_parquet hits local files.
+        #
+        # The backfill constructs:
+        #   url = f"https://data.jmail.world/v1/documents-full/{shard}.parquet"
+        #   ddb.execute(f"COPY (SELECT ... FROM read_parquet('{url}')) TO ...")
+        #
+        # We intercept by replacing the URL prefix.
+        import stages.text_recovery as mod
+        # The code uses a literal f-string, so we patch via a wrapper
+        # around duckdb.connect that rewrites any SQL containing the URL.
+        real_connect = duckdb.connect
+
+        class _PatchedConn:
+            def __init__(self, conn):
+                self._conn = conn
+
+            def execute(self, sql, *args, **kwargs):
+                sql = sql.replace(
+                    "https://data.jmail.world/v1/documents-full/",
+                    shard_dir.rstrip("/") + "/"
+                )
+                return self._conn.execute(sql, *args, **kwargs)
+
+            def __enter__(self):
+                self._conn.__enter__()
+                return self
+
+            def __exit__(self, *args):
+                return self._conn.__exit__(*args)
+
+        def patched_connect(*args, **kwargs):
+            return _PatchedConn(real_connect(*args, **kwargs))
+
+        with patch.object(mod.duckdb, "connect", patched_connect):
+            yield
+
+    return _patcher
+
+
+def test_run_text_recovery_backfills_from_jmail(db_conn, tmp_path, _patch_shard_url):
     doc = {
         "id": "EFTA00000001.pdf", "source": "doj",
         "release_batch": "VOL00001", "original_filename": "EFTA00000001.pdf",
@@ -168,8 +245,9 @@ def test_run_text_recovery_backfills_from_jmail(db_conn):
     mark_text_processed(db_conn, doc["id"])
     db_conn.commit()
 
-    with patch("stages.text_recovery.fetch_documents_text_batch") as mock_fetch:
-        mock_fetch.return_value = {"EFTA00000001.pdf": "Backfilled text content here"}
+    shard_dir = _write_shard_parquet(tmp_path, "other",
+                                      [("EFTA00000001.pdf", "Backfilled text content here")])
+    with _patch_shard_url(shard_dir):
         count = run_text_recovery(db_conn, redaction_markers=["[REDACTED]"])
 
     assert count > 0
@@ -181,7 +259,7 @@ def test_run_text_recovery_backfills_from_jmail(db_conn):
     assert row["text_source"] == "jmail"
 
 
-def test_run_text_recovery_builds_fingerprint_after_backfill(db_conn):
+def test_run_text_recovery_builds_fingerprint_after_backfill(db_conn, tmp_path, _patch_shard_url):
     doc = {
         "id": "EFTA00000001.pdf", "source": "doj",
         "release_batch": "VOL00001", "original_filename": "EFTA00000001.pdf",
@@ -193,15 +271,16 @@ def test_run_text_recovery_builds_fingerprint_after_backfill(db_conn):
     db_conn.commit()
 
     long_text = "word " * 100
-    with patch("stages.text_recovery.fetch_documents_text_batch") as mock_fetch:
-        mock_fetch.return_value = {"EFTA00000001.pdf": long_text}
+    shard_dir = _write_shard_parquet(tmp_path, "other",
+                                      [("EFTA00000001.pdf", long_text)])
+    with _patch_shard_url(shard_dir):
         run_text_recovery(db_conn, redaction_markers=["[REDACTED]"])
 
     fps = get_all_fingerprints(db_conn)
     assert any(f["doc_id"] == "EFTA00000001.pdf" for f in fps)
 
 
-def test_run_text_recovery_skips_already_backfilled(db_conn):
+def test_run_text_recovery_skips_already_backfilled(db_conn, tmp_path, _patch_shard_url):
     doc = {
         "id": "already_done", "source": "doj",
         "release_batch": "VOL00001", "original_filename": "done.pdf",
@@ -212,13 +291,20 @@ def test_run_text_recovery_skips_already_backfilled(db_conn):
     mark_text_processed(db_conn, doc["id"])
     db_conn.commit()
 
-    with patch("stages.text_recovery.fetch_documents_text_batch") as mock_fetch:
-        mock_fetch.return_value = {}
+    # Write an empty shard — shouldn't be queried at all since doc has text
+    shard_dir = _write_shard_parquet(tmp_path, "other", [])
+    with _patch_shard_url(shard_dir):
         run_text_recovery(db_conn, redaction_markers=["[REDACTED]"])
-    mock_fetch.assert_not_called()
+
+    # Doc should be unchanged
+    row = db_conn.execute(
+        "SELECT extracted_text FROM documents WHERE id = ?",
+        ("already_done",)
+    ).fetchone()
+    assert row["extracted_text"] == "existing text"
 
 
-def test_backfill_miss_marks_text_source_and_terminates(db_conn):
+def test_backfill_miss_marks_text_source_and_terminates(db_conn, tmp_path, _patch_shard_url):
     """Docs not found in Jmail should get text_source='backfill_miss' so
     the backfill loop terminates instead of re-querying them forever."""
     doc = {
@@ -231,9 +317,10 @@ def test_backfill_miss_marks_text_source_and_terminates(db_conn):
     mark_text_processed(db_conn, doc["id"])
     db_conn.commit()
 
-    with patch("stages.text_recovery.fetch_documents_text_batch") as mock_fetch:
-        # Jmail returns nothing for this doc
-        mock_fetch.return_value = {}
+    # Shard exists but doesn't contain this doc
+    shard_dir = _write_shard_parquet(tmp_path, "other",
+                                      [("some_other_doc.pdf", "text")])
+    with _patch_shard_url(shard_dir):
         run_text_recovery(db_conn, redaction_markers=["[REDACTED]"])
 
     row = db_conn.execute(
@@ -242,11 +329,9 @@ def test_backfill_miss_marks_text_source_and_terminates(db_conn):
     ).fetchone()
     assert row["text_source"] == "backfill_miss"
     assert row["extracted_text"] == ""
-    # Crucially: fetch was called exactly once (not in an infinite loop)
-    mock_fetch.assert_called_once()
 
 
-def test_run_text_recovery_processes_pdf_with_text_layer(db_conn, tmp_path):
+def test_run_text_recovery_processes_pdf_with_text_layer(db_conn, tmp_path, _patch_shard_url):
     """A doc with a cached PDF should get text from the text layer."""
     cache_dir = tmp_path / "pdf_cache" / "VOL00001"
     cache_dir.mkdir(parents=True)
@@ -254,7 +339,6 @@ def test_run_text_recovery_processes_pdf_with_text_layer(db_conn, tmp_path):
     import fitz
     doc = fitz.open()
     page = doc.new_page()
-    # Use insert_textbox to ensure enough text
     rect = fitz.Rect(50, 50, 500, 700)
     page.insert_textbox(rect, "This is a test document with many words. " * 20, fontsize=11)
     pdf_path = cache_dir / "scan.pdf"
@@ -271,8 +355,9 @@ def test_run_text_recovery_processes_pdf_with_text_layer(db_conn, tmp_path):
     mark_text_processed(db_conn, db_doc["id"])
     db_conn.commit()
 
-    with patch("stages.text_recovery.fetch_documents_text_batch") as mock_fetch:
-        mock_fetch.return_value = {}
+    # Shard has no text for this doc — backfill will miss, then OCR picks it up
+    shard_dir = _write_shard_parquet(tmp_path, "other", [])
+    with _patch_shard_url(shard_dir):
         with patch("stages.text_recovery._CACHE_DIR", tmp_path / "pdf_cache"):
             run_text_recovery(db_conn, redaction_markers=["[REDACTED]"])
 
