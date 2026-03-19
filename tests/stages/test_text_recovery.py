@@ -129,12 +129,16 @@ def test_is_tesseract_available_returns_bool():
 def test_ocr_image_returns_text_for_text_image():
     if not _is_tesseract_available():
         pytest.skip("Tesseract not installed")
-    img = Image.new("L", (400, 100), color=240)
+    # Image must have enough dark pixels (>2%) to avoid "blank" classification.
+    # Simulate a scanned document page with multiple lines of text.
+    img = Image.new("L", (600, 400), color=240)
     from PIL import ImageDraw
     draw = ImageDraw.Draw(img)
-    draw.text((10, 30), "Hello World Test Document", fill=0)
+    for y in range(30, 380, 25):
+        draw.text((20, y), "The quick brown fox jumps over the lazy dog", fill=0)
     text, tag = ocr_image(img)
     assert tag == "text"
+    assert len(text) > 0
 
 
 # ---------------------------------------------------------------------------
