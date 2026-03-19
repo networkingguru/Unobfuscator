@@ -199,7 +199,8 @@ def run_phase0_email_fastpath(conn, min_header_matches: int = 2) -> set[int]:
 
 
 def load_fingerprints(conn, num_perm: int = 128,
-                      exclude: set = None) -> dict[str, MinHash]:
+                      exclude: set = None,
+                      memory_limit_pct: int = 0) -> dict[str, MinHash]:
     """Load stored fingerprints from DB and reconstruct MinHash objects.
 
     Args:
@@ -230,6 +231,8 @@ def load_fingerprints(conn, num_perm: int = 128,
         offset += batch_size
         logger.info("Loaded %d / %d fingerprints (skipped grouped)",
                      len(result), total)
+        if memory_limit_pct > 0:
+            _check_memory(memory_limit_pct)
 
     return result
 
@@ -237,6 +240,7 @@ def load_fingerprints(conn, num_perm: int = 128,
 def run_phase2_lsh_candidates(
     conn, threshold: float = 0.70, num_perm: int = 128,
     redaction_markers: list[str] = None,
+    memory_limit_pct: int = 0,
 ) -> list[tuple[str, str]]:
     """Use LSH banding to find candidate pairs likely to be the same document.
 
@@ -267,8 +271,27 @@ def run_phase2_lsh_candidates(
         ).fetchall()
     }
 
-    fingerprints = load_fingerprints(conn, num_perm=num_perm,
-                                      exclude=already_grouped)
+    try:
+        fingerprints = load_fingerprints(conn, num_perm=num_perm,
+                                          exclude=already_grouped,
+                                          memory_limit_pct=memory_limit_pct)
+    except MemoryLimitExceeded as e:
+        logger.warning(
+            "LSH aborted — memory limit exceeded "
+            "(RSS: %s MB, limit: %s MB / %d%% of %s MB).\n"
+            "Root cause: MinHash fingerprint loading exceeded available memory budget.\n"
+            "Tips:\n"
+            "  - Increase memory.limit_percent in config.yaml (current: %d)\n"
+            "  - Run on a machine with more RAM\n"
+            "  - Reduce fingerprint count by processing fewer batches",
+            f"{e.rss_mb:,}", f"{e.limit_mb:,}", e.limit_pct,
+            f"{e.total_mb:,}", e.limit_pct
+        )
+        set_config(conn, "lsh_memory_warning",
+                   f"Skipped: memory limit exceeded "
+                   f"({e.rss_mb:,} MB / {e.limit_pct}%)")
+        conn.commit()
+        return []
     del already_grouped  # free the set
     if len(fingerprints) < 2:
         return []
@@ -314,6 +337,9 @@ def run_phase2_lsh_candidates(
     # Remember current counts so we can skip the rebuild next cycle if nothing changed
     set_config(conn, "lsh_last_fp_count", fp_count)
     set_config(conn, "lsh_last_group_count", group_count)
+    conn.commit()
+
+    set_config(conn, "lsh_memory_warning", "")
     conn.commit()
 
     return candidates

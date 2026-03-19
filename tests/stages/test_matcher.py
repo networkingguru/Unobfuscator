@@ -3,7 +3,7 @@ import numpy as np
 from datasketch import MinHash
 from core.db import (
     init_db, get_connection, upsert_document, upsert_fingerprint,
-    get_doc_group, create_match_group, add_group_member
+    get_doc_group, create_match_group, add_group_member, get_config
 )
 from unittest.mock import patch
 from stages.matcher import (
@@ -313,6 +313,63 @@ def test_check_memory_skips_when_rss_unavailable():
     with patch("stages.matcher._get_rss_bytes", return_value=0), \
          patch("stages.matcher._get_total_ram_bytes", return_value=16_000_000_000):
         _check_memory(70)  # no exception
+
+
+def test_load_fingerprints_raises_when_memory_exceeded(conn):
+    """load_fingerprints should raise MemoryLimitExceeded when over limit."""
+    for i in range(5):
+        text = f"unique text number {i} " * 50
+        seed_doc(conn, f"doc_{i}", text)
+        sig = build_fingerprint(clean_text(text, []))
+        upsert_fingerprint(conn, f"doc_{i}", sig, 100)
+    conn.commit()
+
+    with patch("stages.matcher._check_memory",
+               side_effect=MemoryLimitExceeded(8547, 8192, 70, 16384)):
+        with pytest.raises(MemoryLimitExceeded):
+            load_fingerprints(conn, memory_limit_pct=70)
+
+
+def test_phase2_catches_memory_exceeded_returns_empty(conn):
+    """run_phase2_lsh_candidates should return [] and write DB flag on memory exceeded."""
+    for i in range(5):
+        text = f"unique text number {i} " * 50
+        seed_doc(conn, f"doc_{i}", text)
+        sig = build_fingerprint(clean_text(text, []))
+        upsert_fingerprint(conn, f"doc_{i}", sig, 100)
+    conn.commit()
+
+    with patch("stages.matcher._check_memory",
+               side_effect=MemoryLimitExceeded(8547, 8192, 70, 16384)):
+        result = run_phase2_lsh_candidates(conn, memory_limit_pct=70)
+
+    assert result == []
+    warning = get_config(conn, "lsh_memory_warning", default="")
+    assert "memory limit" in warning.lower()
+
+
+def test_phase2_clears_warning_on_success(conn):
+    """A successful LSH run should clear any previous memory warning."""
+    from core.db import set_config
+    set_config(conn, "lsh_memory_warning", "previous warning")
+    conn.commit()
+
+    for i in range(2):
+        doc = {
+            "id": f"clear_test_{i}", "source": "test",
+            "release_batch": "TEST", "original_filename": f"t{i}.pdf",
+            "page_count": 1, "size_bytes": 100,
+            "description": "test", "extracted_text": f"text {i} " * 50,
+        }
+        upsert_document(conn, doc)
+        sig = build_fingerprint(clean_text(doc["extracted_text"], []))
+        upsert_fingerprint(conn, doc["id"], sig, 100)
+    conn.commit()
+
+    run_phase2_lsh_candidates(conn, memory_limit_pct=70)
+
+    warning = get_config(conn, "lsh_memory_warning", default="")
+    assert warning == ""
 
 
 def test_memory_limit_exceeded_has_correct_attributes():
