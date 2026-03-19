@@ -101,9 +101,14 @@ def run_phase0_email_fastpath(conn, min_header_matches: int = 2) -> set[int]:
     return matched
 
 
-def load_fingerprints(conn, num_perm: int = 128) -> dict[str, MinHash]:
-    """Load all stored fingerprints from DB and reconstruct MinHash objects."""
+def load_fingerprints(conn, num_perm: int = 128,
+                      exclude: set = None) -> dict[str, MinHash]:
+    """Load stored fingerprints from DB and reconstruct MinHash objects.
 
+    Args:
+        exclude: set of doc_ids to skip (e.g. already-grouped docs).
+                 Saves memory by not creating MinHash objects we'd discard.
+    """
     total = conn.execute("SELECT COUNT(*) FROM document_fingerprints").fetchone()[0]
     logger.info("Loading %d fingerprints from DB...", total)
 
@@ -119,12 +124,15 @@ def load_fingerprints(conn, num_perm: int = 128) -> dict[str, MinHash]:
         if not rows:
             break
         for row in rows:
+            if exclude and row["doc_id"] in exclude:
+                continue
             hashvalues = np.frombuffer(row["minhash_sig"], dtype=np.uint64)
             m = MinHash(num_perm=num_perm)
             m.hashvalues = hashvalues.copy()
             result[row["doc_id"]] = m
         offset += batch_size
-        logger.info("Loaded %d / %d fingerprints", len(result), total)
+        logger.info("Loaded %d / %d fingerprints (skipped grouped)",
+                     len(result), total)
 
     return result
 
@@ -153,21 +161,18 @@ def run_phase2_lsh_candidates(
                      "(%d fingerprints, %d group members)", fp_count, group_count)
         return []
 
-    fingerprints = load_fingerprints(conn, num_perm=num_perm)
-    if len(fingerprints) < 2:
-        return []
-
-    # Exclude docs already assigned to a group
+    # Exclude docs already assigned to a group — skip them during loading
+    # so we never allocate MinHash objects for them.
     already_grouped = {
         row["doc_id"]
         for row in conn.execute(
             "SELECT doc_id FROM match_group_members"
         ).fetchall()
     }
-    fingerprints = {
-        doc_id: mh for doc_id, mh in fingerprints.items()
-        if doc_id not in already_grouped
-    }
+
+    fingerprints = load_fingerprints(conn, num_perm=num_perm,
+                                      exclude=already_grouped)
+    del already_grouped  # free the set
     if len(fingerprints) < 2:
         return []
 
