@@ -17,6 +17,9 @@ polling:
 ocr:
   min_words_per_page: 50
 
+memory:
+  limit_percent: 70
+
 redaction_markers:
   - "[REDACTED]"
   - "[Redacted]"

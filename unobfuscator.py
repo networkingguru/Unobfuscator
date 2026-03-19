@@ -111,8 +111,10 @@ def _run_one_cycle(conn, cfg: dict) -> None:
 
     _set_activity("Stage 2 Matcher: LSH candidates")
     logger.info("Stage 2: building LSH index")
+    mem_limit = cfg_get(cfg, "memory.limit_percent", default=70)
     candidates = run_phase2_lsh_candidates(conn, threshold=threshold,
-                                            redaction_markers=markers)
+                                            redaction_markers=markers,
+                                            memory_limit_pct=mem_limit)
     logger.info("Stage 2: LSH found %d candidate pairs", len(candidates))
 
     _set_activity(f"Stage 2 Matcher: verifying {len(candidates)} candidates")
@@ -420,6 +422,7 @@ def status(ctx, doc):
         "SELECT COALESCE(SUM(recovered_count),0) FROM merge_results"
     ).fetchone()[0]
     output_dir = cfg_get(cfg, "output_dir", default="./output")
+    lsh_warning = get_config(conn, "lsh_memory_warning", default="")
 
     t = Table(title="Unobfuscator — Status", show_header=False)
     t.add_column("", style="bold")
@@ -429,6 +432,8 @@ def status(ctx, doc):
         t.add_row("Activity", activity)
     t.add_row("Stage 1 Indexer", f"{indexed:,} / {total:,} docs")
     t.add_row("Stage 2 Matcher", f"{fps:,} fingerprints built")
+    if lsh_warning:
+        t.add_row("LSH Warning", f"[yellow]{lsh_warning}[/yellow]")
     t.add_row("Stage 3 Merger", f"{groups:,} groups merged")
     t.add_row("Stage 4 PDF Processor", f"{pdf_done:,} / {pdf_total:,} PDFs done")
     t.add_row("Text Recovery", f"{ocr_done:,} processed, {ocr_pending:,} pending")
