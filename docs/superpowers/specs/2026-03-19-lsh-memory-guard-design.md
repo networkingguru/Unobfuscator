@@ -28,7 +28,13 @@ Use `os.sysconf('SC_PAGE_SIZE') * os.sysconf('SC_PHYS_PAGES')` on Linux. On macO
 
 ### Getting Current RSS
 
-`resource.getrusage(resource.RUSAGE_SELF).ru_maxrss` — returns bytes on macOS, KB on Linux. Detect platform via `sys.platform` and normalize to bytes.
+`resource.getrusage(resource.RUSAGE_SELF).ru_maxrss` returns **peak** RSS (high-water mark), not current — once memory drops after a successful LSH run, peak stays high and would false-trigger on the next cycle.
+
+Instead, read current RSS directly:
+
+- **macOS:** `ctypes` call to `mach_task_basic_info` via `libSystem` — returns `resident_size` in bytes. No subprocess, no dependency.
+- **Linux:** Read `/proc/self/statm`, field index 1 (resident pages) × `os.sysconf('SC_PAGE_SIZE')`.
+- **Fallback:** If neither works, log a warning and disable the guard (never raise `MemoryLimitExceeded`).
 
 ### Check Points
 
@@ -38,7 +44,7 @@ Two check points, both in `stages/matcher.py`:
 
 2. **`run_phase2_lsh_candidates()`** — catches `MemoryLimitExceeded` from `load_fingerprints()`. Logs warning, writes DB flag, returns `[]`.
 
-No check during LSH insertion or querying. If loading completes within budget, the index build adds ~30-50% more — if that's a problem, the user should lower `limit_percent`.
+No check during LSH insertion or querying. The check during loading is sufficient because loading is the first half of memory growth — if loading 1.3M fingerprints uses 4 GB and passes on a machine with an 11 GB budget (70% of 16 GB), the index build adds ~30-50% more (~6 GB total), still within budget. On machines where loading itself exceeds the budget, the guard catches it before the even-heavier index build begins. If the index build is the problem on a particular machine, the user should lower `limit_percent`.
 
 ### MemoryLimitExceeded Exception
 
@@ -86,7 +92,7 @@ When `MemoryLimitExceeded` is raised:
      - Reduce fingerprint count by processing fewer batches
    ```
 3. Writes `set_config(conn, "lsh_memory_warning", "<message>")` with a short summary
-4. Does NOT update `lsh_last_fp_count` / `lsh_last_group_count` — so next cycle with new fingerprints will retry
+4. Does NOT update `lsh_last_fp_count` / `lsh_last_group_count` — so the next cycle will retry **only if new fingerprints or group changes arrive** (which is the existing skip-check logic). If the dataset is stable and the machine simply doesn't have enough RAM, LSH stays skipped — this is correct behavior since nothing would change on retry.
 5. Returns `[]`
 
 ### Clearing the Warning
@@ -115,8 +121,8 @@ set_config(conn, "lsh_memory_warning", "")
 
 | File | Change |
 |------|--------|
-| `stages/matcher.py` | Add `MemoryLimitExceeded`, `_get_total_ram_bytes()`, `_get_rss_bytes()`, `_check_memory()`. Add check in `load_fingerprints()` loop. Catch exception in `run_phase2_lsh_candidates()`. Clear flag on success. |
-| `unobfuscator.py` | Pass `memory_limit_pct` from config to `run_phase2_lsh_candidates()`. Add LSH warning row to `status` command. |
+| `stages/matcher.py` | Add `MemoryLimitExceeded`, `_get_total_ram_bytes()`, `_get_rss_bytes()`, `_check_memory()`. Add `memory_limit_pct` parameter to `load_fingerprints()` and `run_phase2_lsh_candidates()`. Add check in `load_fingerprints()` loop. Catch exception in `run_phase2_lsh_candidates()`. Clear flag on success. |
+| `unobfuscator.py` | Read `cfg_get(cfg, "memory.limit_percent", default=70)` and pass to `run_phase2_lsh_candidates(conn, ..., memory_limit_pct=limit)`. Add LSH warning row to `status` command. |
 | `config.yaml` | Add `memory.limit_percent: 70`. |
 
 ## Testing
