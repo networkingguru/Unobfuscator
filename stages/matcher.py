@@ -32,21 +32,31 @@ _HEADER_PATTERNS = [
 # complementary redactions are present (secondary confirmation signal).
 _SECONDARY_OVERLAP_THRESHOLD = 500
 
+_DEFAULT_RAM_BYTES = 16 * 1024 ** 3  # 16 GB fallback when detection fails
+_total_ram_cache: int | None = None  # cached — total RAM never changes
+
 
 def _get_total_ram_bytes() -> int:
-    """Return total physical RAM in bytes."""
+    """Return total physical RAM in bytes (cached after first call)."""
+    global _total_ram_cache
+    if _total_ram_cache is not None:
+        return _total_ram_cache
+
     if sys.platform == "darwin":
         import subprocess
         try:
             out = subprocess.check_output(["sysctl", "-n", "hw.memsize"],
                                            text=True).strip()
-            return int(out)
+            _total_ram_cache = int(out)
+            return _total_ram_cache
         except Exception:
-            return 16 * 1024 * 1024 * 1024  # 16 GB fallback
+            _total_ram_cache = _DEFAULT_RAM_BYTES
+            return _total_ram_cache
     try:
-        return os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+        _total_ram_cache = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
     except Exception:
-        return 16 * 1024 * 1024 * 1024  # 16 GB fallback
+        _total_ram_cache = _DEFAULT_RAM_BYTES
+    return _total_ram_cache
 
 
 def _get_rss_bytes() -> int:
@@ -337,8 +347,6 @@ def run_phase2_lsh_candidates(
     # Remember current counts so we can skip the rebuild next cycle if nothing changed
     set_config(conn, "lsh_last_fp_count", fp_count)
     set_config(conn, "lsh_last_group_count", group_count)
-    conn.commit()
-
     set_config(conn, "lsh_memory_warning", "")
     conn.commit()
 
