@@ -93,6 +93,39 @@ def _get_rss_bytes() -> int:
         return 0
 
 
+class MemoryLimitExceeded(Exception):
+    """Raised when RSS exceeds the configured memory limit."""
+    def __init__(self, rss_mb: int, limit_mb: int, limit_pct: int, total_mb: int):
+        self.rss_mb = rss_mb
+        self.limit_mb = limit_mb
+        self.limit_pct = limit_pct
+        self.total_mb = total_mb
+        super().__init__(
+            f"RSS {rss_mb:,} MB exceeds limit {limit_mb:,} MB "
+            f"({limit_pct}% of {total_mb:,} MB)"
+        )
+
+
+def _check_memory(limit_pct: int) -> None:
+    """Raise MemoryLimitExceeded if current RSS exceeds limit_pct of total RAM.
+
+    If RSS cannot be determined (returns 0), the guard is silently disabled.
+    """
+    rss = _get_rss_bytes()
+    if rss == 0:
+        return  # guard disabled — can't measure RSS on this platform
+    total = _get_total_ram_bytes()
+    limit = total * limit_pct // 100
+    if rss > limit:
+        mb = 1024 * 1024
+        raise MemoryLimitExceeded(
+            rss_mb=rss // mb,
+            limit_mb=limit // mb,
+            limit_pct=limit_pct,
+            total_mb=total // mb,
+        )
+
+
 def extract_email_headers(text: str) -> list[str]:
     """Return a list of normalized header values found in the text."""
     headers = []

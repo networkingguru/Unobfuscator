@@ -5,11 +5,12 @@ from core.db import (
     init_db, get_connection, upsert_document, upsert_fingerprint,
     get_doc_group, create_match_group, add_group_member
 )
+from unittest.mock import patch
 from stages.matcher import (
     extract_email_headers, run_phase0_email_fastpath,
     load_fingerprints, run_phase2_lsh_candidates,
     find_longest_common_substring, run_phase3_verify_and_group,
-    _get_total_ram_bytes, _get_rss_bytes,
+    _get_total_ram_bytes, _get_rss_bytes, _check_memory, MemoryLimitExceeded,
 )
 from stages.indexer import build_fingerprint, clean_text
 
@@ -283,3 +284,40 @@ def test_rss_is_less_than_total_ram():
     rss = _get_rss_bytes()
     total = _get_total_ram_bytes()
     assert rss < total
+
+
+# --- Memory check and exception ---
+
+
+def test_check_memory_passes_when_under_limit():
+    """No exception when RSS is well under the limit."""
+    with patch("stages.matcher._get_rss_bytes", return_value=1_000_000_000), \
+         patch("stages.matcher._get_total_ram_bytes", return_value=16_000_000_000):
+        _check_memory(70)  # no exception
+
+
+def test_check_memory_raises_when_over_limit():
+    """MemoryLimitExceeded when RSS exceeds limit_pct of total RAM."""
+    with patch("stages.matcher._get_rss_bytes", return_value=12_000_000_000), \
+         patch("stages.matcher._get_total_ram_bytes", return_value=16_000_000_000):
+        with pytest.raises(MemoryLimitExceeded) as exc_info:
+            _check_memory(70)
+        assert exc_info.value.rss_mb == 12_000_000_000 // (1024 * 1024)
+        assert exc_info.value.limit_mb == (16_000_000_000 * 70 // 100) // (1024 * 1024)
+        assert exc_info.value.limit_pct == 70
+        assert exc_info.value.total_mb == 16_000_000_000 // (1024 * 1024)
+
+
+def test_check_memory_skips_when_rss_unavailable():
+    """If _get_rss_bytes returns 0, guard is disabled — no exception."""
+    with patch("stages.matcher._get_rss_bytes", return_value=0), \
+         patch("stages.matcher._get_total_ram_bytes", return_value=16_000_000_000):
+        _check_memory(70)  # no exception
+
+
+def test_memory_limit_exceeded_has_correct_attributes():
+    exc = MemoryLimitExceeded(rss_mb=8547, limit_mb=8192, limit_pct=50, total_mb=16384)
+    assert exc.rss_mb == 8547
+    assert exc.limit_mb == 8192
+    assert exc.limit_pct == 50
+    assert exc.total_mb == 16384
