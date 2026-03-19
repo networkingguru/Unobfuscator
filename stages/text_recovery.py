@@ -233,6 +233,11 @@ def run_text_recovery(conn, redaction_markers: list[str],
     recovered = 0
 
     # --- Step 1: Jmail shard backfill ---
+    # Fetch in small batches (200 per API call) to keep memory bounded.
+    # DuckDB downloads remote parquet data per query, so large IN-lists
+    # cause proportionally large memory spikes.
+    _BACKFILL_BATCH = 200
+
     db_batches = conn.execute(
         "SELECT DISTINCT release_batch FROM documents WHERE release_batch IS NOT NULL"
     ).fetchall()
@@ -240,7 +245,7 @@ def run_text_recovery(conn, redaction_markers: list[str],
 
     while True:
         docs = get_docs_needing_backfill(conn, known_batches=backfill_batches,
-                                         limit=5000)
+                                         limit=_BACKFILL_BATCH)
         if not docs:
             break
 
@@ -251,13 +256,18 @@ def run_text_recovery(conn, redaction_markers: list[str],
 
         for shard, shard_docs in by_shard.items():
             doc_ids = [d["id"] for d in shard_docs]
-            # Any batch_id works here — resolve_shard inside
-            # fetch_documents_text_batch maps it to the same shard file.
             batch_id = shard_docs[0]["release_batch"]
             try:
                 text_map = fetch_documents_text_batch(doc_ids, batch_id)
             except Exception as e:
                 logger.warning("Failed to fetch text for shard %s: %s", shard, e)
+                # Mark these docs so we don't retry them this run
+                for doc in shard_docs:
+                    conn.execute(
+                        "UPDATE documents SET text_source = 'backfill_miss' "
+                        "WHERE id = ?", (doc["id"],)
+                    )
+                conn.commit()
                 continue
 
             for doc in shard_docs:
@@ -270,15 +280,12 @@ def run_text_recovery(conn, redaction_markers: list[str],
                     mark_ocr_processed(conn, doc["id"])
                     recovered += 1
                 else:
-                    # Not found in Jmail — set text_source so this doc
-                    # won't be re-queried by get_docs_needing_backfill
-                    # (which filters on text_source IS NULL).
-                    # Leave extracted_text empty so OCR can still pick it up.
                     conn.execute(
                         "UPDATE documents SET text_source = 'backfill_miss' "
                         "WHERE id = ?", (doc["id"],)
                     )
             conn.commit()
+            del text_map  # free memory before next shard
 
     # --- Step 2 & 3: Text layer extraction + OCR ---
     while True:
