@@ -4,8 +4,12 @@ Logic reference: PIPELINE.md — Phases 0, 2, and 3
 (Phase 1 fingerprinting is done by the Indexer in Stage 1.)
 """
 
+import ctypes
+import ctypes.util
 import logging
+import os
 import re
+import sys
 import numpy as np
 from collections import defaultdict
 from datasketch import MinHash, MinHashLSH
@@ -27,6 +31,66 @@ _HEADER_PATTERNS = [
 # Minimum common-text length (chars) required to confirm a match when no
 # complementary redactions are present (secondary confirmation signal).
 _SECONDARY_OVERLAP_THRESHOLD = 500
+
+
+def _get_total_ram_bytes() -> int:
+    """Return total physical RAM in bytes."""
+    if sys.platform == "darwin":
+        import subprocess
+        try:
+            out = subprocess.check_output(["sysctl", "-n", "hw.memsize"],
+                                           text=True).strip()
+            return int(out)
+        except Exception:
+            return 16 * 1024 * 1024 * 1024  # 16 GB fallback
+    try:
+        return os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+    except Exception:
+        return 16 * 1024 * 1024 * 1024  # 16 GB fallback
+
+
+def _get_rss_bytes() -> int:
+    """Return current process RSS in bytes.
+
+    Uses mach_task_basic_info on macOS (ctypes) and /proc/self/statm
+    on Linux. Returns 0 if neither method works (disables the guard).
+    """
+    if sys.platform == "darwin":
+        try:
+            libsys = ctypes.CDLL(ctypes.util.find_library("System"), use_errno=True)
+
+            class _TaskBasicInfo(ctypes.Structure):
+                _fields_ = [
+                    ("suspend_count", ctypes.c_uint32),
+                    ("virtual_size", ctypes.c_uint64),
+                    ("resident_size", ctypes.c_uint64),
+                    ("user_time_secs", ctypes.c_uint32),
+                    ("user_time_usecs", ctypes.c_uint32),
+                    ("system_time_secs", ctypes.c_uint32),
+                    ("system_time_usecs", ctypes.c_uint32),
+                    ("policy", ctypes.c_int32),
+                ]
+
+            MACH_TASK_BASIC_INFO = 20
+            info = _TaskBasicInfo()
+            count = ctypes.c_uint32(ctypes.sizeof(info) // 4)
+            task = libsys.mach_task_self()
+            kr = libsys.task_info(
+                task, MACH_TASK_BASIC_INFO, ctypes.byref(info), ctypes.byref(count)
+            )
+            if kr == 0:
+                return info.resident_size
+        except Exception:
+            pass
+        return 0
+
+    # Linux: read /proc/self/statm
+    try:
+        with open("/proc/self/statm") as f:
+            fields = f.read().split()
+        return int(fields[1]) * os.sysconf("SC_PAGE_SIZE")
+    except Exception:
+        return 0
 
 
 def extract_email_headers(text: str) -> list[str]:

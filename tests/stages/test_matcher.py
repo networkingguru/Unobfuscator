@@ -8,7 +8,8 @@ from core.db import (
 from stages.matcher import (
     extract_email_headers, run_phase0_email_fastpath,
     load_fingerprints, run_phase2_lsh_candidates,
-    find_longest_common_substring, run_phase3_verify_and_group
+    find_longest_common_substring, run_phase3_verify_and_group,
+    _get_total_ram_bytes, _get_rss_bytes,
 )
 from stages.indexer import build_fingerprint, clean_text
 
@@ -258,3 +259,27 @@ def test_phase3_rejects_medium_overlap_without_complementary_redactions(conn):
     # No complementary redactions AND common text <= 500 chars → should be rejected
     assert get_doc_group(conn, 1) is None
     assert get_doc_group(conn, 2) is None
+
+
+# --- Memory measurement helpers ---
+
+
+def test_get_total_ram_bytes_returns_positive_int():
+    total = _get_total_ram_bytes()
+    assert isinstance(total, int)
+    assert total > 0
+    assert total >= 512 * 1024 * 1024
+    assert total <= 1024 * 1024 * 1024 * 1024
+
+
+def test_get_rss_bytes_returns_positive_int():
+    rss = _get_rss_bytes()
+    assert isinstance(rss, int)
+    assert rss > 0
+    assert rss >= 10 * 1024 * 1024
+
+
+def test_rss_is_less_than_total_ram():
+    rss = _get_rss_bytes()
+    total = _get_total_ram_bytes()
+    assert rss < total
