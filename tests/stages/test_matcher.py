@@ -165,18 +165,6 @@ def test_find_longest_common_substring_returns_empty_for_unrelated():
 # Generate texts > 2000 chars to trigger the large-doc code path.
 _LARGE_PREFIX_A = "Document version alpha. " * 100  # ~2400 chars
 _LARGE_PREFIX_B = "Document version bravo. " * 100  # ~2400 chars
-_LARGE_SHARED = (
-    "The deposition was conducted on March fifteenth two thousand and two "
-    "at the offices of counsel in downtown Manhattan. Present were the "
-    "deponent, counsel for both parties, and a certified court reporter. "
-    "The proceedings began at approximately ten o'clock in the morning "
-    "and continued until four thirty in the afternoon with a break for "
-    "lunch. The following is a true and accurate transcript of the "
-    "testimony given under oath during that session. All exhibits "
-    "referenced herein were marked and admitted into evidence without "
-    "objection unless otherwise noted in the record."
-)  # ~550 chars
-
 
 def test_rolling_hash_finds_all_segments_in_large_texts():
     """Large texts (>2000 chars) should find all common segments, not just the longest."""
