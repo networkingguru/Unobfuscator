@@ -4,12 +4,14 @@ Logic reference: PIPELINE.md — Phases 0, 2, and 3
 (Phase 1 fingerprinting is done by the Indexer in Stage 1.)
 """
 
+import array
 import ctypes
 import ctypes.util
 import logging
 import os
 import re
 import sys
+import time
 import numpy as np
 from collections import defaultdict
 from datasketch import MinHash, MinHashLSH
@@ -31,6 +33,12 @@ _HEADER_PATTERNS = [
 # Minimum common-text length (chars) required to confirm a match when no
 # complementary redactions are present (secondary confirmation signal).
 _SECONDARY_OVERLAP_THRESHOLD = 500
+
+# --- Rolling-hash constants ---
+_RH_BASE1, _RH_MOD1 = 131, (1 << 61) - 1   # Mersenne prime
+_RH_BASE2, _RH_MOD2 = 137, (1 << 59) - 55  # large prime, different size
+_MAX_BUCKET = 256  # discard high-frequency seeds to bound worst case
+_LCS_TIMEOUT = 30  # seconds — safety circuit breaker
 
 _DEFAULT_RAM_BYTES = 16 * 1024 ** 3  # 16 GB fallback when detection fails
 _total_ram_cache: int | None = None  # cached — total RAM never changes
@@ -377,8 +385,7 @@ def find_longest_common_substring(
     min_seg = 10
     max_chars = 2000
     if len(a) > max_chars or len(b) > max_chars:
-        # For very long texts, just find the single longest common substring
-        return _lcs_single(a, b, min_seg)
+        return _collect_common_segments_rolling_hash(a, b, min_seg)
 
     return _collect_common_segments(a, b, min_seg)
 
@@ -426,21 +433,117 @@ def _collect_common_segments(a: str, b: str, min_seg: int) -> str:
     return " ".join(a[s:s + l] for s, l in merged)
 
 
-def _lcs_single(a: str, b: str, min_len: int) -> str:
-    """Find the single longest common substring for large texts."""
-    best = ""
-    max_len = min(len(a), len(b), 500)
-    for length in range(max_len, min_len - 1, -1):
-        found = False
-        for start in range(0, len(a) - length + 1):
-            substr = a[start:start + length]
-            if substr in b:
-                best = substr
-                found = True
-                break
-        if found:
+def _collect_common_segments_rolling_hash(a: str, b: str, min_seg: int) -> str:
+    """Find all common substrings >= min_seg chars using rolling-hash seed-and-extend.
+
+    Same semantics as _collect_common_segments (DP), but O(n+m+S) instead of O(n*m).
+    Uses double-hashing to avoid false positives and a bucket cap to prevent
+    degenerate O(n*m) behavior on highly repetitive text.
+    """
+    if len(a) < min_seg or len(b) < min_seg:
+        return ""
+
+    t_start = time.monotonic()
+
+    # Precompute base^(min_seg-1) mod prime for rolling removal
+    pow1 = pow(_RH_BASE1, min_seg - 1, _RH_MOD1)
+    pow2 = pow(_RH_BASE2, min_seg - 1, _RH_MOD2)
+
+    # Step 1: Hash all min_seg-length windows in `a` → dict of hash → positions
+    index: dict[tuple[int, int], array.array] = {}
+    h1 = h2 = 0
+    for i, ch in enumerate(a):
+        c = ord(ch)
+        h1 = (h1 * _RH_BASE1 + c) % _RH_MOD1
+        h2 = (h2 * _RH_BASE2 + c) % _RH_MOD2
+        if i >= min_seg - 1:
+            key = (h1, h2)
+            bucket = index.get(key)
+            if bucket is None:
+                bucket = array.array("L")
+                index[key] = bucket
+            if len(bucket) < _MAX_BUCKET:
+                bucket.append(i - min_seg + 1)
+            # Remove outgoing character
+            out = ord(a[i - min_seg + 1])
+            h1 = (h1 - out * pow1) % _RH_MOD1
+            h2 = (h2 - out * pow2) % _RH_MOD2
+
+    # Step 2: Scan `b`, collect seed pairs (pos_a, pos_b)
+    seeds: list[tuple[int, int]] = []
+    h1 = h2 = 0
+    for j, ch in enumerate(b):
+        c = ord(ch)
+        h1 = (h1 * _RH_BASE1 + c) % _RH_MOD1
+        h2 = (h2 * _RH_BASE2 + c) % _RH_MOD2
+        if j >= min_seg - 1:
+            key = (h1, h2)
+            bucket = index.get(key)
+            if bucket is not None:
+                pos_b = j - min_seg + 1
+                for pos_a in bucket:
+                    seeds.append((pos_a, pos_b))
+            out = ord(b[j - min_seg + 1])
+            h1 = (h1 - out * pow1) % _RH_MOD1
+            h2 = (h2 - out * pow2) % _RH_MOD2
+
+    if not seeds:
+        return ""
+
+    # Step 3: Sort by pos_a so we can skip already-covered regions
+    seeds.sort()
+    segments: list[tuple[int, int]] = []  # (start_in_a, length)
+    covered_end_a = -1  # tracks how far we've extended in `a`
+
+    for pos_a, pos_b in seeds:
+        # Timeout guard
+        if time.monotonic() - t_start > _LCS_TIMEOUT:
+            logger.warning("Rolling-hash LCS timed out after %ds on texts "
+                           "len(a)=%d len(b)=%d with %d seeds",
+                           _LCS_TIMEOUT, len(a), len(b), len(seeds))
             break
-    return best
+
+        if pos_a < covered_end_a:
+            continue  # already covered by a previous extension
+
+        # Verify seed is a true match (not a hash collision)
+        if a[pos_a:pos_a + min_seg] != b[pos_b:pos_b + min_seg]:
+            continue
+
+        # Extend forward
+        end_a, end_b = pos_a + min_seg, pos_b + min_seg
+        while end_a < len(a) and end_b < len(b) and a[end_a] == b[end_b]:
+            end_a += 1
+            end_b += 1
+
+        # Extend backward
+        start_a, start_b = pos_a, pos_b
+        while start_a > 0 and start_b > 0 and a[start_a - 1] == b[start_b - 1]:
+            start_a -= 1
+            start_b -= 1
+
+        seg_len = end_a - start_a
+        if seg_len >= min_seg:
+            segments.append((start_a, seg_len))
+            covered_end_a = end_a
+
+    if not segments:
+        return ""
+
+    # Step 4: Merge overlapping/adjacent segments (same logic as DP path)
+    segments.sort(key=lambda x: (x[0], -x[1]))
+    merged: list[tuple[int, int]] = []
+    for start, length in segments:
+        end = start + length
+        if merged and start < merged[-1][0] + merged[-1][1]:
+            prev_start, prev_len = merged[-1]
+            prev_end = prev_start + prev_len
+            if end > prev_end:
+                merged[-1] = (prev_start, end - prev_start)
+        else:
+            merged.append((start, length))
+
+    return " ".join(a[s:s + l] for s, l in merged)
 
 
 def _has_complementary_redactions(
@@ -474,7 +577,8 @@ def _get_text(conn, doc_id: str, _cache: dict = {}) -> str:
 def run_phase3_verify_and_group(
     conn, candidates: list[tuple],
     redaction_markers: list[str],
-    min_overlap_chars: int = 200
+    min_overlap_chars: int = 200,
+    progress_callback=None,
 ) -> None:
     """Verify candidate pairs and group confirmed matches.
 
@@ -483,22 +587,45 @@ def run_phase3_verify_and_group(
     Primary confirmation: complementary redactions (one has text where other is redacted).
     Secondary: long common text (>500 chars) even without complementary redactions.
     Rejection: common text shorter than min_overlap_chars.
+
+    progress_callback, if provided, is called periodically with
+    (candidates_checked, total_candidates, confirmed_matches).
     """
 
     # Clear text cache for fresh run
     _get_text.__defaults__[0].clear()
 
+    total = len(candidates)
     confirmed = 0
-    for i, (doc_a, doc_b) in enumerate(candidates):
+    rejected = 0
+    t_start = time.monotonic()
+
+    # Persist total so status can read it even between log intervals
+    set_config(conn, "phase3_total", total)
+    set_config(conn, "phase3_checked", 0)
+    set_config(conn, "phase3_confirmed", 0)
+    conn.commit()
+
+    log_interval = 1_000  # log every N candidates
+
+    for i, (doc_a, doc_b) in enumerate(candidates, 1):
         text_a = _get_text(conn, doc_a)
         text_b = _get_text(conn, doc_b)
 
         common = find_longest_common_substring(text_a, text_b, redaction_markers)
         if len(common) < min_overlap_chars:
+            rejected += 1
+            if i % log_interval == 0:
+                _phase3_progress(conn, i, total, confirmed, rejected,
+                                 t_start, progress_callback)
             continue  # Insufficient overlap — reject
 
         has_complementary = _has_complementary_redactions(text_a, text_b, redaction_markers)
         if not has_complementary and len(common) <= _SECONDARY_OVERLAP_THRESHOLD:
+            rejected += 1
+            if i % log_interval == 0:
+                _phase3_progress(conn, i, total, confirmed, rejected,
+                                 t_start, progress_callback)
             continue  # Weak evidence — not enough to confirm match
 
         # At least one confirmation signal met — assign to group
@@ -508,9 +635,41 @@ def run_phase3_verify_and_group(
         if confirmed % 100 == 0:
             conn.commit()
 
-    logger.info("Phase 3: verified %d candidates → %d confirmed matches",
-                len(candidates), confirmed)
+        if i % log_interval == 0:
+            _phase3_progress(conn, i, total, confirmed, rejected,
+                             t_start, progress_callback)
+
+    elapsed = time.monotonic() - t_start
+    logger.info("Phase 3 complete: verified %d candidates → %d confirmed matches "
+                "(%d rejected) in %.1f min",
+                total, confirmed, rejected, elapsed / 60)
+
+    # Clear progress keys now that phase is done
+    set_config(conn, "phase3_total", 0)
+    set_config(conn, "phase3_checked", 0)
+    set_config(conn, "phase3_confirmed", 0)
     conn.commit()
+
+
+def _phase3_progress(conn, checked, total, confirmed, rejected,
+                     t_start, callback):
+    """Log and persist Phase 3 progress."""
+    elapsed = time.monotonic() - t_start
+    pct = checked / total * 100 if total else 0
+    rate = checked / elapsed if elapsed > 0 else 0
+    remaining = (total - checked) / rate if rate > 0 else 0
+
+    logger.info("Phase 3: %d / %d (%.1f%%) — %d confirmed, %d rejected — "
+                "%.0f pairs/sec — ~%.0f min remaining",
+                checked, total, pct, confirmed, rejected,
+                rate, remaining / 60)
+
+    set_config(conn, "phase3_checked", checked)
+    set_config(conn, "phase3_confirmed", confirmed)
+    conn.commit()
+
+    if callback:
+        callback(checked, total, confirmed)
 
 
 def _assign_to_group(conn, doc_a: int, doc_b: int, similarity: float) -> None:

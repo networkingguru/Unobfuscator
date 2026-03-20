@@ -162,6 +162,142 @@ def test_find_longest_common_substring_returns_empty_for_unrelated():
     assert len(common) < 10
 
 
+# Generate texts > 2000 chars to trigger the large-doc code path.
+_LARGE_PREFIX_A = "Document version alpha. " * 100  # ~2400 chars
+_LARGE_PREFIX_B = "Document version bravo. " * 100  # ~2400 chars
+_LARGE_SHARED = (
+    "The deposition was conducted on March fifteenth two thousand and two "
+    "at the offices of counsel in downtown Manhattan. Present were the "
+    "deponent, counsel for both parties, and a certified court reporter. "
+    "The proceedings began at approximately ten o'clock in the morning "
+    "and continued until four thirty in the afternoon with a break for "
+    "lunch. The following is a true and accurate transcript of the "
+    "testimony given under oath during that session. All exhibits "
+    "referenced herein were marked and admitted into evidence without "
+    "objection unless otherwise noted in the record."
+)  # ~550 chars
+
+
+def test_rolling_hash_finds_all_segments_in_large_texts():
+    """Large texts (>2000 chars) should find all common segments, not just the longest."""
+    segment1 = "First shared passage appears here in both documents."
+    segment2 = "Second shared passage is also present in both versions."
+    a = _LARGE_PREFIX_A + segment1 + " Unique A middle. " + segment2 + " Unique A end."
+    b = _LARGE_PREFIX_B + segment1 + " Unique B middle. " + segment2 + " Unique B end."
+    common = find_longest_common_substring(a, b, REDACTION_MARKERS)
+    assert segment1.strip() in common or segment1[10:40] in common
+    assert segment2.strip() in common or segment2[10:40] in common
+
+
+def test_rolling_hash_returns_empty_for_large_unrelated_texts():
+    a = "Alpha document content here. " * 100
+    b = "Bravo entirely different text. " * 100
+    common = find_longest_common_substring(a, b, REDACTION_MARKERS)
+    assert common == ""
+
+
+def test_rolling_hash_timeout_returns_partial(monkeypatch):
+    """Timeout guard should return partial results, not crash."""
+    import stages.matcher as m
+    monkeypatch.setattr(m, "_LCS_TIMEOUT", 0.001)  # force immediate timeout
+    shared = "The deposition transcript of March two thousand and two. " * 50
+    a = _LARGE_PREFIX_A + shared
+    b = _LARGE_PREFIX_B + shared
+    # Should not raise — returns whatever it found before timeout
+    common = find_longest_common_substring(a, b, REDACTION_MARKERS)
+    assert isinstance(common, str)  # may be empty or partial, but not an exception
+
+
+def test_rolling_hash_mixed_sizes():
+    """One large text + one small text should still find common segments."""
+    shared = "The witness testified under oath about events in Palm Beach."
+    a = _LARGE_PREFIX_A + shared + " End of large doc."
+    b = "Short doc. " + shared + " Done."
+    common = find_longest_common_substring(a, b, REDACTION_MARKERS)
+    assert "testified under oath" in common
+
+
+def test_rolling_hash_boundary_exactly_min_seg():
+    """Exactly 10 shared chars should be found; 9 should not."""
+    ten_chars = "AbCdEfGhIj"
+    nine_chars = "AbCdEfGhI"
+    a = _LARGE_PREFIX_A + ten_chars + " unique ending A."
+    # 10-char match
+    b = _LARGE_PREFIX_B + ten_chars + " unique ending B."
+    common = find_longest_common_substring(a, b, REDACTION_MARKERS)
+    assert ten_chars in common
+    # 9-char match — should not be found (use truly unique surrounding text
+    # so the 9-char segment can't be part of a longer backward-extended match)
+    a9 = _LARGE_PREFIX_A + "ZZZQQQWWW" + nine_chars + "XJJJKKKLLL end A."
+    b9 = _LARGE_PREFIX_B + "MMMNNNPPP" + nine_chars + "YRRRSSSTTT end B."
+    common9 = find_longest_common_substring(a9, b9, REDACTION_MARKERS)
+    assert nine_chars not in common9
+
+
+def test_rolling_hash_empty_and_short_inputs():
+    common = find_longest_common_substring("", _LARGE_PREFIX_A, REDACTION_MARKERS)
+    assert common == ""
+    common2 = find_longest_common_substring("short", _LARGE_PREFIX_A, REDACTION_MARKERS)
+    assert len(common2) < 10
+
+
+def test_rolling_hash_non_ascii():
+    shared = "Témoignage déposé le quinze mars deux mille deux à Genève"
+    a = _LARGE_PREFIX_A + shared + " fin du document."
+    b = _LARGE_PREFIX_B + shared + " end of document."
+    common = find_longest_common_substring(a, b, REDACTION_MARKERS)
+    assert "Genève" in common
+
+
+def test_rolling_hash_repeated_content_completes_fast():
+    """Adversarial: highly repetitive text must complete in bounded time."""
+    import time
+    repeated = "the quick brown fox jumps over " * 500  # 15K chars, very repetitive
+    a = repeated + " unique tail alpha."
+    b = repeated + " unique tail bravo."
+    t0 = time.monotonic()
+    common = find_longest_common_substring(a, b, REDACTION_MARKERS)
+    elapsed = time.monotonic() - t0
+    assert elapsed < 5.0, f"Took {elapsed:.1f}s on repeated content"
+    assert len(common) > 100  # should find substantial overlap
+
+
+def test_rolling_hash_performance_50k():
+    """50K-char documents with 5K overlap must complete in < 1 second."""
+    import time
+    unique_a = "".join(chr(65 + (i * 7) % 26) for i in range(22500))
+    unique_b = "".join(chr(65 + (i * 13) % 26) for i in range(22500))
+    shared = "The deposition testimony covered the following key topics. " * 85  # ~5K
+    a = unique_a + shared + unique_a
+    b = unique_b + shared + unique_b
+    t0 = time.monotonic()
+    common = find_longest_common_substring(a, b, REDACTION_MARKERS)
+    elapsed = time.monotonic() - t0
+    assert elapsed < 1.0, f"Took {elapsed:.1f}s on 50K-char docs"
+    assert len(common) >= 4000
+
+
+def test_rolling_hash_consistent_with_dp():
+    """Both code paths should produce equivalent results for same input."""
+    from stages.matcher import _collect_common_segments, _collect_common_segments_rolling_hash
+    import re
+    # Use a text short enough for DP but test rolling hash directly
+    shared = "The flight logs show departure from Teterboro on March tenth."
+    a = "Preamble A. " + shared + " End A."
+    b = "Preamble B. " + shared + " End B."
+    # Strip markers same way find_longest_common_substring does
+    cleaned_a = re.sub(r"\s+", " ", a).strip()
+    cleaned_b = re.sub(r"\s+", " ", b).strip()
+    dp_result = _collect_common_segments(cleaned_a, cleaned_b, 10)
+    rh_result = _collect_common_segments_rolling_hash(cleaned_a, cleaned_b, 10)
+    # Both should find the shared passage
+    assert "flight logs" in dp_result
+    assert "flight logs" in rh_result
+    # Total common text lengths should be similar (not necessarily identical
+    # due to segment boundary handling, but within 10%)
+    assert abs(len(dp_result) - len(rh_result)) <= max(len(dp_result), 1) * 0.1
+
+
 def test_phase3_groups_confirmed_candidate_pair(conn):
     # Uses >500 chars of shared text (secondary confirmation signal).
     seed_doc(conn, 1, LONG_OVERLAP_TEXT_A)
