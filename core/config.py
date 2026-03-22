@@ -2,6 +2,11 @@ import yaml
 from pathlib import Path
 from typing import Any
 
+# Project root — two levels up from core/config.py.
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+PDF_CACHE_DIR = _PROJECT_ROOT / "pdf_cache"
+
 
 def load_config(path: str) -> dict:
     p = Path(path)

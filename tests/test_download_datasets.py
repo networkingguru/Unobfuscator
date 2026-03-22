@@ -7,6 +7,7 @@ from unittest.mock import patch, MagicMock
 
 from download_datasets import (
     DATASETS,
+    SOURCE_ARCHIVE_ORG,
     get_disk_usage,
     check_disk_space,
     get_remote_size,
@@ -49,18 +50,18 @@ def test_write_and_load_provenance(tmp_path):
     prov_path = tmp_path / "provenance.json"
     write_provenance(str(prov_path), 3, {
         "source_url": "https://example.com/DataSet%203.zip",
-        "source_type": "archive.org",
+        "source_type": SOURCE_ARCHIVE_ORG,
         "source_label": "Internet Archive mirror — DOJ original unavailable",
     })
     data = load_provenance(str(prov_path))
     assert "3" in data
-    assert data["3"]["source_type"] == "archive.org"
+    assert data["3"]["source_type"] == SOURCE_ARCHIVE_ORG
 
 
 def test_write_provenance_preserves_existing(tmp_path):
     prov_path = tmp_path / "provenance.json"
-    write_provenance(str(prov_path), 3, {"source_type": "archive.org"})
-    write_provenance(str(prov_path), 4, {"source_type": "archive.org"})
+    write_provenance(str(prov_path), 3, {"source_type": SOURCE_ARCHIVE_ORG})
+    write_provenance(str(prov_path), 4, {"source_type": SOURCE_ARCHIVE_ORG})
     data = load_provenance(str(prov_path))
     assert "3" in data
     assert "4" in data

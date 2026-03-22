@@ -14,21 +14,30 @@ import fitz  # PyMuPDF
 import httpx
 from pathlib import Path
 from typing import Optional
-from core.db import get_doc_group, get_document_for_pdf, append_soft_redaction_text, mark_pdf_processed
+from core.db import (
+    get_doc_group, get_document_for_pdf, append_soft_redaction_text,
+    mark_pdf_processed, upsert_fingerprint
+)
 from core.queue import enqueue
+from stages.indexer import clean_text, shingle, build_fingerprint
 
 logger = logging.getLogger(__name__)
 
 _AGE_VERIFY_COOKIE = ("justiceGovAgeVerified", "true")
-_CACHE_DIR = Path(__file__).resolve().parent.parent / "pdf_cache"
+from core.config import PDF_CACHE_DIR as _CACHE_DIR
+
+# Thread-safe connection pool shared across workers.
+_http_client = httpx.Client(
+    timeout=30,
+    follow_redirects=True,
+    limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+    cookies={_AGE_VERIFY_COOKIE[0]: _AGE_VERIFY_COOKIE[1]},
+)
 
 
 def _download_pdf(url: str) -> httpx.Response:
     """Download a PDF, handling the DOJ age-verification gate if needed."""
-    cookies = {}
-    if "justice.gov" in url:
-        cookies[_AGE_VERIFY_COOKIE[0]] = _AGE_VERIFY_COOKIE[1]
-    response = httpx.get(url, timeout=30, follow_redirects=True, cookies=cookies)
+    response = _http_client.get(url)
     response.raise_for_status()
     return response
 
@@ -70,11 +79,14 @@ def extract_soft_redactions(pdf_bytes: bytes) -> list[dict]:
     return recovered
 
 
-def process_pdf_for_document(conn, doc_id: int) -> None:
+def process_pdf_for_document(conn, doc_id: int,
+                              redaction_markers: list[str] = None) -> None:
     """Download a document's PDF, check for soft redactions, queue merge job if found.
 
     Logic reference: PIPELINE.md — Phase 5, steps 1–3
     """
+    if redaction_markers is None:
+        redaction_markers = []
     doc = get_document_for_pdf(conn, doc_id)
     if not doc or not doc["pdf_url"]:
         return  # No PDF URL — skip silently
@@ -106,6 +118,16 @@ def process_pdf_for_document(conn, doc_id: int) -> None:
     if soft_redactions:
         recovered_text = "\n".join(r["text"] for r in soft_redactions)
         append_soft_redaction_text(conn, doc_id, recovered_text)
+
+        # Regenerate fingerprint so LSH picks up the new text on next rebuild.
+        updated_text = conn.execute(
+            "SELECT extracted_text FROM documents WHERE id = ?", (doc_id,)
+        ).fetchone()[0] or ""
+        cleaned = clean_text(updated_text, redaction_markers)
+        shingles = shingle(cleaned)
+        if shingles:
+            sig = build_fingerprint(cleaned)
+            upsert_fingerprint(conn, doc_id, sig, len(shingles))
 
         group_id = get_doc_group(conn, doc_id)
         if group_id is not None:

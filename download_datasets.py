@@ -24,11 +24,17 @@ import httpx
 from rich.console import Console
 from rich.table import Table
 
+from core.config import PDF_CACHE_DIR
+
 console = Console()
 logger = logging.getLogger(__name__)
 
 # 10% disk reserve threshold
 DISK_RESERVE_FRACTION = 0.10
+
+# Source types — used in provenance JSON and referenced by output_generator.
+SOURCE_ARCHIVE_ORG = "archive.org"
+SOURCE_COMMUNITY_GEEKEN = "community-mirror:geeken"
 
 _ARCHIVE_ORG_LABEL = (
     "Source: Internet Archive mirror — DOJ original unavailable. "
@@ -39,70 +45,71 @@ _COMMUNITY_MIRROR_LABEL = (
     "No DOJ-published checksums exist; integrity cannot be verified against the original."
 )
 
-def _cache_dir_name(ds: dict) -> str:
-    """Return the cache subdirectory name for a dataset.
+def _cache_dir_name(ds_id: int, release_batch: str | None = None) -> str:
+    """Return the cache subdirectory name that matches the DB ``release_batch``.
 
-    Uses the explicit ``release_batch`` field when present (must match the
-    value stored in the documents table), otherwise falls back to the
-    ``VOL{id:05d}`` convention.
+    pdf_processor and text_recovery resolve cached PDFs via
+    ``pdf_cache/{release_batch}/{filename}``.  Most datasets use the
+    ``VOL{id:05d}`` convention, but Dataset 11 is stored as ``DataSet11``
+    in the DB — pass *release_batch* to override.
     """
-    return ds.get("release_batch", f"VOL{ds['id']:05d}")
+    return release_batch or f"VOL{ds_id:05d}"
 
 
 DATASETS = [
     {
         "id": 3,
         "url": "https://archive.org/download/data-set-1/DataSet%203.zip",
-        "source_type": "archive.org",
+        "source_type": SOURCE_ARCHIVE_ORG,
         "source_label": _ARCHIVE_ORG_LABEL,
         "sha256": "160231C8C689C76003976B609E55689530FC4832A1535CE13BFCD8F871C21E65",
     },
     {
         "id": 4,
         "url": "https://archive.org/download/data-set-1/DataSet%204.zip",
-        "source_type": "archive.org",
+        "source_type": SOURCE_ARCHIVE_ORG,
         "source_label": _ARCHIVE_ORG_LABEL,
         "sha256": "E78948690C22B904D6B79AFE92A4EB1D7ABB8E746B0D025123826EBEE0DF8273",
     },
     {
         "id": 5,
         "url": "https://archive.org/download/data-set-1/DataSet%205.zip",
-        "source_type": "archive.org",
+        "source_type": SOURCE_ARCHIVE_ORG,
         "source_label": _ARCHIVE_ORG_LABEL,
         "sha256": "EEDA87E747487D718E35B661D2D078FF08F0B0E80107C5F498FCE17AE4F298BA",
     },
     {
         "id": 6,
         "url": "https://archive.org/download/data-set-1/DataSet%206.zip",
-        "source_type": "archive.org",
+        "source_type": SOURCE_ARCHIVE_ORG,
         "source_label": _ARCHIVE_ORG_LABEL,
         "sha256": None,
     },
     {
         "id": 7,
         "url": "https://archive.org/download/data-set-1/DataSet%207.zip",
-        "source_type": "archive.org",
+        "source_type": SOURCE_ARCHIVE_ORG,
         "source_label": _ARCHIVE_ORG_LABEL,
         "sha256": None,
     },
     {
         "id": 8,
         "url": "https://doj-files.geeken.dev/doj_zips/original_archives/DataSet%208.zip",
-        "source_type": "community-mirror:geeken",
+        "source_type": SOURCE_COMMUNITY_GEEKEN,
         "source_label": _COMMUNITY_MIRROR_LABEL,
         "sha256": "558010B96B7980ED529A2AD4EA224123A59446927E4441D23A2E8E5C2361EE07",
     },
     {
         "id": 9,
         "url": "https://archive.org/download/data-set-9/DATA%20SET%209.zip",
-        "source_type": "archive.org",
+        "source_type": SOURCE_ARCHIVE_ORG,
         "source_label": _ARCHIVE_ORG_LABEL,
         "sha256": None,
     },
     {
         "id": 12,
         "url": "https://archive.org/download/data-set-12_202601/DataSet%2012.zip",
-        "source_type": "archive.org",
+        "source_type": SOURCE_ARCHIVE_ORG,
         "source_label": _ARCHIVE_ORG_LABEL,
         "sha256": None,
     },
@@ -238,7 +245,7 @@ def _fmt_bytes(n: int) -> str:
 
 
 @click.command()
-@click.option("--cache-dir", default="./pdf_cache", show_default=True,
+@click.option("--cache-dir", default=str(PDF_CACHE_DIR), show_default=True,
               help="Directory to extract PDFs into")
 @click.option("--dry-run", is_flag=True, help="Show what would be downloaded without doing it")
 def main(cache_dir: str, dry_run: bool):
@@ -256,7 +263,7 @@ def main(cache_dir: str, dry_run: bool):
     table.add_column("Status")
 
     for ds in DATASETS:
-        ds_dir = cache / _cache_dir_name(ds)
+        ds_dir = cache / _cache_dir_name(ds["id"], ds.get("release_batch"))
         if ds_dir.exists() and any(ds_dir.iterdir()):
             status = "[green]already downloaded[/green]"
         else:
@@ -271,7 +278,7 @@ def main(cache_dir: str, dry_run: bool):
 
     for ds in DATASETS:
         ds_id = ds["id"]
-        ds_dir = cache / _cache_dir_name(ds)
+        ds_dir = cache / _cache_dir_name(ds["id"], ds.get("release_batch"))
 
         # Skip if already downloaded
         if ds_dir.exists() and any(ds_dir.iterdir()):

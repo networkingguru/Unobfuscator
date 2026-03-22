@@ -22,7 +22,7 @@ from stages.indexer import clean_text, shingle, build_fingerprint
 
 logger = logging.getLogger(__name__)
 
-_CACHE_DIR = Path(__file__).resolve().parent.parent / "pdf_cache"
+from core.config import PDF_CACHE_DIR as _CACHE_DIR
 
 
 def classify_page_pixels(pixels: np.ndarray) -> str:
@@ -292,13 +292,13 @@ def run_text_recovery(conn, redaction_markers: list[str],
             for i in range(0, len(shard_docs), _BACKFILL_QUERY_BATCH):
                 batch = shard_docs[i:i + _BACKFILL_QUERY_BATCH]
                 doc_ids = [d["id"] for d in batch]
-                ids_str = ", ".join(f"'{did}'" for did in doc_ids)
+                placeholders = ", ".join("?" * len(doc_ids))
                 with duckdb.connect() as ddb:
                     rows = ddb.execute(f"""
                         SELECT id, extracted_text
-                        FROM read_parquet('{tmp_path}')
-                        WHERE id IN ({ids_str})
-                    """).fetchall()
+                        FROM read_parquet(?)
+                        WHERE id IN ({placeholders})
+                    """, [tmp_path] + doc_ids).fetchall()
                 text_map = {r[0]: r[1] for r in rows}
                 del rows
 
