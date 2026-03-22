@@ -39,6 +39,16 @@ _COMMUNITY_MIRROR_LABEL = (
     "No DOJ-published checksums exist; integrity cannot be verified against the original."
 )
 
+def _cache_dir_name(ds: dict) -> str:
+    """Return the cache subdirectory name for a dataset.
+
+    Uses the explicit ``release_batch`` field when present (must match the
+    value stored in the documents table), otherwise falls back to the
+    ``VOL{id:05d}`` convention.
+    """
+    return ds.get("release_batch", f"VOL{ds['id']:05d}")
+
+
 DATASETS = [
     {
         "id": 3,
@@ -246,7 +256,7 @@ def main(cache_dir: str, dry_run: bool):
     table.add_column("Status")
 
     for ds in DATASETS:
-        ds_dir = cache / f"VOL{ds['id']:05d}"
+        ds_dir = cache / _cache_dir_name(ds)
         if ds_dir.exists() and any(ds_dir.iterdir()):
             status = "[green]already downloaded[/green]"
         else:
@@ -261,7 +271,7 @@ def main(cache_dir: str, dry_run: bool):
 
     for ds in DATASETS:
         ds_id = ds["id"]
-        ds_dir = cache / f"VOL{ds_id:05d}"
+        ds_dir = cache / _cache_dir_name(ds)
 
         # Skip if already downloaded
         if ds_dir.exists() and any(ds_dir.iterdir()):
