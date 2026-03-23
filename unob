@@ -1,2 +1,2 @@
 #!/usr/bin/env bash
-exec "$(dirname "$0")/venv/bin/python" "$(dirname "$0")/unobfuscator.py" "$@"
+exec python3 "$(dirname "$0")/unobfuscator.py" "$@"
