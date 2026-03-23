@@ -7,6 +7,7 @@ from unittest.mock import patch, MagicMock
 
 from download_datasets import (
     DATASETS,
+    MAX_RETRIES,
     SOURCE_ARCHIVE_ORG,
     get_disk_usage,
     check_disk_space,
@@ -65,6 +66,31 @@ def test_write_provenance_preserves_existing(tmp_path):
     data = load_provenance(str(prov_path))
     assert "3" in data
     assert "4" in data
+
+
+def test_download_failure_preserves_part_file(tmp_path):
+    """When download fails, the .part file should be kept for resume."""
+    dest = str(tmp_path / "test.zip")
+    part_path = dest + ".part"
+
+    # Create a .part file simulating partial download
+    with open(part_path, "wb") as f:
+        f.write(b"x" * 1000)
+
+    # Mock httpx.stream to raise a connection error
+    with patch("download_datasets.httpx.stream") as mock_stream:
+        mock_stream.side_effect = ConnectionError("peer closed connection")
+        with pytest.raises(ConnectionError):
+            download_with_resume("https://example.com/file.zip", dest)
+
+    # .part file must still exist for next resume attempt
+    assert os.path.exists(part_path)
+    assert os.path.getsize(part_path) == 1000
+
+
+def test_retry_constants():
+    """Retry config should allow multiple attempts with backoff."""
+    assert MAX_RETRIES >= 3
 
 
 def test_extract_and_cleanup(tmp_path):

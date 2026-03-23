@@ -15,6 +15,7 @@ import logging
 import os
 import shutil
 import sys
+import time
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -31,6 +32,10 @@ logger = logging.getLogger(__name__)
 
 # 10% disk reserve threshold
 DISK_RESERVE_FRACTION = 0.10
+
+# Retry configuration for transient download failures
+MAX_RETRIES = 5
+RETRY_BACKOFF_BASE = 10  # seconds; doubles each retry (10, 20, 40, 80, 160)
 
 # Source types — used in provenance JSON and referenced by output_generator.
 SOURCE_ARCHIVE_ORG = "archive.org"
@@ -161,7 +166,8 @@ def download_with_resume(url: str, dest_path: str) -> None:
         headers["Range"] = f"bytes={existing_size}-"
         console.print(f"  [dim]Resuming from {existing_size / 1e6:.1f} MB...[/dim]")
 
-    with httpx.stream("GET", url, headers=headers, follow_redirects=True, timeout=300) as resp:
+    with httpx.stream("GET", url, headers=headers, follow_redirects=True,
+                       timeout=httpx.Timeout(30, read=120)) as resp:
         if resp.status_code == 416:
             # Range not satisfiable — file already complete
             if os.path.exists(part_path):
@@ -182,9 +188,14 @@ def download_with_resume(url: str, dest_path: str) -> None:
         downloaded = existing_size
 
         with open(part_path, mode) as f:
+            chunks_since_flush = 0
             for chunk in resp.iter_bytes(chunk_size=1_048_576):  # 1 MB chunks
                 f.write(chunk)
                 downloaded += len(chunk)
+                chunks_since_flush += 1
+                if chunks_since_flush >= 64:  # flush every ~64 MB
+                    f.flush()
+                    chunks_since_flush = 0
                 if total > 0:
                     pct = downloaded / total * 100
                     console.print(
@@ -305,17 +316,25 @@ def main(cache_dir: str, dry_run: bool):
             console.print("[red]Stopping all downloads to preserve disk space.[/red]")
             sys.exit(1)
 
-        # Download
+        # Download with retries (keeps .part file for resume across attempts)
         zip_name = f"DataSet_{ds_id}.zip"
         zip_path = str(cache / zip_name)
-        try:
-            download_with_resume(ds["url"], zip_path)
-        except Exception as e:
-            console.print(f"  [red]Download failed: {e}[/red]")
-            # Clean up partial file
-            part_path = zip_path + ".part"
-            if os.path.exists(part_path):
-                os.remove(part_path)
+        downloaded = False
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                download_with_resume(ds["url"], zip_path)
+                downloaded = True
+                break
+            except Exception as e:
+                console.print(f"  [red]Download failed (attempt {attempt}/{MAX_RETRIES}): {e}[/red]")
+                if attempt < MAX_RETRIES:
+                    wait = RETRY_BACKOFF_BASE * (2 ** (attempt - 1))
+                    console.print(f"  [dim]Retrying in {wait}s...[/dim]")
+                    time.sleep(wait)
+                else:
+                    console.print(f"  [red]Giving up on Dataset {ds_id} after {MAX_RETRIES} attempts. "
+                                  f".part file preserved for next run.[/red]")
+        if not downloaded:
             continue
 
         # Verify SHA-256 if available
