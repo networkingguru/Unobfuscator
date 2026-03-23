@@ -12,6 +12,7 @@ import os
 import re
 import sys
 import time
+from itertools import combinations
 import numpy as np
 from collections import defaultdict
 from datasketch import MinHash, MinHashLSH
@@ -202,8 +203,6 @@ def run_phase0_email_fastpath(conn, min_header_matches: int = 2) -> set[int]:
     #
     # Most docs have 3-4 headers → C(4,2) = 6 combos each.
     # With ~1M email docs this is ~6M hash lookups — completes in seconds.
-    from itertools import combinations
-
     # Step 1: Build per-document header sets from the inverted index.
     doc_headers: dict[str, set[str]] = defaultdict(set)
     for header_val, doc_ids in header_index.items():
