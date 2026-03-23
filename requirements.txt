@@ -1,5 +1,6 @@
 click==8.1.8
 duckdb==1.2.1
+pandas>=2.0
 datasketch==1.6.5
 numpy==2.2.3
 pymupdf==1.25.3
