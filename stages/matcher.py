@@ -196,6 +196,12 @@ def run_phase0_email_fastpath(conn, min_header_matches: int = 2) -> set[int]:
 
     # Find pairs sharing >= min_header_matches headers
     pair_counts: dict[tuple[str, str], int] = defaultdict(int)
+    eligible_headers = sum(1 for ids in header_index.values() if 2 <= len(ids) <= 1000)
+    logger.info("Phase 0: %d eligible headers (2–1000 docs each), building pair counts...",
+                eligible_headers)
+
+    t_pair_start = time.monotonic()
+    headers_processed = 0
     for header_val, doc_ids in header_index.items():
         if len(doc_ids) < 2 or len(doc_ids) > 1000:
             continue  # skip very common headers (noise)
@@ -203,13 +209,30 @@ def run_phase0_email_fastpath(conn, min_header_matches: int = 2) -> set[int]:
             for j in range(i + 1, len(doc_ids)):
                 pair = (min(doc_ids[i], doc_ids[j]), max(doc_ids[i], doc_ids[j]))
                 pair_counts[pair] += 1
+        headers_processed += 1
+        if headers_processed % 100_000 == 0:
+            elapsed = time.monotonic() - t_pair_start
+            rate = headers_processed / elapsed if elapsed > 0 else 0
+            remaining = (eligible_headers - headers_processed) / rate if rate > 0 else 0
+            logger.info("Phase 0: pair counting %d / %d headers (%.1f%%), "
+                        "%d unique pairs, ~%.0f min remaining",
+                        headers_processed, eligible_headers,
+                        headers_processed / eligible_headers * 100,
+                        len(pair_counts), remaining / 60)
+
+    logger.info("Phase 0: pair counting complete — %d unique pairs from %d headers in %.1f min",
+                len(pair_counts), eligible_headers, (time.monotonic() - t_pair_start) / 60)
 
     matched: set[str] = set()
+    groups_processed = 0
     for (doc_a, doc_b), count in pair_counts.items():
         if count >= min_header_matches:
             _assign_to_group(conn, doc_a, doc_b, similarity=1.0)
             matched.add(doc_a)
             matched.add(doc_b)
+            groups_processed += 1
+            if groups_processed % 50_000 == 0:
+                logger.info("Phase 0: grouped %d / %d pairs so far", groups_processed, len(matched))
 
     logger.info("Phase 0: %d documents grouped via email headers", len(matched))
     conn.commit()
