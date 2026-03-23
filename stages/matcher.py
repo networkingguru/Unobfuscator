@@ -194,47 +194,58 @@ def run_phase0_email_fastpath(conn, min_header_matches: int = 2) -> set[int]:
 
     logger.info("Phase 0: scanned %d docs, %d unique headers", total_scanned, len(header_index))
 
-    # Find pairs sharing >= min_header_matches headers
-    pair_counts: dict[tuple[str, str], int] = defaultdict(int)
-    eligible_headers = sum(1 for ids in header_index.values() if 2 <= len(ids) <= 1000)
-    logger.info("Phase 0: %d eligible headers (2–1000 docs each), building pair counts...",
-                eligible_headers)
+    # Find pairs sharing >= min_header_matches headers using combination hashing.
+    #
+    # Instead of building all O(n²) pairs per header and counting overlaps,
+    # generate all C(h, min_header_matches) combinations of each document's
+    # unique header values and group documents sharing any combination.
+    #
+    # Most docs have 3-4 headers → C(4,2) = 6 combos each.
+    # With ~1M email docs this is ~6M hash lookups — completes in seconds.
+    from itertools import combinations
 
-    t_pair_start = time.monotonic()
-    headers_processed = 0
+    # Step 1: Build per-document header sets from the inverted index.
+    doc_headers: dict[str, set[str]] = defaultdict(set)
     for header_val, doc_ids in header_index.items():
-        if len(doc_ids) < 2 or len(doc_ids) > 1000:
-            continue  # skip very common headers (noise)
-        for i in range(len(doc_ids)):
-            for j in range(i + 1, len(doc_ids)):
-                pair = (min(doc_ids[i], doc_ids[j]), max(doc_ids[i], doc_ids[j]))
-                pair_counts[pair] += 1
-        headers_processed += 1
-        if headers_processed % 100_000 == 0:
-            elapsed = time.monotonic() - t_pair_start
-            rate = headers_processed / elapsed if elapsed > 0 else 0
-            remaining = (eligible_headers - headers_processed) / rate if rate > 0 else 0
-            logger.info("Phase 0: pair counting %d / %d headers (%.1f%%), "
-                        "%d unique pairs, ~%.0f min remaining",
-                        headers_processed, eligible_headers,
-                        headers_processed / eligible_headers * 100,
-                        len(pair_counts), remaining / 60)
+        if len(doc_ids) > 1000:
+            continue  # skip noise headers (common dates, generic addresses)
+        for doc_id in doc_ids:
+            doc_headers[doc_id].add(header_val)
 
-    logger.info("Phase 0: pair counting complete — %d unique pairs from %d headers in %.1f min",
-                len(pair_counts), eligible_headers, (time.monotonic() - t_pair_start) / 60)
+    logger.info("Phase 0: %d docs with eligible headers, building combination index...",
+                len(doc_headers))
 
+    # Step 2: For each doc, hash all C(h, k) header combinations → bucket.
+    # Documents in the same bucket share >= k identical headers.
+    combo_buckets: dict[tuple, list[str]] = defaultdict(list)
+    for doc_id, headers in doc_headers.items():
+        if len(headers) < min_header_matches:
+            continue
+        for combo in combinations(sorted(headers), min_header_matches):
+            combo_buckets[combo].append(doc_id)
+    del doc_headers  # free memory
+
+    # Step 3: Group all documents in each bucket.
     matched: set[str] = set()
-    groups_processed = 0
-    for (doc_a, doc_b), count in pair_counts.items():
-        if count >= min_header_matches:
-            _assign_to_group(conn, doc_a, doc_b, similarity=1.0)
-            matched.add(doc_a)
-            matched.add(doc_b)
-            groups_processed += 1
-            if groups_processed % 50_000 == 0:
-                logger.info("Phase 0: grouped %d / %d pairs so far", groups_processed, len(matched))
+    groups_created = 0
+    for combo, doc_ids in combo_buckets.items():
+        if len(doc_ids) < 2:
+            continue
+        # Use first doc as anchor; assign all others to same group.
+        anchor = doc_ids[0]
+        for other in doc_ids[1:]:
+            _assign_to_group(conn, anchor, other, similarity=1.0)
+            matched.add(anchor)
+            matched.add(other)
+            groups_created += 1
+            if groups_created % 50_000 == 0:
+                logger.info("Phase 0: processed %d group assignments, %d docs matched so far",
+                            groups_created, len(matched))
+                conn.commit()
+    del combo_buckets  # free memory
 
-    logger.info("Phase 0: %d documents grouped via email headers", len(matched))
+    logger.info("Phase 0: %d documents grouped via email headers (%d group assignments)",
+                len(matched), groups_created)
     conn.commit()
     return matched
 

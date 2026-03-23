@@ -111,6 +111,59 @@ def test_phase0_does_not_group_single_header_match(conn):
     assert get_doc_group(conn, 2) is None
 
 
+def test_phase0_handles_many_docs_with_shared_headers(conn):
+    """Phase 0 must complete in bounded time even with many docs sharing headers.
+
+    Regression test for the O(n²) pair explosion bug: 200 documents sharing
+    the same From/To/Date headers should group in < 2 seconds, not hang.
+    """
+    import time
+    for i in range(200):
+        text = (
+            "From: shared@example.com\n"
+            "To: recipient@example.com\n"
+            f"Date: 2002-03-10\nSubject: Unique subject {i}\n\n"
+            f"Body content {i}."
+        )
+        seed_doc(conn, f"scale_{i}", text)
+    conn.commit()
+    t0 = time.monotonic()
+    matched = run_phase0_email_fastpath(conn, min_header_matches=2)
+    elapsed = time.monotonic() - t0
+    # All 200 docs share From + To + Date (3 headers) → should all be grouped
+    assert len(matched) == 200
+    # Must complete in bounded time — the old algorithm would generate
+    # 200*199/2 = 19,900 pairs PER shared header; the new one should be instant
+    assert elapsed < 2.0, f"Phase 0 took {elapsed:.1f}s for 200 docs — regression"
+
+
+def test_phase0_groups_by_header_combinations(conn):
+    """Documents sharing exactly min_header_matches headers should be grouped."""
+    # Doc A and B share From + Subject (2 headers) but different To and Date
+    text_a = (
+        "From: same@example.com\nTo: alpha@example.com\n"
+        "Date: 2001-01-01\nSubject: Same topic\n\nBody A."
+    )
+    text_b = (
+        "From: same@example.com\nTo: beta@example.com\n"
+        "Date: 2002-02-02\nSubject: Same topic\n\nBody B."
+    )
+    # Doc C shares only From with A (1 header) — should NOT group
+    text_c = (
+        "From: same@example.com\nTo: gamma@example.com\n"
+        "Date: 2003-03-03\nSubject: Different topic\n\nBody C."
+    )
+    seed_doc(conn, "combo_a", text_a)
+    seed_doc(conn, "combo_b", text_b)
+    seed_doc(conn, "combo_c", text_c)
+    conn.commit()
+    matched = run_phase0_email_fastpath(conn, min_header_matches=2)
+    assert "combo_a" in matched
+    assert "combo_b" in matched
+    # combo_c shares only 1 header (From) with each — should not be matched
+    assert "combo_c" not in matched
+
+
 # --- Phase 2 (LSH) ---
 
 def make_fingerprint(text):
