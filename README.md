@@ -107,6 +107,42 @@ this takes several hours depending on hardware.
 
 ---
 
+## Tracking Progress
+
+Some phases take a long time — here's what to expect and how to monitor them:
+
+| Phase | Typical Duration | What's Happening |
+|---|---|---|
+| Phase 0 — Email fast-path | 30–60 min | Counting and grouping ~1.4M document pairs by email headers |
+| Phase 1 — Fingerprinting | 1–3 hours | Building MinHash signatures for every document on first run |
+| Phase 2 — LSH candidates | 10–30 min | Hashing signatures into buckets and collecting candidate pairs |
+| Phase 3 — Verification | 30–90 min | Downloading and comparing full text for each candidate pair |
+| Phase 5 — PDF processing | 1–4 hours | Fetching and analyzing PDFs from justice.gov / archive.org |
+
+**Check what the daemon is doing right now:**
+
+```bash
+./unob status
+```
+
+This shows the current phase, how many documents have been processed, and
+the daemon's most recent activity line.
+
+**Watch progress in real time:**
+
+```bash
+./unob log -f
+```
+
+Each phase logs a counter as it works (e.g., `Phase 0: grouped 12,400 / 53,000 pairs`),
+so you can see it advancing. Use `./unob log -n 50` to see the last 50 lines
+without following.
+
+> **Tip:** The first full run is the slowest. Subsequent daemon cycles only
+> process new or changed documents and complete much faster.
+
+---
+
 ## Commands
 
 | Command | Description |
@@ -170,10 +206,9 @@ polling:
 
 ## TEREDACTA
 
-A web UI for browsing and searching Unobfuscator results is in active development
-as a companion project at `../TEREDACTA` (a sibling directory to this repo).
-TEREDACTA provides a document viewer, entity browser, and recovery timeline.
-It is not yet released publicly.
+[TEREDACTA](https://github.com/networkingguru/TEREDACTA) is a companion web UI
+for browsing and searching Unobfuscator results. It provides a document viewer,
+entity browser, and recovery timeline.
 
 ---
 
