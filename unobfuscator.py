@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Unobfuscator — CLI entry point."""
 
+import faulthandler
 import json
 import logging
 import os
@@ -87,14 +88,17 @@ def _process_pdf_worker(doc_id, redaction_markers, db_path):
             pass
         # Retry once after backoff for transient lock contention.
         if "database is locked" in str(e):
-            import time as _time
-            _time.sleep(2)
+            time.sleep(2)
             try:
                 process_pdf_for_document(thread_conn, doc_id=doc_id,
                                           redaction_markers=redaction_markers)
                 thread_conn.commit()
             except Exception as e2:
                 logger.warning("PDF worker retry failed for doc %s: %s", doc_id, e2)
+                try:
+                    thread_conn.rollback()
+                except Exception:
+                    pass
     finally:
         thread_conn.close()
 
@@ -362,6 +366,10 @@ def start(ctx, foreground):
         handlers=handlers,
     )
 
+    # Enable faulthandler so C-level crashes (e.g. in PyMuPDF) dump a traceback.
+    _fault_fh = open(log_path, "a")
+    faulthandler.enable(file=_fault_fh)
+
     global _daemon_conn
     _daemon_conn = conn
     _write_pid()
@@ -509,32 +517,36 @@ def status(ctx, doc):
     daemon_label = f"running (PID {pid})" if pid else "stopped"
     activity = get_config(conn, "daemon_activity", default="unknown")
 
-    total = conn.execute("SELECT COUNT(*) FROM documents").fetchone()[0]
-    indexed = conn.execute("SELECT COUNT(*) FROM documents WHERE text_processed=1").fetchone()[0]
+    # Single scan of documents table instead of 7 separate COUNT(*) queries.
+    doc_stats = conn.execute("""
+        SELECT COUNT(*),
+               SUM(CASE WHEN text_processed=1 THEN 1 ELSE 0 END),
+               SUM(CASE WHEN pdf_processed=1 THEN 1 ELSE 0 END),
+               SUM(CASE WHEN pdf_url IS NOT NULL THEN 1 ELSE 0 END),
+               SUM(CASE WHEN ocr_processed=1 THEN 1 ELSE 0 END),
+               SUM(CASE WHEN ocr_processed=0
+                    AND (extracted_text IS NULL OR extracted_text = '') THEN 1 ELSE 0 END)
+        FROM documents
+    """).fetchone()
+    total, indexed, pdf_done, pdf_total, ocr_done, ocr_pending = (
+        v or 0 for v in doc_stats
+    )
+
     fps = conn.execute("SELECT COUNT(*) FROM document_fingerprints").fetchone()[0]
-    groups = conn.execute("SELECT COUNT(*) FROM merge_results").fetchone()[0]
-    pdf_done = conn.execute("SELECT COUNT(*) FROM documents WHERE pdf_processed=1").fetchone()[0]
-    pdf_total = conn.execute(
-        "SELECT COUNT(*) FROM documents WHERE pdf_url IS NOT NULL"
-    ).fetchone()[0]
-    ocr_done = conn.execute(
-        "SELECT COUNT(*) FROM documents WHERE ocr_processed=1"
-    ).fetchone()[0]
-    ocr_pending = conn.execute(
-        "SELECT COUNT(*) FROM documents WHERE ocr_processed=0 "
-        "AND (extracted_text IS NULL OR extracted_text = '')"
-    ).fetchone()[0]
+
+    merge_stats = conn.execute("""
+        SELECT COUNT(*),
+               SUM(CASE WHEN output_generated=1 THEN 1 ELSE 0 END),
+               COALESCE(SUM(recovered_count), 0)
+        FROM merge_results
+    """).fetchone()
+    groups, output_count, recovered = (v or 0 for v in merge_stats)
+
     text_sources = conn.execute(
         "SELECT text_source, COUNT(*) FROM documents "
         "WHERE text_source IS NOT NULL GROUP BY text_source"
     ).fetchall()
     source_str = ", ".join(f"{r[0]}: {r[1]:,}" for r in text_sources)
-    output_count = conn.execute(
-        "SELECT COUNT(*) FROM merge_results WHERE output_generated=1"
-    ).fetchone()[0]
-    recovered = conn.execute(
-        "SELECT COALESCE(SUM(recovered_count),0) FROM merge_results"
-    ).fetchone()[0]
     output_dir = cfg_get(cfg, "output_dir", default="./output")
     lsh_warning = get_config(conn, "lsh_memory_warning", default="")
 
