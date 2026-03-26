@@ -8,7 +8,7 @@ workers:
 
 matching:
   min_overlap_chars: 200
-  similarity_threshold: 0.40
+  similarity_threshold: 0.70
   email_header_min_matches: 2
 
 polling:
