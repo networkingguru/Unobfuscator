@@ -81,17 +81,31 @@ def _process_pdf_worker(doc_id, redaction_markers, db_path):
         thread_conn.commit()
     except Exception as e:
         logger.error("PDF worker error for doc %s: %s", doc_id, e)
+        try:
+            thread_conn.rollback()
+        except Exception:
+            pass
+        # Retry once after backoff for transient lock contention.
+        if "database is locked" in str(e):
+            import time as _time
+            _time.sleep(2)
+            try:
+                process_pdf_for_document(thread_conn, doc_id=doc_id,
+                                          redaction_markers=redaction_markers)
+                thread_conn.commit()
+            except Exception as e2:
+                logger.warning("PDF worker retry failed for doc %s: %s", doc_id, e2)
     finally:
         thread_conn.close()
 
 
 def _run_pdf_parallel(pdf_docs, redaction_markers, db_path, num_workers):
-    """Process pending PDFs using a thread pool."""
+    """Process a batch of pending PDFs using a thread pool."""
     global _shutdown_requested
     total = len(pdf_docs)
     done = 0
-    logger.info("Stage 4: processing %d PDFs with %d workers", total, num_workers)
-    _set_activity(f"Stage 4 PDF: 0/{total}")
+    logger.info("Stage 4: processing batch of %d PDFs with %d workers", total, num_workers)
+    _set_activity(f"Stage 4 PDF: batch of {total}")
 
     with ThreadPoolExecutor(max_workers=num_workers) as pool:
         futures = {}
@@ -208,12 +222,15 @@ def _run_one_cycle(conn, cfg: dict) -> None:
         run_merger(conn, redaction_markers=markers)
 
     if not _shutdown_requested:
-        pdf_docs = get_pending_pdf_documents(conn, limit=-1)
-        if pdf_docs:
+        num_workers = cfg_get(cfg, "workers.pdf", default=10)
+        db_path = cfg_get(cfg, "db_path", default="./data/unobfuscator.db")
+        pdf_batch_size = cfg_get(cfg, "workers.pdf_batch_size", default=1000)
+        while not _shutdown_requested:
+            pdf_docs = get_pending_pdf_documents(conn, limit=pdf_batch_size)
+            if not pdf_docs:
+                break
             # Commit before spawning workers so they don't block on our write lock.
             conn.commit()
-            num_workers = cfg_get(cfg, "workers.pdf", default=10)
-            db_path = cfg_get(cfg, "db_path", default="./data/unobfuscator.db")
             _run_pdf_parallel(pdf_docs, markers, db_path, num_workers)
 
     # Phase 5.5: Text recovery (Jmail backfill + OCR)
@@ -374,6 +391,33 @@ def start(ctx, foreground):
             try:
                 _run_one_cycle(conn, cfg)
                 consecutive_errors = 0  # Reset on success
+
+                stats = get_queue_stats(conn)
+                pending_pdfs = conn.execute(
+                    "SELECT COUNT(*) FROM documents WHERE pdf_processed = 0 AND pdf_url IS NOT NULL"
+                ).fetchone()[0]
+                pending_ocr = conn.execute(
+                    "SELECT COUNT(*) FROM documents "
+                    "WHERE ocr_processed = 0 AND (extracted_text IS NULL OR extracted_text = '')"
+                ).fetchone()[0]
+                if stats.get("pending", 0) == 0 and pending_pdfs == 0 and pending_ocr == 0 and not _shutdown_requested:
+                    _set_activity("Polling for new batches")
+                    poll_ok = _poll_for_new_batches(conn, cfg)
+                    wait = poll_interval if poll_ok else retry_interval
+                    wake = datetime.now(timezone.utc) + timedelta(seconds=wait)
+                    reason = "" if poll_ok else " (poll failed, retrying sooner)"
+                    _set_activity(
+                        f"Idle — sleeping {wait // 60:.0f}m until "
+                        f"{wake.astimezone().strftime('%H:%M')}{reason}"
+                    )
+                    console.print(
+                        f"[dim]All tasks complete. Checking for updates in "
+                        f"{wait // 60:.0f} min...[/dim]"
+                    )
+                    for _ in range(int(wait)):
+                        if _shutdown_requested:
+                            break
+                        time.sleep(1)
             except Exception:
                 consecutive_errors += 1
                 logger.exception(
@@ -392,33 +436,6 @@ def start(ctx, foreground):
                     break
                 backoff = min(30 * consecutive_errors, 300)
                 for _ in range(backoff):
-                    if _shutdown_requested:
-                        break
-                    time.sleep(1)
-                continue
-            stats = get_queue_stats(conn)
-            pending_pdfs = conn.execute(
-                "SELECT COUNT(*) FROM documents WHERE pdf_processed = 0 AND pdf_url IS NOT NULL"
-            ).fetchone()[0]
-            pending_ocr = conn.execute(
-                "SELECT COUNT(*) FROM documents "
-                "WHERE ocr_processed = 0 AND (extracted_text IS NULL OR extracted_text = '')"
-            ).fetchone()[0]
-            if stats.get("pending", 0) == 0 and pending_pdfs == 0 and pending_ocr == 0 and not _shutdown_requested:
-                _set_activity("Polling for new batches")
-                poll_ok = _poll_for_new_batches(conn, cfg)
-                wait = poll_interval if poll_ok else retry_interval
-                wake = datetime.now(timezone.utc) + timedelta(seconds=wait)
-                reason = "" if poll_ok else " (poll failed, retrying sooner)"
-                _set_activity(
-                    f"Idle — sleeping {wait // 60:.0f}m until "
-                    f"{wake.astimezone().strftime('%H:%M')}{reason}"
-                )
-                console.print(
-                    f"[dim]All tasks complete. Checking for updates in "
-                    f"{wait // 60:.0f} min...[/dim]"
-                )
-                for _ in range(int(wait)):
                     if _shutdown_requested:
                         break
                     time.sleep(1)
