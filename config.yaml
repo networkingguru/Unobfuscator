@@ -5,6 +5,7 @@ db_path: ./data/unobfuscator.db
 workers:
   text: 4
   pdf: 10
+  pdf_batch_size: 1000
 
 matching:
   min_overlap_chars: 200
