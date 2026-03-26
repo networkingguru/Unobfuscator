@@ -78,6 +78,10 @@ CREATE TABLE IF NOT EXISTS config (
     key TEXT PRIMARY KEY,
     value TEXT
 );
+
+CREATE INDEX IF NOT EXISTS idx_documents_pdf_pending
+    ON documents (pdf_processed, pdf_url)
+    WHERE pdf_processed = 0 AND pdf_url IS NOT NULL;
 """
 
 
@@ -86,6 +90,7 @@ def get_connection(db_path: str) -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute("PRAGMA busy_timeout=5000")
     return conn
 
 
@@ -168,7 +173,16 @@ def merge_groups(conn, group_id_keep: int, group_id_remove: int) -> None:
         UPDATE OR IGNORE match_group_members SET group_id = ?
         WHERE group_id = ?
     """, (group_id_keep, group_id_remove))
+    # Delete any members that couldn't be moved (already exist in target group)
+    conn.execute("DELETE FROM match_group_members WHERE group_id = ?",
+                 (group_id_remove,))
+    # Remove stale merge_results before deleting the group (FK constraint)
+    conn.execute("DELETE FROM merge_results WHERE group_id = ?",
+                 (group_id_remove,))
     conn.execute("DELETE FROM match_groups WHERE group_id = ?", (group_id_remove,))
+    # Reset merged flag so the kept group is re-merged with all members
+    conn.execute("UPDATE match_groups SET merged = 0 WHERE group_id = ?",
+                 (group_id_keep,))
 
 
 def upsert_merge_result(conn, group_id: int, merged_text: str,
@@ -255,8 +269,7 @@ def mark_output_generated(conn, group_id: int) -> None:
 
 def get_pending_output_groups(conn) -> list[dict]:
     rows = conn.execute("""
-        SELECT group_id, merged_text, recovered_count, total_redacted,
-               source_doc_ids, recovered_segments, soft_recovered_count
+        SELECT group_id
         FROM merge_results
         WHERE output_generated = 0 AND recovered_count > 0
     """).fetchall()

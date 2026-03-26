@@ -13,11 +13,15 @@ Logic reference: PIPELINE.md — Phase 6
 """
 
 import json
+import logging
 import os
+import time
 from datetime import date
 from pathlib import Path
 from typing import Optional
 import fitz  # PyMuPDF
+
+logger = logging.getLogger(__name__)
 
 from core.db import (
     get_merge_result, get_documents_by_ids,
@@ -73,16 +77,10 @@ def _insert_text_multipage(pdf: fitz.Document, text: str, fontsize: int = 10) ->
     return pages_created
 
 
-def _apply_highlights(page: fitz.Page, texts: list[str], color: tuple) -> None:
-    """Highlight occurrences of each text string on the page.
-
-    Splits multi-line recovered text into individual lines and searches for
-    each line separately, since search_for works within contiguous text runs.
-    Deduplicates search strings and rects to avoid double-annotating.
-    Strips block-redaction characters (█■) since they render as dots in PDFs.
-    """
-    highlighted_rects: set[tuple] = set()
-    seen_searches: set[str] = set()
+def _build_search_strings(texts: list[str]) -> list[str]:
+    """Pre-compute deduplicated search strings from recovered text segments."""
+    seen: set[str] = set()
+    result: list[str] = []
     for text in texts:
         text = text.strip()
         if not text:
@@ -96,18 +94,44 @@ def _apply_highlights(page: fitz.Page, texts: list[str], color: tuple) -> None:
             if len(clean_line) < 4:
                 continue
             search_text = clean_line[:70]
-            if search_text in seen_searches:
+            if search_text not in seen:
+                seen.add(search_text)
+                result.append(search_text)
+    return result
+
+
+def _apply_highlights(page: fitz.Page, texts: list[str], color: tuple,
+                      _search_strings: list[str] = None) -> None:
+    """Highlight occurrences of each text string on the page.
+
+    Splits multi-line recovered text into individual lines and searches for
+    each line separately, since search_for works within contiguous text runs.
+    Deduplicates search strings and rects to avoid double-annotating.
+    Strips block-redaction characters (█■) since they render as dots in PDFs.
+
+    Uses a fast Python `in` pre-filter on page text before calling MuPDF's
+    search_for, which avoids expensive C-level text span iteration on pages
+    where the string doesn't appear.
+    """
+    search_strings = _search_strings if _search_strings is not None else _build_search_strings(texts)
+    if not search_strings:
+        return
+
+    # Get page text once for fast Python-level pre-filtering
+    page_text = page.get_text()
+    highlighted_rects: set[tuple] = set()
+    for search_text in search_strings:
+        if search_text not in page_text:
+            continue  # fast skip — string not on this page
+        for rect in page.search_for(search_text):
+            rect_key = (round(rect.x0, 1), round(rect.y0, 1),
+                        round(rect.x1, 1), round(rect.y1, 1))
+            if rect_key in highlighted_rects:
                 continue
-            seen_searches.add(search_text)
-            for rect in page.search_for(search_text):
-                rect_key = (round(rect.x0, 1), round(rect.y0, 1),
-                            round(rect.x1, 1), round(rect.y1, 1))
-                if rect_key in highlighted_rects:
-                    continue
-                highlighted_rects.add(rect_key)
-                annot = page.add_highlight_annot(rect)
-                annot.set_colors(stroke=color)
-                annot.update()
+            highlighted_rects.add(rect_key)
+            annot = page.add_highlight_annot(rect)
+            annot.set_colors(stroke=color)
+            annot.update()
 
 
 def _write_section_header(pdf: fitz.Document, title: str) -> fitz.Page:
@@ -155,8 +179,16 @@ def generate_output_pdf(
     recovered_segments = json.loads(merge_row.get("recovered_segments") or "[]")
 
     source_docs = get_documents_by_ids(conn, source_doc_ids)
-    # source_docs[0] is the base (destination), rest are donors
-    base_doc = source_docs[0] if source_docs else {}
+    if not source_docs:
+        logger.warning("Group %d: no source docs found in DB, skipping", group_id)
+        return None
+    # source_docs[0] is the base (destination), rest are donors.
+    # Verify the first doc matches the expected base ID.
+    base_doc = source_docs[0]
+    if base_doc["id"] != str(source_doc_ids[0]):
+        logger.warning("Group %d: base doc %s missing from DB, skipping",
+                        group_id, source_doc_ids[0])
+        return None
     donor_docs = source_docs[1:] if len(source_docs) > 1 else []
 
     # Check provenance for non-DOJ sources
@@ -182,55 +214,60 @@ def generate_output_pdf(
     )
 
     pdf = fitz.open()
-
-    # ── SECTION 1: DESTINATION DOCUMENT (merged text, GREEN highlights) ──
-    _write_section_header(
-        pdf,
-        f"DESTINATION DOCUMENT — {base_doc.get('original_filename', '?')}"
-    )
-    dest_start_page = len(pdf)
-    dest_pages = _insert_text_multipage(pdf, merged_text, fontsize=10)
-
-    # Apply GREEN highlights on recovered text in destination pages
-    recovered_texts = [seg.get("text", "").strip() for seg in recovered_segments]
-    for i in range(dest_start_page, dest_start_page + dest_pages):
-        _apply_highlights(pdf[i], recovered_texts, GREEN)
-
-    # ── SECTION 2: SOURCE DOCUMENT(s) (full donor text, YELLOW highlights) ──
-    # Group recovered segments by donor doc
-    by_donor: dict[str, list[str]] = {}
-    for seg in recovered_segments:
-        did = seg.get("source_doc_id", "")
-        text = seg.get("text", "").strip()
-        if text:
-            by_donor.setdefault(did, []).append(text)
-
-    for donor in donor_docs:
-        donor_id = donor["id"]
-        donor_text = donor.get("extracted_text", "")
-        donor_name = donor.get("original_filename", donor_id)
-
+    try:
+        # ── SECTION 1: DESTINATION DOCUMENT (merged text, GREEN highlights) ──
         _write_section_header(
             pdf,
-            f"SOURCE DOCUMENT — {donor_name}"
+            f"DESTINATION DOCUMENT — {base_doc.get('original_filename', '?')}"
         )
-        src_start_page = len(pdf)
-        src_pages = _insert_text_multipage(pdf, donor_text, fontsize=10)
+        dest_start_page = len(pdf)
+        dest_pages = _insert_text_multipage(pdf, merged_text, fontsize=10)
 
-        # Apply YELLOW highlights on the passages that provided recoveries
-        donor_recovered = by_donor.get(donor_id, [])
-        for i in range(src_start_page, src_start_page + src_pages):
-            _apply_highlights(pdf[i], donor_recovered, YELLOW)
+        # Apply GREEN highlights on recovered text in destination pages
+        recovered_texts = [seg.get("text", "").strip() for seg in recovered_segments]
+        dest_searches = _build_search_strings(recovered_texts)
+        for i in range(dest_start_page, dest_start_page + dest_pages):
+            _apply_highlights(pdf[i], recovered_texts, GREEN,
+                              _search_strings=dest_searches)
 
-    # ── SECTION 3: METADATA ──
-    _write_metadata_page(
-        pdf, base_doc, donor_docs,
-        recovered_count, soft_recovered_count,
-        provenance_label=provenance_label,
-    )
+        # ── SECTION 2: SOURCE DOCUMENT(s) (full donor text, YELLOW highlights) ──
+        # Group recovered segments by donor doc
+        by_donor: dict[str, list[str]] = {}
+        for seg in recovered_segments:
+            did = seg.get("source_doc_id", "")
+            text = seg.get("text", "").strip()
+            if text:
+                by_donor.setdefault(did, []).append(text)
 
-    pdf.save(output_path)
-    pdf.close()
+        for donor in donor_docs:
+            donor_id = donor["id"]
+            donor_text = donor.get("extracted_text", "")
+            donor_name = donor.get("original_filename", donor_id)
+
+            _write_section_header(
+                pdf,
+                f"SOURCE DOCUMENT — {donor_name}"
+            )
+            src_start_page = len(pdf)
+            src_pages = _insert_text_multipage(pdf, donor_text, fontsize=10)
+
+            # Apply YELLOW highlights on the passages that provided recoveries
+            donor_recovered = by_donor.get(donor_id, [])
+            donor_searches = _build_search_strings(donor_recovered)
+            for i in range(src_start_page, src_start_page + src_pages):
+                _apply_highlights(pdf[i], donor_recovered, YELLOW,
+                                  _search_strings=donor_searches)
+
+        # ── SECTION 3: METADATA ──
+        _write_metadata_page(
+            pdf, base_doc, donor_docs,
+            recovered_count, soft_recovered_count,
+            provenance_label=provenance_label,
+        )
+
+        pdf.save(output_path)
+    finally:
+        pdf.close()
 
     mark_output_generated(conn, group_id)
     return output_path
@@ -303,16 +340,45 @@ def _write_metadata_page(
 
 
 def run_output_generator(conn, output_dir: str, redaction_markers: list[str],
-                         provenance_path: str = None) -> int:
-    """Generate output PDFs for all pending merge results. Returns count generated."""
+                         provenance_path: str = None,
+                         commit_every: int = 50,
+                         shutdown_check=None) -> int:
+    """Generate output PDFs for all pending merge results. Returns count generated.
+
+    Args:
+        commit_every: Commit the transaction every N groups to checkpoint progress.
+        shutdown_check: Optional callable returning True if shutdown was requested.
+    """
     # Load provenance once for all groups instead of re-reading per group.
     prov_data = _load_provenance(provenance_path) if provenance_path else {}
+    pending = get_pending_output_groups(conn)
+    total = len(pending)
     count = 0
-    for row in get_pending_output_groups(conn):
-        path = generate_output_pdf(conn, row["group_id"], output_dir, redaction_markers,
-                                   provenance_path=provenance_path,
-                                   _prov_data=prov_data)
+    since_commit = 0
+    t0 = time.monotonic()
+    for i, row in enumerate(pending):
+        if shutdown_check and shutdown_check():
+            logger.info("Stage 5: shutdown requested after %d/%d groups", i, total)
+            break
+        group_id = row["group_id"]
+        try:
+            path = generate_output_pdf(conn, group_id, output_dir, redaction_markers,
+                                       provenance_path=provenance_path,
+                                       _prov_data=prov_data)
+        except Exception:
+            logger.exception("Stage 5: failed to generate PDF for group %d", group_id)
+            since_commit += 1  # still count toward commit interval
+            continue
         if path:
             count += 1
+        since_commit += 1
+        if since_commit >= commit_every:
+            conn.commit()
+            elapsed = time.monotonic() - t0
+            logger.info("Stage 5: %d/%d groups processed, %d PDFs written (%.1fs elapsed)",
+                        i + 1, total, count, elapsed)
+            since_commit = 0
     conn.commit()
+    elapsed = time.monotonic() - t0
+    logger.info("Stage 5: complete — %d PDFs written from %d groups (%.1fs)", count, total, elapsed)
     return count

@@ -63,10 +63,10 @@ def test_run_one_cycle_completes_without_error(mock_text_batch, mock_meta, conn,
     assert count == 1
 
 
-@patch("stages.pdf_processor.httpx.get")
+@patch("stages.pdf_processor._download_pdf")
 @patch("stages.indexer.fetch_documents_metadata")
 @patch("stages.indexer.fetch_documents_text_batch")
-def test_run_one_cycle_processes_multiple_pdfs(mock_text_batch, mock_meta, mock_http, conn, cfg):
+def test_run_one_cycle_processes_multiple_pdfs(mock_text_batch, mock_meta, mock_dl, conn, cfg):
     """Multiple pending PDFs are all processed in a single daemon cycle."""
     # Seed two documents that already have pdf_url set and are pending PDF processing.
     for doc_id in (10, 11):
@@ -85,8 +85,7 @@ def test_run_one_cycle_processes_multiple_pdfs(mock_text_batch, mock_meta, mock_
     doc = fitz.open()
     doc.new_page()
     clean_pdf = doc.tobytes()
-    mock_http.return_value.status_code = 200
-    mock_http.return_value.content = clean_pdf
+    mock_dl.return_value.content = clean_pdf
 
     # No batches to index, but two PDFs are pending.
     mock_meta.return_value = []
@@ -257,3 +256,72 @@ def test_config_set_overwrites_existing_value(tmp_path):
     stored = get_config(conn, "some_key")
     conn.close()
     assert stored == "second_value", f"Expected 'second_value', got {stored!r}"
+
+
+def test_backfill_fingerprints_rebuilds_stale_fingerprints(tmp_path):
+    """backfill-fingerprints should rebuild fingerprints for docs with soft-redaction text."""
+    db_path = str(tmp_path / "bf_test.db")
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(
+        yaml.dump({"db_path": db_path, "redaction_markers": ["[REDACTED]"]})
+    )
+
+    init_db(db_path)
+    conn = get_connection(db_path)
+
+    # Seed a document that has soft-redaction text but no fingerprint (simulating the bug)
+    long_text = (
+        "The witness testified about a meeting with [REDACTED] on January fifth "
+        "two thousand and two at the residence located on the island. "
+        "\n\n[SOFT_REDACTION_RECOVERED]\n"
+        "Additional recovered content from the soft redaction overlay in the PDF."
+    )
+    upsert_document(conn, {
+        "id": "doc_sr_1", "source": "doj", "release_batch": "VOL00001",
+        "original_filename": "sr.pdf", "page_count": 1,
+        "size_bytes": 1000, "description": "", "extracted_text": long_text,
+    })
+    conn.commit()
+
+    # Verify no fingerprint exists yet
+    fp = conn.execute(
+        "SELECT * FROM document_fingerprints WHERE doc_id = 'doc_sr_1'"
+    ).fetchone()
+    assert fp is None
+    conn.close()
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        ["--config", str(config_file), "backfill-fingerprints"],
+        catch_exceptions=False,
+    )
+    assert result.exit_code == 0, f"CLI exited with {result.exit_code}:\n{result.output}"
+    assert "fingerprints rebuilt" in result.output
+
+    # Verify fingerprint was created
+    conn = get_connection(db_path)
+    fp = conn.execute(
+        "SELECT * FROM document_fingerprints WHERE doc_id = 'doc_sr_1'"
+    ).fetchone()
+    conn.close()
+    assert fp is not None
+    assert fp["shingle_count"] > 0
+
+
+def test_backfill_fingerprints_skips_when_no_soft_redactions(tmp_path):
+    """backfill-fingerprints should report nothing to do when no docs have the marker."""
+    db_path = str(tmp_path / "bf_empty.db")
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(yaml.dump({"db_path": db_path}))
+
+    init_db(db_path)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        ["--config", str(config_file), "backfill-fingerprints"],
+        catch_exceptions=False,
+    )
+    assert result.exit_code == 0
+    assert "No documents" in result.output
