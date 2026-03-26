@@ -612,6 +612,7 @@ def run_phase3_verify_and_group(
     redaction_markers: list[str],
     min_overlap_chars: int = 200,
     progress_callback=None,
+    shutdown_check=None,
 ) -> None:
     """Verify candidate pairs and group confirmed matches.
 
@@ -642,6 +643,9 @@ def run_phase3_verify_and_group(
     log_interval = 1_000  # log every N candidates
 
     for i, (doc_a, doc_b) in enumerate(candidates, 1):
+        if shutdown_check and shutdown_check():
+            logger.info("Phase 3 interrupted by shutdown after %d/%d candidates", i - 1, total)
+            break
         text_a = _get_text(conn, doc_a)
         text_b = _get_text(conn, doc_b)
 
