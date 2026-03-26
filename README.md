@@ -113,11 +113,12 @@ Some phases take a long time — here's what to expect and how to monitor them:
 
 | Phase | Typical Duration | What's Happening |
 |---|---|---|
-| Phase 0 — Email fast-path | 30–60 min | Counting and grouping ~1.4M document pairs by email headers |
-| Phase 1 — Fingerprinting | 1–3 hours | Building MinHash signatures for every document on first run |
-| Phase 2 — LSH candidates | 10–30 min | Hashing signatures into buckets and collecting candidate pairs |
-| Phase 3 — Verification | 30–90 min | Downloading and comparing full text for each candidate pair |
-| Phase 5 — PDF processing | 1–4 hours | Fetching and analyzing PDFs from justice.gov / archive.org |
+| Phase 0 — Email fast-path | ~17 min | Scanning 1.4M docs and grouping by email headers |
+| Phase 1 — Fingerprinting | varies | Building MinHash signatures (skipped if already in DB) |
+| Phase 2 — LSH candidates | ~30 min | Loading 1.3M fingerprints and building the LSH index |
+| **Phase 3 — Verification** | **2–3 days** | **The bottleneck: rolling-hash LCS on ~2M candidate pairs at ~10 pairs/sec** |
+| Phase 5 — PDF processing | ~1 hr 15 min | Fetching and analyzing ~77K PDFs from justice.gov / archive.org |
+| Phase 6 — Output generation | ~6 min | Writing annotated PDFs |
 
 **Check what the daemon is doing right now:**
 
