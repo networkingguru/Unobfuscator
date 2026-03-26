@@ -8,6 +8,7 @@ import signal
 import subprocess
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Optional
@@ -71,6 +72,51 @@ def _remove_pid() -> None:
         pass
 
 
+def _process_pdf_worker(doc_id, redaction_markers, db_path):
+    """Worker function for parallel PDF processing. Each thread gets its own connection."""
+    thread_conn = get_connection(db_path)
+    try:
+        process_pdf_for_document(thread_conn, doc_id=doc_id,
+                                  redaction_markers=redaction_markers)
+        thread_conn.commit()
+    except Exception as e:
+        logger.error("PDF worker error for doc %s: %s", doc_id, e)
+    finally:
+        thread_conn.close()
+
+
+def _run_pdf_parallel(pdf_docs, redaction_markers, db_path, num_workers):
+    """Process pending PDFs using a thread pool."""
+    global _shutdown_requested
+    total = len(pdf_docs)
+    done = 0
+    logger.info("Stage 4: processing %d PDFs with %d workers", total, num_workers)
+    _set_activity(f"Stage 4 PDF: 0/{total}")
+
+    with ThreadPoolExecutor(max_workers=num_workers) as pool:
+        futures = {}
+        for pdf_doc in pdf_docs:
+            if _shutdown_requested:
+                break
+            fut = pool.submit(_process_pdf_worker, pdf_doc["id"],
+                              redaction_markers, db_path)
+            futures[fut] = pdf_doc["id"]
+
+        for fut in as_completed(futures):
+            done += 1
+            if done % 100 == 0 or done == total:
+                _set_activity(f"Stage 4 PDF: {done}/{total}")
+            if _shutdown_requested:
+                # Cancel remaining futures on shutdown
+                for f in futures:
+                    f.cancel()
+                break
+            exc = fut.exception()
+            if exc:
+                logger.error("PDF future error for doc %s: %s",
+                             futures[fut], exc)
+
+
 def _run_one_cycle(conn, cfg: dict) -> None:
     """Run one full pass of all 5 stages using only core.db helpers — no inline SQL."""
     global _shutdown_requested
@@ -117,9 +163,20 @@ def _run_one_cycle(conn, cfg: dict) -> None:
                                             memory_limit_pct=mem_limit)
     logger.info("Stage 2: LSH found %d candidate pairs", len(candidates))
 
-    _set_activity(f"Stage 2 Matcher: verifying {len(candidates)} candidates")
+    if _shutdown_requested:
+        return
+
+    _set_activity(f"Stage 2 Matcher: verifying {len(candidates):,} candidates")
+
+    def _phase3_cb(checked, total, confirmed):
+        pct = checked * 100 // total if total else 0
+        _set_activity(f"Stage 2 Matcher: {checked:,}/{total:,} pairs "
+                      f"({pct}%), {confirmed:,} confirmed")
+
     run_phase3_verify_and_group(conn, candidates, redaction_markers=markers,
-                                min_overlap_chars=min_overlap)
+                                min_overlap_chars=min_overlap,
+                                progress_callback=_phase3_cb,
+                                shutdown_check=lambda: _shutdown_requested)
 
     if _shutdown_requested:
         return
@@ -152,11 +209,12 @@ def _run_one_cycle(conn, cfg: dict) -> None:
 
     if not _shutdown_requested:
         pdf_docs = get_pending_pdf_documents(conn, limit=-1)
-        for i, pdf_doc in enumerate(pdf_docs, 1):
-            if _shutdown_requested:
-                break
-            _set_activity(f"Stage 4 PDF: processing {i}/{len(pdf_docs)}")
-            process_pdf_for_document(conn, doc_id=pdf_doc["id"])
+        if pdf_docs:
+            # Commit before spawning workers so they don't block on our write lock.
+            conn.commit()
+            num_workers = cfg_get(cfg, "workers.pdf", default=10)
+            db_path = cfg_get(cfg, "db_path", default="./data/unobfuscator.db")
+            _run_pdf_parallel(pdf_docs, markers, db_path, num_workers)
 
     # Phase 5.5: Text recovery (Jmail backfill + OCR)
     if not _shutdown_requested:
@@ -174,7 +232,8 @@ def _run_one_cycle(conn, cfg: dict) -> None:
         prov_path = str(project_root / "pdf_cache" / "provenance.json")
         output_count = run_output_generator(conn, output_dir=output_dir,
                                             redaction_markers=markers,
-                                            provenance_path=prov_path)
+                                            provenance_path=prov_path,
+                                            shutdown_check=lambda: _shutdown_requested)
         logger.info("Stage 5: generated %d output files", output_count)
 
     # Mark pending index jobs done — the cycle already processed all DB state.
@@ -289,6 +348,13 @@ def start(ctx, foreground):
     global _daemon_conn
     _daemon_conn = conn
     _write_pid()
+
+    # Clear any stale progress keys from a previous crashed run
+    set_config(conn, "phase3_total", 0)
+    set_config(conn, "phase3_checked", 0)
+    set_config(conn, "phase3_confirmed", 0)
+    conn.commit()
+
     console.print(f"[green]Daemon started (PID {os.getpid()})[/green]")
 
     def _handle_signal(sig, frame):
@@ -299,11 +365,37 @@ def start(ctx, foreground):
     signal.signal(signal.SIGTERM, _handle_signal)
 
     retry_interval = 5 * 60  # 5 min retry on poll failure
+    consecutive_errors = 0
+    max_consecutive_errors = 5
     try:
         _set_activity("Polling for new batches (initial)")
         _poll_for_new_batches(conn, cfg)
         while not _shutdown_requested:
-            _run_one_cycle(conn, cfg)
+            try:
+                _run_one_cycle(conn, cfg)
+                consecutive_errors = 0  # Reset on success
+            except Exception:
+                consecutive_errors += 1
+                logger.exception(
+                    "Error in processing cycle (%d/%d)",
+                    consecutive_errors, max_consecutive_errors,
+                )
+                _set_activity(
+                    f"Error in cycle ({consecutive_errors}/{max_consecutive_errors})"
+                    " — retrying after backoff"
+                )
+                if consecutive_errors >= max_consecutive_errors:
+                    logger.critical(
+                        "Too many consecutive errors (%d), shutting down",
+                        consecutive_errors,
+                    )
+                    break
+                backoff = min(30 * consecutive_errors, 300)
+                for _ in range(backoff):
+                    if _shutdown_requested:
+                        break
+                    time.sleep(1)
+                continue
             stats = get_queue_stats(conn)
             pending_pdfs = conn.execute(
                 "SELECT COUNT(*) FROM documents WHERE pdf_processed = 0 AND pdf_url IS NOT NULL"
@@ -332,6 +424,11 @@ def start(ctx, foreground):
                     time.sleep(1)
     finally:
         _set_activity("Stopped")
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
         _daemon_conn = None
         _remove_pid()
         console.print("[yellow]Daemon stopped.[/yellow]")
@@ -431,7 +528,21 @@ def status(ctx, doc):
     if pid:
         t.add_row("Activity", activity)
     t.add_row("Stage 1 Indexer", f"{indexed:,} / {total:,} docs")
-    t.add_row("Stage 2 Matcher", f"{fps:,} fingerprints built")
+    phase3_total = int(get_config(conn, "phase3_total", default=0))
+    phase3_checked = int(get_config(conn, "phase3_checked", default=0))
+    phase3_confirmed = int(get_config(conn, "phase3_confirmed", default=0))
+    match_members = conn.execute("SELECT COUNT(*) FROM match_group_members").fetchone()[0]
+
+    matcher_detail = f"{fps:,} fingerprints built"
+    if phase3_total > 0:
+        pct = phase3_checked * 100 // phase3_total
+        matcher_detail += (f"\n  Phase 3: {phase3_checked:,} / {phase3_total:,} "
+                           f"pairs checked ({pct}%)"
+                           f"\n  {phase3_confirmed:,} confirmed, "
+                           f"{match_members:,} group members")
+    else:
+        matcher_detail += f", {match_members:,} group members"
+    t.add_row("Stage 2 Matcher", matcher_detail)
     if lsh_warning:
         t.add_row("LSH Warning", f"[yellow]{lsh_warning}[/yellow]")
     t.add_row("Stage 3 Merger", f"{groups:,} groups merged")
@@ -594,6 +705,50 @@ def backfill(ctx):
                               min_words_per_page=min_wpp)
     console.print(f"[green]Text recovery complete: {count} documents recovered.[/green]")
     conn.close()
+
+
+@cli.command("backfill-fingerprints")
+@click.pass_context
+def backfill_fingerprints(ctx):
+    """One-shot: rebuild fingerprints for docs that had soft-redaction text appended."""
+    from stages.indexer import clean_text, shingle, build_fingerprint
+
+    cfg = load_config(ctx.obj["config_path"])
+    db_path = cfg_get(cfg, "db_path", default="./data/unobfuscator.db")
+    markers = cfg_get(cfg, "redaction_markers", default=[])
+
+    init_db(db_path)
+    conn = get_connection(db_path)
+
+    logging.basicConfig(level=logging.INFO,
+                        format="%(asctime)s %(name)s %(levelname)s %(message)s")
+
+    rows = conn.execute(
+        "SELECT id, extracted_text FROM documents "
+        "WHERE extracted_text LIKE '%[SOFT_REDACTION_RECOVERED]%'"
+    ).fetchall()
+
+    if not rows:
+        console.print("[yellow]No documents with soft-redaction recoveries found.[/yellow]")
+        conn.close()
+        return
+
+    console.print(f"[dim]Rebuilding fingerprints for {len(rows):,} documents...[/dim]")
+    rebuilt = 0
+    for row in rows:
+        cleaned = clean_text(row["extracted_text"], markers)
+        shingles = shingle(cleaned)
+        if shingles:
+            sig = build_fingerprint(cleaned)
+            from core.db import upsert_fingerprint
+            upsert_fingerprint(conn, row["id"], sig, len(shingles))
+            rebuilt += 1
+    conn.commit()
+    conn.close()
+    console.print(
+        f"[green]Done: {rebuilt:,} fingerprints rebuilt out of {len(rows):,} documents.[/green]\n"
+        f"Run the daemon to trigger LSH rebuild and find new matches."
+    )
 
 
 if __name__ == "__main__":
