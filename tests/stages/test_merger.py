@@ -325,6 +325,69 @@ def test_merge_group_allows_legitimate_repeated_name_recovery(conn):
     assert result["merged_text"].count("Bill Clinton") == 2
 
 
+def test_confidence_field_marks_repeated_recoveries_as_questionable(conn):
+    """Recoveries of the same text 3+ times get confidence='questionable'."""
+    # 4 redactions, each with unique left anchor but donor has same name everywhere
+    base_text = (
+        "Meeting with [REDACTED] on Monday. "
+        "Lunch with [REDACTED] on Tuesday. "
+        "Call from [REDACTED] on Wednesday. "
+        "Dinner with [REDACTED] on Thursday."
+    )
+    donor_text = (
+        "Meeting with John Smith on Monday. "
+        "Lunch with John Smith on Tuesday. "
+        "Call from John Smith on Wednesday. "
+        "Dinner with John Smith on Thursday."
+    )
+    seed_doc(conn, 1, base_text)
+    seed_doc(conn, 2, donor_text)
+    conn.commit()
+    g = create_match_group(conn)
+    add_group_member(conn, g, 1, 1.0)
+    add_group_member(conn, g, 2, 0.9)
+    conn.commit()
+
+    result = merge_group(conn, g, REDACTION_MARKERS, anchor_length=50)
+    # All 4 recover "John Smith" — same text 4x triggers questionable
+    for seg in result["recovered_segments"]:
+        assert seg["confidence"] == "questionable"
+
+
+def test_confidence_field_high_for_unique_recoveries(conn):
+    """Recoveries of distinct texts get confidence='high'."""
+    seed_doc(conn, 1, BASE_TEXT)
+    seed_doc(conn, 2, DONOR_TEXT_A)
+    seed_doc(conn, 3, DONOR_TEXT_B)
+    conn.commit()
+    g = create_match_group(conn)
+    add_group_member(conn, g, 1, 1.0)
+    add_group_member(conn, g, 2, 0.9)
+    add_group_member(conn, g, 3, 0.9)
+    conn.commit()
+
+    result = merge_group(conn, g, REDACTION_MARKERS, anchor_length=20)
+    assert result["recovered_count"] == 2
+    for seg in result["recovered_segments"]:
+        assert seg["confidence"] == "high"
+
+
+def test_is_real_recovery_rejects_redaction_descriptions(conn):
+    """Redaction descriptions like 'blacked out' should not be treated as recoveries."""
+    base_text = "The document contained [REDACTED] in the margin."
+    donor_text = "The document contained [blackened box] in the margin."
+    seed_doc(conn, 1, base_text)
+    seed_doc(conn, 2, donor_text)
+    conn.commit()
+    g = create_match_group(conn)
+    add_group_member(conn, g, 1, 1.0)
+    add_group_member(conn, g, 2, 0.9)
+    conn.commit()
+
+    result = merge_group(conn, g, REDACTION_MARKERS, anchor_length=50)
+    assert result["recovered_count"] == 0
+
+
 def test_run_merger_stores_results_and_marks_group_merged(conn):
     seed_doc(conn, 1, BASE_TEXT)
     seed_doc(conn, 2, DONOR_TEXT_A)

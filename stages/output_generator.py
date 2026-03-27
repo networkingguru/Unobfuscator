@@ -2,6 +2,7 @@
 
 Only generates a file when at least one redaction was recovered.
 GREEN highlight = recovered text in the destination (redacted) document.
+ORANGE highlight = questionable recovery (same text recovered 3+ times).
 YELLOW highlight = source text in the donor (unredacted) document.
 
 Structure:
@@ -31,6 +32,7 @@ from core.db import (
 # Highlight colours as RGB tuples for PyMuPDF
 GREEN = (0.0, 1.0, 0.0)    # recovered text in destination document
 YELLOW = (1.0, 1.0, 0.0)   # source text in donor document
+ORANGE = (1.0, 0.65, 0.0)  # questionable recovery in destination document
 
 
 def build_output_path(output_dir: str, source: str, batch: str, doc_id: int) -> str:
@@ -223,12 +225,21 @@ def generate_output_pdf(
         dest_start_page = len(pdf)
         dest_pages = _insert_text_multipage(pdf, merged_text, fontsize=10)
 
-        # Apply GREEN highlights on recovered text in destination pages
-        recovered_texts = [seg.get("text", "").strip() for seg in recovered_segments]
-        dest_searches = _build_search_strings(recovered_texts)
+        # Apply highlights on recovered text in destination pages:
+        # GREEN for high-confidence, ORANGE for questionable
+        high_texts = [seg.get("text", "").strip() for seg in recovered_segments
+                      if seg.get("confidence") != "questionable"]
+        questionable_texts = [seg.get("text", "").strip() for seg in recovered_segments
+                              if seg.get("confidence") == "questionable"]
+        high_searches = _build_search_strings(high_texts)
+        questionable_searches = _build_search_strings(questionable_texts)
         for i in range(dest_start_page, dest_start_page + dest_pages):
-            _apply_highlights(pdf[i], recovered_texts, GREEN,
-                              _search_strings=dest_searches)
+            if high_texts:
+                _apply_highlights(pdf[i], high_texts, GREEN,
+                                  _search_strings=high_searches)
+            if questionable_texts:
+                _apply_highlights(pdf[i], questionable_texts, ORANGE,
+                                  _search_strings=questionable_searches)
 
         # ── SECTION 2: SOURCE DOCUMENT(s) (full donor text, YELLOW highlights) ──
         # Group recovered segments by donor doc
@@ -259,10 +270,12 @@ def generate_output_pdf(
                                   _search_strings=donor_searches)
 
         # ── SECTION 3: METADATA ──
+        questionable_count = len(questionable_texts)
         _write_metadata_page(
             pdf, base_doc, donor_docs,
             recovered_count, soft_recovered_count,
             provenance_label=provenance_label,
+            questionable_count=questionable_count,
         )
 
         pdf.save(output_path)
@@ -280,6 +293,7 @@ def _write_metadata_page(
     recovered_count: int,
     soft_recovered_count: int,
     provenance_label: str = None,
+    questionable_count: int = 0,
 ) -> None:
     """Write the final metadata page with links and stats."""
     page = pdf.new_page()
@@ -307,6 +321,8 @@ def _write_metadata_page(
     write("=" * 70)
     write(f"Unobfuscator v1.0 — {today}")
     write(f"Redactions recovered: {recovered_count}    |    Method: {method}")
+    if questionable_count:
+        write(f"Questionable recoveries: {questionable_count} (highlighted in ORANGE)")
     write("=" * 70)
     write("")
 
