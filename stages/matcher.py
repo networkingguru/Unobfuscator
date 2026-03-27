@@ -406,6 +406,8 @@ def find_longest_common_substring(
     def strip_markers(t):
         for m in redaction_markers:
             t = t.replace(m, " ")
+        # Collapse Unicode full-block redaction runs (█, U+2588) from OCR output
+        t = re.sub(r"\u2588+", " ", t)
         return re.sub(r"\s+", " ", t).strip()
 
     a = strip_markers(text_a)
