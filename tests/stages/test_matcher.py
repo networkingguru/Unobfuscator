@@ -339,6 +339,22 @@ def test_rolling_hash_consistent_with_dp():
     assert abs(len(dp_result) - len(rh_result)) <= max(len(dp_result), 1) * 0.1
 
 
+def test_rolling_hash_handles_unicode_redaction_blocks():
+    """Documents with long █ (U+2588) redaction blocks must not cause seed explosion."""
+    import time
+    # Simulate OCR-redacted docs: email header + massive █ block + small unique tail
+    redacted_block = "█" * 20000
+    a = "From: sender@example.com\nTo: recipient@example.com\n" + redacted_block + "\nUnique passage alpha about Teterboro departure logs."
+    b = "From: sender@example.com\nTo: recipient@example.com\n" + redacted_block + "\nUnique passage bravo about Teterboro departure logs."
+    t0 = time.monotonic()
+    common = find_longest_common_substring(a, b, REDACTION_MARKERS)
+    elapsed = time.monotonic() - t0
+    # Must complete fast — the █ block should be collapsed, not hashed
+    assert elapsed < 2.0, f"Took {elapsed:.1f}s on █-heavy docs"
+    # Should still find the real shared text (email headers + "Teterboro departure logs")
+    assert "sender@example.com" in common or "Teterboro" in common
+
+
 def test_phase3_groups_confirmed_candidate_pair(conn):
     # Uses >500 chars of shared text (secondary confirmation signal).
     seed_doc(conn, 1, LONG_OVERLAP_TEXT_A)
