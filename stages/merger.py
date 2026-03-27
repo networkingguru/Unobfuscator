@@ -190,8 +190,8 @@ def _is_real_recovery(text: str, redaction_markers: list[str]) -> bool:
     if block_count > 0 and block_count / len(stripped) > 0.10:
         return False
     clean = re.sub(r'[█■]+', '', stripped).strip()
-    # Also strip punctuation wrappers: <>, (), "", etc.
-    clean_alpha = re.sub(r'[<>()"\'\s,;:+\-]+', '', clean).strip()
+    # Also strip punctuation wrappers: <>, (), [], "", etc.
+    clean_alpha = re.sub(r'[<>()\[\]"\'\s,;:+\-]+', '', clean).strip()
     if len(clean_alpha) < 4:
         return False
 
@@ -219,7 +219,22 @@ def _is_real_recovery(text: str, redaction_markers: list[str]) -> bool:
     # Table column headers / generic labels that aren't real content
     if lower in {"item", "description", "field", "value", "date", "details",
                  "name", "notes", "type", "status", "number", "e-ticket number",
-                 "category", "[blank]", "blank", "(usanys)"}:
+                 "category", "[blank]", "[blank]\n-", "blank", "(usanys)"}:
+        return False
+
+    # Redaction descriptions — not actual recovered content
+    redaction_descriptions = {
+        "blacked out", "blackened out", "blackened box",
+        "blanked out", "blocked out", "covered", "obscured",
+        "whited out", "crossed out",
+    }
+    # Strip brackets/angle brackets for matching
+    bracket_stripped = re.sub(r'[\[\]<>]', '', lower).strip()
+    if bracket_stripped in redaction_descriptions:
+        return False
+
+    # X-only runs (XXXXXXXX, etc.)
+    if re.match(r'^[Xx]+$', stripped):
         return False
 
     # Very short text that's just a year or generic word
@@ -294,11 +309,20 @@ def merge_group(
                 recovered_segments.append({
                     "text": recovered,
                     "source_doc_id": donor_id,
-                    "stage": "merge"
+                    "stage": "merge",
+                    "confidence": "high",
+                    "anchor_alpha_len": len(alpha_content),
                 })
                 if donor_id not in source_doc_ids:
                     source_doc_ids.append(donor_id)
                 break  # Found recovery for this gap — move to next
+
+    # Flag questionable recoveries: same text recovered 3+ times is suspicious
+    from collections import Counter
+    text_counts = Counter(seg["text"] for seg in recovered_segments)
+    for seg in recovered_segments:
+        if text_counts[seg["text"]] >= 3:
+            seg["confidence"] = "questionable"
 
     return {
         "merged_text": merged,
