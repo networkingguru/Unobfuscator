@@ -99,6 +99,27 @@ def test_find_text_between_anchors_returns_none_when_anchors_missing():
     assert result is None
 
 
+def test_find_between_exact_rejects_ambiguous_match():
+    """When anchor pair matches multiple positions in donor, return None."""
+    donor = "Hello dear friend World. Some filler. Hello dear enemy World."
+    result = find_text_between_anchors(donor, "Hello", "World")
+    assert result is None
+
+
+def test_find_between_exact_accepts_unique_match():
+    """When anchor pair matches exactly once, return the text between them."""
+    donor = "Hello dear friend World. Some filler text here."
+    result = find_text_between_anchors(donor, "Hello", "World")
+    assert result == "dear friend"
+
+
+def test_find_between_exact_rejects_ambiguous_right_anchor_when_left_empty():
+    """When left_anchor is empty and right_anchor matches multiple times, return None."""
+    donor = "First section MARKER middle section MARKER end"
+    result = find_text_between_anchors(donor, "", "MARKER")
+    assert result is None
+
+
 # --- Full merge ---
 
 def test_merge_group_fills_redactions_from_donors(conn):

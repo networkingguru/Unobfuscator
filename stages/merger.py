@@ -117,10 +117,16 @@ def find_text_between_anchors(
 def _find_between_exact(
     text: str, left_anchor: str, right_anchor: str
 ) -> Optional[str]:
-    """Exact string search for text between two anchors."""
+    """Exact string search for text between two anchors.
+
+    Returns None if the anchor pair matches multiple positions (ambiguous).
+    """
     if not left_anchor:
         right_pos = text.find(right_anchor)
         if right_pos == -1:
+            return None
+        # Uniqueness: check right_anchor doesn't appear again
+        if text.find(right_anchor, right_pos + 1) != -1:
             return None
         return text[:right_pos].strip()
 
@@ -132,6 +138,13 @@ def _find_between_exact(
     right_pos = text.find(right_anchor, search_from)
     if right_pos == -1:
         return None
+
+    # Uniqueness: check the anchor pair doesn't match a second position
+    second_left = text.find(left_anchor, left_pos + 1)
+    if second_left != -1:
+        second_right = text.find(right_anchor, second_left + len(left_anchor))
+        if second_right != -1:
+            return None  # ambiguous
 
     return text[search_from:right_pos].strip()
 
