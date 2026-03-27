@@ -9,7 +9,7 @@ import signal
 import subprocess
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Optional
@@ -20,18 +20,19 @@ from rich.table import Table
 from core.db import (
     init_db, get_connection, get_known_batch_ids, insert_release_batch,
     get_pending_pdf_documents, get_documents_by_ids, reset_group_merged,
-    set_config, get_config, get_unindexed_batch_ids, mark_batch_fully_indexed
+    set_config, get_config, get_unindexed_batch_ids, mark_batch_fully_indexed,
+    mark_pdf_processed, append_soft_redaction_text, upsert_fingerprint,
+    get_doc_group
 )
 from core.config import load_config, get as cfg_get
 from core.api import fetch_release_batches, fetch_person_document_ids
 from core.queue import enqueue, get_queue_stats, dequeue, mark_done
-from stages.indexer import run_indexer_batch
+from stages.indexer import run_indexer_batch, clean_text, shingle, build_fingerprint
 from stages.matcher import (
     run_phase0_email_fastpath, run_phase2_lsh_candidates,
     run_phase3_verify_and_group
 )
 from stages.merger import run_merger
-from stages.pdf_processor import process_pdf_for_document
 from stages.output_generator import run_output_generator
 from stages.summary_generator import generate_summary_pdf
 from stages.text_recovery import run_text_recovery
@@ -73,66 +74,137 @@ def _remove_pid() -> None:
         pass
 
 
-def _process_pdf_worker(doc_id, redaction_markers, db_path):
-    """Worker function for parallel PDF processing. Each thread gets its own connection."""
-    thread_conn = get_connection(db_path)
-    try:
-        process_pdf_for_document(thread_conn, doc_id=doc_id,
-                                  redaction_markers=redaction_markers)
-        thread_conn.commit()
-    except Exception as e:
-        logger.error("PDF worker error for doc %s: %s", doc_id, e)
+def _process_pdf_worker(doc_id, pdf_url, release_batch, original_filename,
+                        redaction_markers, pdf_cache_dir=None):
+    """Worker function for parallel PDF processing (runs in a subprocess).
+
+    Downloads and parses the PDF, returns results for the main process to
+    write to the database.  No DB access happens in the worker — this avoids
+    both SQLite lock contention and PyMuPDF thread-safety crashes.
+    """
+    from stages.pdf_processor import extract_soft_redactions, _download_pdf
+    from pathlib import Path
+
+    if pdf_cache_dir is None:
+        from core.config import PDF_CACHE_DIR
+        pdf_cache_dir = PDF_CACHE_DIR
+    else:
+        pdf_cache_dir = Path(pdf_cache_dir)
+
+    # --- download / load from cache ---
+    pdf_bytes = None
+    if release_batch and original_filename:
+        local_path = pdf_cache_dir / release_batch / original_filename
+        if local_path.is_file():
+            pdf_bytes = local_path.read_bytes()
+
+    if pdf_bytes is None:
+        if not pdf_url:
+            return {"doc_id": doc_id, "ok": True, "soft_redactions": []}
         try:
-            thread_conn.rollback()
-        except Exception:
-            pass
-        # Retry once after backoff for transient lock contention.
-        if "database is locked" in str(e):
-            time.sleep(2)
-            try:
-                process_pdf_for_document(thread_conn, doc_id=doc_id,
-                                          redaction_markers=redaction_markers)
-                thread_conn.commit()
-            except Exception as e2:
-                logger.warning("PDF worker retry failed for doc %s: %s", doc_id, e2)
-                try:
-                    thread_conn.rollback()
-                except Exception:
-                    pass
-    finally:
-        thread_conn.close()
+            response = _download_pdf(pdf_url)
+            pdf_bytes = response.content
+        except Exception as e:
+            return {"doc_id": doc_id, "ok": False, "error": str(e)}
+
+    # --- extract soft redactions (PyMuPDF, process-isolated) ---
+    soft_redactions = extract_soft_redactions(pdf_bytes)
+
+    return {
+        "doc_id": doc_id,
+        "ok": True,
+        "soft_redactions": soft_redactions,
+    }
 
 
-def _run_pdf_parallel(pdf_docs, redaction_markers, db_path, num_workers):
-    """Process a batch of pending PDFs using a thread pool."""
+def _run_pdf_parallel(pdf_docs, redaction_markers, db_path, num_workers,
+                      pdf_cache_dir=None):
+    """Process a batch of pending PDFs using a process pool.
+
+    Workers handle download + PyMuPDF parsing in separate processes (avoiding
+    both thread-safety crashes and SQLite lock contention).  The main process
+    applies all DB writes sequentially.
+    """
     global _shutdown_requested
     total = len(pdf_docs)
     done = 0
     logger.info("Stage 4: processing batch of %d PDFs with %d workers", total, num_workers)
     _set_activity(f"Stage 4 PDF: batch of {total}")
 
-    with ThreadPoolExecutor(max_workers=num_workers) as pool:
-        futures = {}
-        for pdf_doc in pdf_docs:
-            if _shutdown_requested:
-                break
-            fut = pool.submit(_process_pdf_worker, pdf_doc["id"],
-                              redaction_markers, db_path)
-            futures[fut] = pdf_doc["id"]
+    conn = get_connection(db_path)
+    try:
+        with ProcessPoolExecutor(max_workers=num_workers) as pool:
+            futures = {}
+            for pdf_doc in pdf_docs:
+                if _shutdown_requested:
+                    break
+                fut = pool.submit(
+                    _process_pdf_worker,
+                    pdf_doc["id"],
+                    pdf_doc.get("pdf_url", ""),
+                    pdf_doc.get("release_batch", ""),
+                    pdf_doc.get("original_filename", ""),
+                    redaction_markers,
+                    str(pdf_cache_dir) if pdf_cache_dir else None,
+                )
+                futures[fut] = pdf_doc["id"]
 
-        for fut in as_completed(futures):
-            done += 1
-            if done % 100 == 0 or done == total:
-                _set_activity(f"Stage 4 PDF: {done}/{total}")
-            if _shutdown_requested:
-                # Cancel remaining futures on shutdown
-                for f in futures:
-                    f.cancel()
-                break
-            exc = fut.exception()
-            if exc:
-                logger.error("PDF future error for doc %s: %s",
-                             futures[fut], exc)
+            for fut in as_completed(futures):
+                done += 1
+                if done % 100 == 0 or done == total:
+                    _set_activity(f"Stage 4 PDF: {done}/{total}")
+                if _shutdown_requested:
+                    for f in futures:
+                        f.cancel()
+                    break
+
+                try:
+                    result = fut.result()
+                except Exception as exc:
+                    logger.error("PDF worker crashed for doc %s: %s",
+                                 futures[fut], exc)
+                    mark_pdf_processed(conn, futures[fut])
+                    continue
+
+                doc_id = result["doc_id"]
+                if not result["ok"]:
+                    logger.warning("PDF download failed for doc %s: %s",
+                                   doc_id, result.get("error"))
+                    mark_pdf_processed(conn, doc_id)
+                    continue
+
+                # Apply DB writes in main process — no contention.
+                if result["soft_redactions"]:
+                    recovered_text = "\n".join(
+                        r["text"] for r in result["soft_redactions"]
+                    )
+                    append_soft_redaction_text(conn, doc_id, recovered_text)
+
+                    updated_text = conn.execute(
+                        "SELECT extracted_text FROM documents WHERE id = ?",
+                        (doc_id,),
+                    ).fetchone()
+                    updated_text = (updated_text[0] or "") if updated_text else ""
+                    cleaned = clean_text(updated_text, redaction_markers)
+                    shingles = shingle(cleaned)
+                    if shingles:
+                        sig = build_fingerprint(cleaned)
+                        upsert_fingerprint(conn, doc_id, sig, len(shingles))
+
+                    group_id = get_doc_group(conn, doc_id)
+                    if group_id is not None:
+                        enqueue(conn, stage="merge",
+                                payload={"group_id": group_id}, priority=50)
+
+                mark_pdf_processed(conn, doc_id)
+
+                # Commit every 50 docs to avoid holding large transactions.
+                if done % 50 == 0:
+                    conn.commit()
+
+            conn.commit()
+    finally:
+        conn.close()
 
 
 def _run_one_cycle(conn, cfg: dict) -> None:

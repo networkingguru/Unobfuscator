@@ -228,24 +228,39 @@ def db_path(tmp_path):
     return path
 
 
-@patch("stages.pdf_processor._download_pdf")
-def test_run_pdf_parallel_processes_all_docs(mock_dl, db_path):
+def _setup_pdf_cache(tmp_path, batch, filenames, pdf_bytes):
+    """Write PDFs to a local cache dir so process workers find them without network."""
+    cache_dir = tmp_path / "pdf_cache" / batch
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    for fn in filenames:
+        (cache_dir / fn).write_bytes(pdf_bytes)
+    return tmp_path / "pdf_cache"
+
+
+def test_run_pdf_parallel_processes_all_docs(db_path, tmp_path):
     """All docs should be marked pdf_processed=1 after parallel run."""
     from unobfuscator import _run_pdf_parallel
 
+    batch = "VOL00001"
     conn = get_connection(db_path)
+    filenames = []
     for i in range(20):
-        seed_doc(conn, f"par-{i}", filename=f"par{i}.pdf")
+        fn = f"par{i}.pdf"
+        filenames.append(fn)
+        seed_doc(conn, f"par-{i}", filename=fn, batch=batch)
         conn.execute(
             "UPDATE documents SET pdf_url = ? WHERE id = ?",
             (f"http://example.com/{i}.pdf", f"par-{i}"),
         )
     conn.commit()
 
-    mock_dl.return_value.content = make_clean_pdf()
-    pdf_docs = [{"id": f"par-{i}"} for i in range(20)]
+    cache_dir = _setup_pdf_cache(tmp_path, batch, filenames, make_clean_pdf())
+    pdf_docs = [{"id": f"par-{i}", "pdf_url": f"http://example.com/{i}.pdf",
+                 "release_batch": batch, "original_filename": f"par{i}.pdf"}
+                for i in range(20)]
 
-    _run_pdf_parallel(pdf_docs, [], db_path, num_workers=4)
+    _run_pdf_parallel(pdf_docs, [], db_path, num_workers=4,
+                      pdf_cache_dir=cache_dir)
 
     processed = conn.execute(
         "SELECT COUNT(*) FROM documents WHERE pdf_processed = 1"
@@ -254,70 +269,73 @@ def test_run_pdf_parallel_processes_all_docs(mock_dl, db_path):
     assert processed == 20
 
 
-@patch("stages.pdf_processor._download_pdf")
-def test_run_pdf_parallel_each_worker_uses_own_connection(mock_dl, db_path):
-    """Each worker thread must open its own SQLite connection."""
+def test_run_pdf_parallel_uses_separate_processes(db_path, tmp_path):
+    """Workers run in separate processes (not threads) for PyMuPDF safety."""
     from unobfuscator import _run_pdf_parallel
 
+    batch = "VOL00001"
     conn = get_connection(db_path)
-    for i in range(6):
-        seed_doc(conn, f"thr-{i}", filename=f"thr{i}.pdf")
+    filenames = []
+    for i in range(4):
+        fn = f"proc{i}.pdf"
+        filenames.append(fn)
+        seed_doc(conn, f"proc-{i}", filename=fn, batch=batch)
         conn.execute(
             "UPDATE documents SET pdf_url = ? WHERE id = ?",
-            (f"http://example.com/thr{i}.pdf", f"thr-{i}"),
+            (f"http://example.com/proc{i}.pdf", f"proc-{i}"),
         )
     conn.commit()
     conn.close()
 
-    thread_ids = set()
-    original_get_conn = get_connection
+    cache_dir = _setup_pdf_cache(tmp_path, batch, filenames, make_clean_pdf())
+    pdf_docs = [{"id": f"proc-{i}", "pdf_url": f"http://example.com/proc{i}.pdf",
+                 "release_batch": batch, "original_filename": f"proc{i}.pdf"}
+                for i in range(4)]
 
-    def tracking_get_conn(path):
-        thread_ids.add(threading.current_thread().ident)
-        return original_get_conn(path)
-
-    mock_dl.return_value.content = make_clean_pdf()
-    pdf_docs = [{"id": f"thr-{i}"} for i in range(6)]
-
-    with patch("unobfuscator.get_connection", side_effect=tracking_get_conn):
-        _run_pdf_parallel(pdf_docs, [], db_path, num_workers=3)
-
-    # Multiple threads should have been used
-    assert len(thread_ids) > 1
+    # Verify ProcessPoolExecutor is used (not ThreadPoolExecutor)
+    from concurrent.futures import ProcessPoolExecutor
+    with patch("unobfuscator.ProcessPoolExecutor", wraps=ProcessPoolExecutor) as mock_ppe:
+        _run_pdf_parallel(pdf_docs, [], db_path, num_workers=2,
+                          pdf_cache_dir=cache_dir)
+    mock_ppe.assert_called_once_with(max_workers=2)
 
 
-@patch("stages.pdf_processor._download_pdf")
-def test_run_pdf_parallel_handles_worker_errors(mock_dl, db_path):
+def test_run_pdf_parallel_handles_worker_errors(db_path, tmp_path):
     """A failing worker should not crash the pool or block other workers."""
     from unobfuscator import _run_pdf_parallel
 
+    batch = "VOL00001"
     conn = get_connection(db_path)
+    filenames = []
     for i in range(5):
-        seed_doc(conn, f"err-{i}", filename=f"err{i}.pdf")
+        fn = f"err{i}.pdf"
+        filenames.append(fn)
+        seed_doc(conn, f"err-{i}", filename=fn, batch=batch)
         conn.execute(
             "UPDATE documents SET pdf_url = ? WHERE id = ?",
             (f"http://example.com/err{i}.pdf", f"err-{i}"),
         )
     conn.commit()
 
-    call_count = 0
+    # Write valid PDFs for all except err2 (write corrupt bytes)
+    cache_dir = tmp_path / "pdf_cache" / batch
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    for i in range(5):
+        fn = f"err{i}.pdf"
+        if i == 2:
+            # Don't write a cache file — and the URL won't work either,
+            # so the worker returns ok=False
+            pass
+        else:
+            (cache_dir / fn).write_bytes(make_clean_pdf())
 
-    def flaky_download(url):
-        nonlocal call_count
-        call_count += 1
-        if "err2" in url:
-            raise ConnectionError("Simulated network failure")
-        resp = MagicMock()
-        resp.content = make_clean_pdf()
-        return resp
+    pdf_docs = [{"id": f"err-{i}", "pdf_url": f"http://invalid.test/err{i}.pdf",
+                 "release_batch": batch, "original_filename": f"err{i}.pdf"}
+                for i in range(5)]
 
-    mock_dl.side_effect = flaky_download
-    pdf_docs = [{"id": f"err-{i}"} for i in range(5)]
+    _run_pdf_parallel(pdf_docs, [], db_path, num_workers=3,
+                      pdf_cache_dir=tmp_path / "pdf_cache")
 
-    _run_pdf_parallel(pdf_docs, [], db_path, num_workers=3)
-
-    # err-2 failed download => marked processed (broken URL handling)
-    # Other 4 should succeed
     processed = conn.execute(
         "SELECT COUNT(*) FROM documents WHERE pdf_processed = 1"
     ).fetchone()[0]
@@ -325,27 +343,35 @@ def test_run_pdf_parallel_handles_worker_errors(mock_dl, db_path):
     assert processed == 5  # all marked processed (including failed one)
 
 
-@patch("stages.pdf_processor._download_pdf")
-def test_run_pdf_parallel_concurrent_writes_no_corruption(mock_dl, db_path):
-    """Concurrent DB writes from multiple workers should not corrupt data."""
+def test_run_pdf_parallel_concurrent_writes_no_corruption(db_path, tmp_path):
+    """Soft redaction text recovered in workers is correctly written to DB by main process."""
     from unobfuscator import _run_pdf_parallel
 
+    batch = "VOL00001"
     conn = get_connection(db_path)
-    # Create docs with soft redactions so workers do DB writes (append text + fingerprint)
+    filenames = []
     for i in range(10):
-        seed_doc(conn, f"wr-{i}", filename=f"wr{i}.pdf")
+        fn = f"wr{i}.pdf"
+        filenames.append(fn)
+        seed_doc(conn, f"wr-{i}", filename=fn, batch=batch)
         conn.execute(
             "UPDATE documents SET pdf_url = ? WHERE id = ?",
             (f"http://example.com/wr{i}.pdf", f"wr-{i}"),
         )
     conn.commit()
 
-    mock_dl.return_value.content = make_pdf_with_soft_redaction(
-        "Hidden text that should be recovered from the redaction overlay"
+    cache_dir = _setup_pdf_cache(
+        tmp_path, batch, filenames,
+        make_pdf_with_soft_redaction(
+            "Hidden text that should be recovered from the redaction overlay"
+        ),
     )
-    pdf_docs = [{"id": f"wr-{i}"} for i in range(10)]
+    pdf_docs = [{"id": f"wr-{i}", "pdf_url": f"http://example.com/wr{i}.pdf",
+                 "release_batch": batch, "original_filename": f"wr{i}.pdf"}
+                for i in range(10)]
 
-    _run_pdf_parallel(pdf_docs, ["[REDACTED]"], db_path, num_workers=4)
+    _run_pdf_parallel(pdf_docs, ["[REDACTED]"], db_path, num_workers=4,
+                      pdf_cache_dir=cache_dir)
 
     # All should have soft redaction text appended
     for i in range(10):

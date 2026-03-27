@@ -90,7 +90,7 @@ def get_connection(db_path: str) -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
-    conn.execute("PRAGMA busy_timeout=5000")
+    conn.execute("PRAGMA busy_timeout=30000")
     return conn
 
 
@@ -278,7 +278,8 @@ def get_pending_output_groups(conn) -> list[dict]:
 
 def get_pending_pdf_documents(conn, limit: int) -> list[dict]:
     rows = conn.execute(
-        "SELECT id FROM documents WHERE pdf_processed = 0 AND pdf_url IS NOT NULL LIMIT ?",
+        "SELECT id, pdf_url, release_batch, original_filename "
+        "FROM documents WHERE pdf_processed = 0 AND pdf_url IS NOT NULL LIMIT ?",
         (limit,)
     ).fetchall()
     return [dict(row) for row in rows]
