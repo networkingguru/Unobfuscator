@@ -118,7 +118,7 @@ def _process_pdf_worker(doc_id, pdf_url, release_batch, original_filename,
 
 
 def _run_pdf_parallel(pdf_docs, redaction_markers, db_path, num_workers,
-                      pdf_cache_dir=None):
+                      pdf_cache_dir=None, conn=None):
     """Process a batch of pending PDFs using a process pool.
 
     Workers handle download + PyMuPDF parsing in separate processes (avoiding
@@ -131,7 +131,9 @@ def _run_pdf_parallel(pdf_docs, redaction_markers, db_path, num_workers,
     logger.info("Stage 4: processing batch of %d PDFs with %d workers", total, num_workers)
     _set_activity(f"Stage 4 PDF: batch of {total}")
 
-    conn = get_connection(db_path)
+    own_conn = conn is None
+    if own_conn:
+        conn = get_connection(db_path)
     try:
         with ProcessPoolExecutor(max_workers=num_workers) as pool:
             futures = {}
@@ -204,7 +206,8 @@ def _run_pdf_parallel(pdf_docs, redaction_markers, db_path, num_workers,
 
             conn.commit()
     finally:
-        conn.close()
+        if own_conn:
+            conn.close()
 
 
 def _run_one_cycle(conn, cfg: dict) -> None:
@@ -307,7 +310,7 @@ def _run_one_cycle(conn, cfg: dict) -> None:
                 break
             # Commit before spawning workers so they don't block on our write lock.
             conn.commit()
-            _run_pdf_parallel(pdf_docs, markers, db_path, num_workers)
+            _run_pdf_parallel(pdf_docs, markers, db_path, num_workers, conn=conn)
 
     # Phase 5.5: Text recovery (Jmail backfill + OCR)
     if not _shutdown_requested:
