@@ -75,7 +75,7 @@ def _remove_pid() -> None:
 
 
 def _process_pdf_worker(doc_id, pdf_url, release_batch, original_filename,
-                        redaction_markers, pdf_cache_dir=None):
+                        pdf_cache_dir=None):
     """Worker function for parallel PDF processing (runs in a subprocess).
 
     Downloads and parses the PDF, returns results for the main process to
@@ -106,6 +106,9 @@ def _process_pdf_worker(doc_id, pdf_url, release_batch, original_filename,
             pdf_bytes = response.content
         except Exception as e:
             return {"doc_id": doc_id, "ok": False, "error": str(e)}
+
+    if not pdf_bytes:
+        return {"doc_id": doc_id, "ok": False, "error": "empty PDF response"}
 
     # --- extract soft redactions (PyMuPDF, process-isolated) ---
     soft_redactions = extract_soft_redactions(pdf_bytes)
@@ -146,7 +149,6 @@ def _run_pdf_parallel(pdf_docs, redaction_markers, db_path, num_workers,
                     pdf_doc.get("pdf_url", ""),
                     pdf_doc.get("release_batch", ""),
                     pdf_doc.get("original_filename", ""),
-                    redaction_markers,
                     str(pdf_cache_dir) if pdf_cache_dir else None,
                 )
                 futures[fut] = pdf_doc["id"]
@@ -208,6 +210,11 @@ def _run_pdf_parallel(pdf_docs, redaction_markers, db_path, num_workers,
     finally:
         if own_conn:
             conn.close()
+        else:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
 
 
 def _run_one_cycle(conn, cfg: dict) -> None:

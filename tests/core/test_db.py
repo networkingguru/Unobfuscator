@@ -230,3 +230,11 @@ def test_migration_sets_text_source_for_existing_docs(conn):
     conn.commit()
     row = conn.execute("SELECT text_source FROM documents WHERE id = ?", (SAMPLE_DOC["id"],)).fetchone()
     assert row["text_source"] == "jmail"
+
+
+def test_busy_timeout_is_30000ms(db_path):
+    """Verify get_connection sets PRAGMA busy_timeout to 30000ms."""
+    conn = get_connection(db_path)
+    row = conn.execute("PRAGMA busy_timeout").fetchone()
+    assert row[0] == 30000
+    conn.close()
