@@ -154,6 +154,77 @@ def test_merge_group_returns_zero_recovered_when_no_donors_help(conn):
     assert "[REDACTED]" in result["merged_text"]
 
 
+def test_merge_group_skips_redactions_with_degenerate_anchors(conn):
+    """Consecutive redactions with only quote markers between them should not be recovered."""
+    base_text = (
+        "From: sender@example.com\n"
+        ">>>>>> Employment Counselor\n"
+        ">>>>>> [REDACTED]\n"
+        ">>>>>> [REDACTED]\n"
+        ">>>>>> [REDACTED]\n"
+        ">>>>>> [REDACTED]\n"
+        ">>>>>> [REDACTED]\n"
+        ">>>>>>>\n"
+        ">>>>>>>> On Jan 27, 2016, Michelle wrote:"
+    )
+    donor_text = (
+        "From: sender@example.com\n"
+        ">>>>>> Employment Counselor\n"
+        ">>>>>> Regal Domestics, Inc.\n"
+        ">>>>>> 123 Main Street\n"
+        ">>>>>> New York, NY 10001\n"
+        ">>>>>> (555) 123-4567\n"
+        ">>>>>> michelle@regal.com\n"
+        ">>>>>>>\n"
+        ">>>>>>>> On Jan 27, 2016, Michelle wrote:"
+    )
+    seed_doc(conn, 1, base_text)
+    seed_doc(conn, 2, donor_text)
+    conn.commit()
+    g = create_match_group(conn)
+    add_group_member(conn, g, 1, 1.0)
+    add_group_member(conn, g, 2, 0.9)
+    conn.commit()
+
+    result = merge_group(conn, g, REDACTION_MARKERS, anchor_length=50)
+    assert result["recovered_count"] <= 1
+
+
+def test_anchor_quality_floor_boundary(conn):
+    """Anchors with exactly 7 combined alphanumeric chars are skipped; 8 pass."""
+    # Both anchors truncated to short content by adjacent redaction markers
+    # Left anchor after truncation: "Abcdefg" (7 alpha), right anchor: "" (truncated by [REDACTED])
+    base_7 = "[REDACTED] Abcdefg [REDACTED] [REDACTED]"
+    # Left anchor after truncation: "Abcdefgh" (8 alpha), right anchor: "" (truncated by [REDACTED])
+    base_8 = "[REDACTED] Abcdefgh [REDACTED] [REDACTED]"
+    donor_7 = "[REDACTED] Abcdefg RECOVERED [REDACTED]"
+    donor_8 = "[REDACTED] Abcdefgh RECOVERED"
+
+    seed_doc(conn, 1, base_7)
+    seed_doc(conn, 2, donor_7)
+    conn.commit()
+    g = create_match_group(conn)
+    add_group_member(conn, g, 1, 1.0)
+    add_group_member(conn, g, 2, 0.9)
+    conn.commit()
+    result_7 = merge_group(conn, g, REDACTION_MARKERS, anchor_length=50)
+    # base_7 has 3 redactions. The middle one has left="Abcdefg" (7 alpha) and right="" (truncated).
+    # Combined = 7 alpha chars < 8, so should be skipped.
+    assert result_7["recovered_count"] == 0, "7 alphanumeric chars should be below quality floor"
+
+    seed_doc(conn, 3, base_8)
+    seed_doc(conn, 4, donor_8)
+    conn.commit()
+    g2 = create_match_group(conn)
+    add_group_member(conn, g2, 3, 1.0)
+    add_group_member(conn, g2, 4, 0.9)
+    conn.commit()
+    result_8 = merge_group(conn, g2, REDACTION_MARKERS, anchor_length=50)
+    # base_8 middle redaction has left="Abcdefgh" (8 alpha) and right="" (truncated).
+    # Combined = 8 alpha chars >= 8, so should attempt recovery.
+    assert result_8["recovered_count"] >= 1, "8 alphanumeric chars should pass quality floor"
+
+
 def test_run_merger_stores_results_and_marks_group_merged(conn):
     seed_doc(conn, 1, BASE_TEXT)
     seed_doc(conn, 2, DONOR_TEXT_A)
