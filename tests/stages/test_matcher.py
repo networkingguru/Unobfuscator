@@ -355,6 +355,33 @@ def test_rolling_hash_handles_unicode_redaction_blocks():
     assert "sender@example.com" in common or "Teterboro" in common
 
 
+def test_rolling_hash_performance_large_docs_with_boilerplate():
+    """Large docs (100K+) with repetitive boilerplate must complete in bounded time."""
+    import time
+    # Simulate legal PDF: repeated boilerplate header/footer per page + unique content
+    boilerplate = "UNITED STATES DISTRICT COURT SOUTHERN DISTRICT OF NEW YORK " * 20  # ~1.2K per page
+    pages_a = []
+    pages_b = []
+    for i in range(80):  # 80 pages ≈ 100K chars
+        pages_a.append(boilerplate + f"Page {i} unique content alpha section {i * 7}. ")
+        pages_b.append(boilerplate + f"Page {i} unique content bravo section {i * 13}. ")
+    # 20 pages of genuinely shared deposition testimony
+    shared_testimony = "The witness testified that the meeting occurred on March tenth at the residence. " * 15  # ~1.3K per page
+    for i in range(20):
+        shared_page = shared_testimony + f"Exhibit {i} referenced. "
+        pages_a.append(shared_page)
+        pages_b.append(shared_page)
+    a = "\n".join(pages_a)
+    b = "\n".join(pages_b)
+    assert len(a) > 100000, f"Test doc too short: {len(a)}"
+    t0 = time.monotonic()
+    common = find_longest_common_substring(a, b, REDACTION_MARKERS)
+    elapsed = time.monotonic() - t0
+    assert elapsed < 5.0, f"Took {elapsed:.1f}s on 100K+ boilerplate docs"
+    # Should find the shared testimony
+    assert "witness testified" in common
+
+
 def test_phase3_groups_confirmed_candidate_pair(conn):
     # Uses >500 chars of shared text (secondary confirmation signal).
     seed_doc(conn, 1, LONG_OVERLAP_TEXT_A)

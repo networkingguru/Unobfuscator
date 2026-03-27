@@ -39,6 +39,7 @@ _SECONDARY_OVERLAP_THRESHOLD = 500
 _RH_BASE1, _RH_MOD1 = 131, (1 << 61) - 1   # Mersenne prime
 _RH_BASE2, _RH_MOD2 = 137, (1 << 59) - 55  # large prime, different size
 _MAX_BUCKET = 256  # discard high-frequency seeds to bound worst case
+_MAX_SEEDS = 500_000  # cap total seeds to bound sort + extension work
 _LCS_TIMEOUT = 30  # seconds — safety circuit breaker
 
 _DEFAULT_RAM_BYTES = 16 * 1024 ** 3  # 16 GB fallback when detection fails
@@ -416,11 +417,18 @@ def find_longest_common_substring(
     if not a or not b:
         return ""
 
-    # Collect all common substrings of length >= min_seg using DP
-    min_seg = 10
+    # Collect all common substrings of length >= min_seg.
+    # Scale min_seg with document size to bound rolling-hash seed counts.
+    # Cap at 50 — well below the 200-char Phase 3 rejection threshold.
+    shorter = min(len(a), len(b))
+    min_seg = max(10, min(50, shorter // 2000))
     max_chars = 2000
     if len(a) > max_chars or len(b) > max_chars:
-        return _collect_common_segments_rolling_hash(a, b, min_seg)
+        # Scale bucket cap inversely with doc size to bound total seeds.
+        # Target: total seeds < _MAX_SEEDS even if every window matches.
+        windows = max(1, shorter - min_seg)
+        max_bucket = max(4, min(_MAX_BUCKET, _MAX_SEEDS // windows))
+        return _collect_common_segments_rolling_hash(a, b, min_seg, max_bucket)
 
     return _collect_common_segments(a, b, min_seg)
 
@@ -468,7 +476,8 @@ def _collect_common_segments(a: str, b: str, min_seg: int) -> str:
     return " ".join(a[s:s + l] for s, l in merged)
 
 
-def _collect_common_segments_rolling_hash(a: str, b: str, min_seg: int) -> str:
+def _collect_common_segments_rolling_hash(a: str, b: str, min_seg: int,
+                                          max_bucket: int = _MAX_BUCKET) -> str:
     """Find all common substrings >= min_seg chars using rolling-hash seed-and-extend.
 
     Same semantics as _collect_common_segments (DP), but O(n+m+S) instead of O(n*m).
@@ -497,7 +506,7 @@ def _collect_common_segments_rolling_hash(a: str, b: str, min_seg: int) -> str:
             if bucket is None:
                 bucket = array.array("L")
                 index[key] = bucket
-            if len(bucket) < _MAX_BUCKET:
+            if len(bucket) < max_bucket:
                 bucket.append(i - min_seg + 1)
             # Remove outgoing character
             out = ord(a[i - min_seg + 1])
@@ -507,6 +516,7 @@ def _collect_common_segments_rolling_hash(a: str, b: str, min_seg: int) -> str:
     # Step 2: Scan `b`, collect seed pairs (pos_a, pos_b)
     seeds: list[tuple[int, int]] = []
     h1 = h2 = 0
+    seed_overflow = False
     for j, ch in enumerate(b):
         c = ord(ch)
         h1 = (h1 * _RH_BASE1 + c) % _RH_MOD1
@@ -518,9 +528,17 @@ def _collect_common_segments_rolling_hash(a: str, b: str, min_seg: int) -> str:
                 pos_b = j - min_seg + 1
                 for pos_a in bucket:
                     seeds.append((pos_a, pos_b))
+                if len(seeds) >= _MAX_SEEDS:
+                    seed_overflow = True
+                    break
             out = ord(b[j - min_seg + 1])
             h1 = (h1 - out * pow1) % _RH_MOD1
             h2 = (h2 - out * pow2) % _RH_MOD2
+
+    if seed_overflow:
+        logger.warning("Rolling-hash seed cap reached (%d seeds) on texts "
+                       "len(a)=%d len(b)=%d min_seg=%d — results may be partial",
+                       len(seeds), len(a), len(b), min_seg)
 
     if not seeds:
         return ""
