@@ -225,7 +225,6 @@ def test_run_one_cycle_calls_text_recovery(tmp_path):
          patch("unobfuscator.run_phase3_verify_and_group"), \
          patch("unobfuscator.run_merger", return_value=0), \
          patch("unobfuscator.dequeue", return_value=None), \
-         patch("unobfuscator.process_pdf_for_document"), \
          patch("unobfuscator.run_text_recovery") as mock_tr, \
          patch("unobfuscator.run_output_generator", return_value=0), \
          patch("unobfuscator.get_pending_pdf_documents", return_value=[]):
