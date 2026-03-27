@@ -3,9 +3,12 @@
 Logic reference: PIPELINE.md — Phase 4 (Merging)
 """
 
+import logging
 import re
 from typing import Optional
 from core.db import upsert_merge_result
+
+logger = logging.getLogger(__name__)
 
 
 def _normalize_for_anchor(text: str) -> str:
@@ -125,7 +128,8 @@ def _find_between_exact(
         right_pos = text.find(right_anchor)
         if right_pos == -1:
             return None
-        # Uniqueness: check right_anchor doesn't appear again
+        # Stricter than the non-empty case: with no left anchor to pin the search,
+        # any repeated right anchor makes the match ambiguous
         if text.find(right_anchor, right_pos + 1) != -1:
             return None
         return text[:right_pos].strip()
@@ -135,6 +139,14 @@ def _find_between_exact(
         return None
 
     search_from = left_pos + len(left_anchor)
+
+    # Symmetric to the empty-left case: no right anchor means return text from
+    # after left_anchor to end of string, but only if the left anchor is unique.
+    if not right_anchor:
+        if text.find(left_anchor, left_pos + 1) != -1:
+            return None  # ambiguous
+        return text[search_from:].strip()
+
     right_pos = text.find(right_anchor, search_from)
     if right_pos == -1:
         return None
@@ -267,6 +279,12 @@ def merge_group(
     # Process in reverse order so string positions remain valid after substitution
     for pos, marker in reversed(positions):
         left_anchor, right_anchor = extract_anchors(base_text, pos, len(marker), anchor_length, redaction_markers)
+
+        # Anchor quality floor: skip if combined anchors lack alphanumeric content
+        alpha_content = re.sub(r'[^a-zA-Z0-9]', '', left_anchor + right_anchor)
+        if len(alpha_content) < 8:
+            logger.debug("Skipping redaction at pos %d: anchor quality too low (%d alphanumeric chars)", pos, len(alpha_content))
+            continue
 
         for donor_id, donor_text in donors:
             recovered = find_text_between_anchors(donor_text, left_anchor, right_anchor)
