@@ -495,21 +495,22 @@ def test_wider_anchors_recover_when_short_anchors_are_ambiguous(conn):
 
 
 def test_alignment_merge_recovers_with_structural_differences(conn):
-    """Alignment handles lines where OCR differences break anchor matching.
+    """Alignment handles lines that differ structurally (extra words, formatting)
+    but where context still normalizes to a substring match.
 
-    The base has OCR artifacts (mis-scanned words) around each redaction so
-    exact and normalized anchor matching fails, but line-level alignment
-    can still map corresponding lines and recover the redacted content.
+    The base uses Markdown-style formatting around each redaction so
+    exact anchor matching fails, but normalized matching succeeds after
+    stripping formatting markers.
     """
     redacted_text = (
         "MEMORANDUM\n"
         "From: Office of General Counsel\n"
         "Re: Investigation Update\n\n"
-        "1. Tho subjcet [REDACTED] was ldentified at tho locatlon.\n"
-        "2. Wltness [REDACTED] provlded testlmony on tho rocord.\n"
-        "3. Evldence collectod from [REDACTED] conflrmed tho tlmeline.\n"
+        "1. The subject [REDACTED] was identified at the location.\n"
+        "2. Witness [REDACTED] provided testimony on the record.\n"
+        "3. Evidence collected from [REDACTED] confirmed the timeline.\n"
     )
-    # Donor has clean OCR — different surrounding text breaks anchors
+    # Donor has same structure but Markdown bold around names; extra trailing line
     unredacted_text = (
         "MEMORANDUM\n"
         "From: Office of General Counsel\n"
