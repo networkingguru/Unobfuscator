@@ -277,15 +277,41 @@ def merge_group(
     members = sorted(rows, key=redaction_count, reverse=True)
 
     if not members:
-        return {"merged_text": "", "recovered_count": 0, "total_redacted": 0, "source_doc_ids": [], "recovered_segments": []}
+        return {"merged_text": "", "recovered_count": 0, "total_redacted": 0,
+                "source_doc_ids": [], "recovered_segments": []}
 
-    # Pick base: most redaction markers (first after sort); donors fill its gaps
-    base_id = members[0]["id"]
-    base_text = members[0]["extracted_text"] or ""
-    donors = [(row["id"], row["extracted_text"] or "") for row in members[1:]]
+    most_redacted = members[0]
+    least_redacted = min(members, key=redaction_count)
+    most_count = redaction_count(most_redacted)
+    least_count = redaction_count(least_redacted)
+
+    # Reverse merge: if a member has 0 redactions and similar text length,
+    # use it as base. Guard against cover pages / unrelated short docs.
+    reverse_merge = False
+    if least_count == 0 and most_count > 0:
+        most_len = len(most_redacted["extracted_text"] or "")
+        least_len = len(least_redacted["extracted_text"] or "")
+        if least_len > 0 and most_len > 0:
+            ratio = min(most_len, least_len) / max(most_len, least_len)
+            if ratio > 0.3:  # within ~3x length — reasonable structural match
+                reverse_merge = True
+
+    if reverse_merge:
+        base_id = least_redacted["id"]
+        base_text = least_redacted["extracted_text"] or ""
+        donors = [(row["id"], row["extracted_text"] or "") for row in members
+                  if row["id"] != base_id]
+        # total_redacted from the most-redacted member (for reporting)
+        total_redacted = most_count
+    else:
+        base_id = most_redacted["id"]
+        base_text = most_redacted["extracted_text"] or ""
+        donors = [(row["id"], row["extracted_text"] or "") for row in members[1:]]
+        total_redacted = None  # computed below from positions
 
     positions = find_redaction_positions(base_text, redaction_markers)
-    total_redacted = len(positions)
+    if total_redacted is None:
+        total_redacted = len(positions)
     recovered_count = 0
     source_doc_ids = []
     recovered_segments = []
