@@ -22,7 +22,7 @@ from core.db import (
     get_pending_pdf_documents, get_documents_by_ids, reset_group_merged,
     set_config, get_config, get_unindexed_batch_ids, mark_batch_fully_indexed,
     mark_pdf_processed, append_soft_redaction_text, upsert_fingerprint,
-    get_doc_group
+    get_doc_group, get_pending_output_groups
 )
 from core.config import load_config, get as cfg_get
 from core.api import fetch_release_batches, fetch_person_document_ids
@@ -52,6 +52,25 @@ def _set_activity(msg: str) -> None:
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     set_config(_daemon_conn, "daemon_activity", f"{ts} | {msg}")
     _daemon_conn.commit()
+
+
+def _has_pending_work(conn) -> bool:
+    """Check whether any stage has remaining work to process."""
+    stats = get_queue_stats(conn)
+    if stats.get("pending", 0) > 0:
+        return True
+    if conn.execute(
+        "SELECT 1 FROM documents WHERE pdf_processed = 0 AND pdf_url IS NOT NULL LIMIT 1"
+    ).fetchone():
+        return True
+    if conn.execute(
+        "SELECT 1 FROM documents "
+        "WHERE ocr_processed = 0 AND (extracted_text IS NULL OR extracted_text = '') LIMIT 1"
+    ).fetchone():
+        return True
+    if get_pending_output_groups(conn):
+        return True
+    return False
 
 
 def _write_pid() -> None:
@@ -482,32 +501,30 @@ def start(ctx, foreground):
                 _run_one_cycle(conn, cfg)
                 consecutive_errors = 0  # Reset on success
 
-                stats = get_queue_stats(conn)
-                pending_pdfs = conn.execute(
-                    "SELECT COUNT(*) FROM documents WHERE pdf_processed = 0 AND pdf_url IS NOT NULL"
-                ).fetchone()[0]
-                pending_ocr = conn.execute(
-                    "SELECT COUNT(*) FROM documents "
-                    "WHERE ocr_processed = 0 AND (extracted_text IS NULL OR extracted_text = '')"
-                ).fetchone()[0]
-                if stats.get("pending", 0) == 0 and pending_pdfs == 0 and pending_ocr == 0 and not _shutdown_requested:
-                    _set_activity("Polling for new batches")
-                    poll_ok = _poll_for_new_batches(conn, cfg)
-                    wait = poll_interval if poll_ok else retry_interval
-                    wake = datetime.now(timezone.utc) + timedelta(seconds=wait)
-                    reason = "" if poll_ok else " (poll failed, retrying sooner)"
-                    _set_activity(
-                        f"Idle — sleeping {wait // 60:.0f}m until "
-                        f"{wake.astimezone().strftime('%H:%M')}{reason}"
-                    )
-                    console.print(
-                        f"[dim]All tasks complete. Checking for updates in "
-                        f"{wait // 60:.0f} min...[/dim]"
-                    )
-                    for _ in range(int(wait)):
-                        if _shutdown_requested:
-                            break
-                        time.sleep(1)
+                if not _has_pending_work(conn) and not _shutdown_requested:
+                    # No work remains — enter idle polling loop.
+                    # Poll for new batches and sleep without re-running
+                    # all stages each time.
+                    while not _shutdown_requested:
+                        _set_activity("Polling for new batches")
+                        poll_ok = _poll_for_new_batches(conn, cfg)
+                        if _has_pending_work(conn):
+                            break  # new work arrived, run a cycle
+                        wait = poll_interval if poll_ok else retry_interval
+                        wake = datetime.now(timezone.utc) + timedelta(seconds=wait)
+                        reason = "" if poll_ok else " (poll failed, retrying sooner)"
+                        _set_activity(
+                            f"Idle — sleeping {wait // 60:.0f}m until "
+                            f"{wake.astimezone().strftime('%H:%M')}{reason}"
+                        )
+                        console.print(
+                            f"[dim]All tasks complete. Checking for updates in "
+                            f"{wait // 60:.0f} min...[/dim]"
+                        )
+                        for _ in range(int(wait)):
+                            if _shutdown_requested:
+                                break
+                            time.sleep(1)
             except Exception:
                 consecutive_errors += 1
                 logger.exception(

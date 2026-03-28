@@ -235,6 +235,19 @@ def run_text_recovery(conn, redaction_markers: list[str],
     """Run the full text recovery pipeline. Returns count of docs recovered."""
     recovered = 0
 
+    # Fast-path: skip expensive queries when nothing needs recovery.
+    has_backfill = conn.execute(
+        "SELECT 1 FROM documents WHERE text_processed = 1 "
+        "AND (extracted_text IS NULL OR extracted_text = '') "
+        "AND text_source IS NULL LIMIT 1"
+    ).fetchone()
+    has_ocr = conn.execute(
+        "SELECT 1 FROM documents WHERE ocr_processed = 0 "
+        "AND (extracted_text IS NULL OR extracted_text = '') LIMIT 1"
+    ).fetchone()
+    if not has_backfill and not has_ocr:
+        return 0
+
     # --- Step 1: Jmail shard backfill ---
     # Download each needed shard parquet once to a temp file, then query
     # locally in small batches.  Remote parquet queries via DuckDB load
