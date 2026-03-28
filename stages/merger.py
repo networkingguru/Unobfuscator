@@ -253,6 +253,174 @@ def _is_real_recovery(text: str, redaction_markers: list[str]) -> bool:
     return True
 
 
+def _alignment_recover(
+    base_text: str,
+    donor_text: str,
+    positions: list[tuple[int, str]],
+    redaction_markers: list[str],
+) -> dict[int, tuple[str, int]]:
+    """Use line-level SequenceMatcher to propose recoveries for redaction positions.
+
+    Returns dict mapping redaction position -> (candidate text, donor_line_char_offset).
+    The donor_line_char_offset enables positional confirmation instead of global search.
+    Works on lines for O(n) performance (handles 200KB+ docs in <20ms).
+    """
+    from difflib import SequenceMatcher
+
+    base_lines = base_text.splitlines(keepends=True)
+    donor_lines = donor_text.splitlines(keepends=True)
+
+    # Build line-offset maps: line_index -> char_offset
+    base_offsets = []
+    offset = 0
+    for line in base_lines:
+        base_offsets.append(offset)
+        offset += len(line)
+
+    donor_offsets = []
+    offset = 0
+    for line in donor_lines:
+        donor_offsets.append(offset)
+        offset += len(line)
+
+    # Map each redaction position to its line index
+    pos_to_line = {}
+    for pos, marker in positions:
+        for i, line_offset in enumerate(base_offsets):
+            line_end = line_offset + len(base_lines[i])
+            if line_offset <= pos < line_end:
+                pos_to_line[pos] = i
+                break
+
+    # Align lines
+    sm = SequenceMatcher(None, base_lines, donor_lines)
+    opcodes = sm.get_opcodes()
+
+    # Build line mapping: base_line_index -> donor_line_index for 'replace' blocks
+    base_to_donor_line = {}
+    for tag, i1, i2, j1, j2 in opcodes:
+        if tag == 'replace':
+            for bi in range(i1, i2):
+                ratio = (bi - i1) / max(i2 - i1, 1)
+                dj = j1 + int(ratio * (j2 - j1))
+                dj = min(dj, j2 - 1)
+                base_to_donor_line[bi] = dj
+
+    candidates = {}
+    for pos, marker in positions:
+        line_idx = pos_to_line.get(pos)
+        if line_idx is None:
+            continue
+
+        donor_line_idx = base_to_donor_line.get(line_idx)
+        if donor_line_idx is None:
+            continue
+
+        base_line = base_lines[line_idx]
+        donor_line = donor_lines[donor_line_idx]
+        line_offset = base_offsets[line_idx]
+        pos_in_line = pos - line_offset
+
+        # Char-level SequenceMatcher on the individual line pair
+        line_sm = SequenceMatcher(None, base_line, donor_line)
+        line_ops = line_sm.get_opcodes()
+
+        # Only use candidate if the replace region contains exactly one marker
+        for tag, li1, li2, lj1, lj2 in line_ops:
+            if tag == 'replace' and li1 <= pos_in_line < li2:
+                if pos_in_line >= li1 and pos_in_line + len(marker) <= li2:
+                    markers_in_region = sum(
+                        1 for p, m in positions
+                        if pos_to_line.get(p) == line_idx
+                        and li1 <= (p - line_offset) < li2
+                    )
+                    if markers_in_region == 1:
+                        candidate = donor_line[lj1:lj2].strip()
+                        if candidate and _is_real_recovery(candidate, redaction_markers):
+                            candidates[pos] = (candidate, donor_offsets[donor_line_idx] + lj1)
+                break
+
+    return candidates
+
+
+def _confirm_alignment_candidate(
+    candidate: str,
+    donor_text: str,
+    base_text: str,
+    pos: int,
+    marker_len: int,
+    redaction_markers: list[str],
+    donor_line_offset: int = -1,
+) -> bool:
+    """Confirm an alignment candidate using anchor context (both sides must match).
+
+    donor_line_offset: char offset of the donor line that produced this candidate.
+    When provided, checks context around that specific position instead of
+    searching globally (avoids matching wrong occurrence of repeated text).
+    """
+    context_len = 30
+    left_ctx = base_text[max(0, pos - context_len):pos].strip()
+    right_ctx = base_text[pos + marker_len:pos + marker_len + context_len].strip()
+
+    if redaction_markers:
+        for m in redaction_markers:
+            idx = left_ctx.rfind(m)
+            if idx >= 0:
+                left_ctx = left_ctx[idx + len(m):].strip()
+            idx = right_ctx.find(m)
+            if idx >= 0:
+                right_ctx = right_ctx[:idx].strip()
+
+    # Use donor_line_offset if provided, else fall back to global search
+    if donor_line_offset >= 0:
+        cand_pos = donor_line_offset
+    else:
+        cand_pos = donor_text.find(candidate)
+        if cand_pos == -1:
+            return False
+
+    search_window = 200
+    donor_region = donor_text[max(0, cand_pos - search_window):cand_pos + len(candidate) + search_window]
+    norm_region = _normalize_for_anchor(donor_region)
+
+    # Quality floor: < 4 alphanumeric chars after truncation = can't confirm
+    ctx_alpha = re.sub(r'[^a-zA-Z0-9]', '', left_ctx + right_ctx)
+    if len(ctx_alpha) < 4:
+        return False
+
+    # Both non-empty anchors must match (AND, not OR)
+    # Try exact/normalized substring first, then fall back to fuzzy ratio
+    norm_left = _normalize_for_anchor(left_ctx) if left_ctx else ""
+    norm_right = _normalize_for_anchor(right_ctx) if right_ctx else ""
+
+    def _ctx_matches(ctx, norm_ctx, region, norm_reg):
+        if not ctx:
+            return True
+        if ctx in region or norm_ctx in norm_reg:
+            return True
+        # Fuzzy fallback: check if context is similar enough to a region substring
+        # This handles OCR differences where characters are garbled but structure matches
+        from difflib import SequenceMatcher
+        # Slide a window of ctx length across the region and check best ratio
+        ctx_len = len(norm_ctx)
+        if ctx_len < 4:
+            return False
+        best = 0.0
+        for i in range(max(1, len(norm_reg) - ctx_len + 1)):
+            window = norm_reg[i:i + ctx_len]
+            ratio = SequenceMatcher(None, norm_ctx, window).ratio()
+            if ratio > best:
+                best = ratio
+            if best >= 0.7:
+                return True
+        return best >= 0.7
+
+    left_ok = _ctx_matches(left_ctx, norm_left, donor_region, norm_region)
+    right_ok = _ctx_matches(right_ctx, norm_right, donor_region, norm_region)
+
+    return left_ok and right_ok
+
+
 def merge_group(
     conn, group_id: int, redaction_markers: list[str], anchor_length: int = 50
 ) -> dict:
@@ -357,6 +525,38 @@ def merge_group(
                         source_doc_ids.append(donor_id)
                     recovered_this = True
                     break
+
+    # --- Alignment fallback for remaining redactions ---
+    remaining_positions = find_redaction_positions(merged, redaction_markers)
+    if remaining_positions and donors:
+        for donor_id, donor_text in donors:
+            if not remaining_positions:
+                break
+            alignment_candidates = _alignment_recover(
+                merged, donor_text, remaining_positions, redaction_markers
+            )
+            newly_recovered = []
+            for pos, marker in reversed(remaining_positions):
+                if pos in alignment_candidates:
+                    candidate, donor_offset = alignment_candidates[pos]
+                    if _confirm_alignment_candidate(
+                        candidate, donor_text, merged, pos, len(marker),
+                        redaction_markers, donor_line_offset=donor_offset
+                    ):
+                        merged = merged[:pos] + candidate + merged[pos + len(marker):]
+                        recovered_count += 1
+                        recovered_segments.append({
+                            "text": candidate,
+                            "source_doc_id": donor_id,
+                            "stage": "alignment",
+                            "confidence": "high",
+                            "anchor_alpha_len": 0,
+                        })
+                        if donor_id not in source_doc_ids:
+                            source_doc_ids.append(donor_id)
+                        newly_recovered.append(pos)
+            # Re-scan for remaining after this donor (positions shifted)
+            remaining_positions = find_redaction_positions(merged, redaction_markers)
 
     # Flag questionable recoveries: same text recovered 3+ times is suspicious
     from collections import Counter

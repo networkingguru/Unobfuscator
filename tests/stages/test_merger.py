@@ -494,6 +494,69 @@ def test_wider_anchors_recover_when_short_anchors_are_ambiguous(conn):
     assert "Leslie Wexner" in result["merged_text"]
 
 
+def test_alignment_merge_recovers_with_structural_differences(conn):
+    """Alignment handles lines where OCR differences break anchor matching.
+
+    The base has OCR artifacts (mis-scanned words) around each redaction so
+    exact and normalized anchor matching fails, but line-level alignment
+    can still map corresponding lines and recover the redacted content.
+    """
+    redacted_text = (
+        "MEMORANDUM\n"
+        "From: Office of General Counsel\n"
+        "Re: Investigation Update\n\n"
+        "1. Tho subjcet [REDACTED] was ldentified at tho locatlon.\n"
+        "2. Wltness [REDACTED] provlded testlmony on tho rocord.\n"
+        "3. Evldence collectod from [REDACTED] conflrmed tho tlmeline.\n"
+    )
+    # Donor has clean OCR — different surrounding text breaks anchors
+    unredacted_text = (
+        "MEMORANDUM\n"
+        "From: Office of General Counsel\n"
+        "Re: Investigation Update\n\n"
+        "1. The subject John Smith was identified at the location.\n"
+        "2. Witness Sarah Johnson provided testimony on the record.\n"
+        "3. Evidence collected from Palm Beach PD confirmed the timeline.\n"
+        "4. The [REDACTED] case file was sealed.\n"
+    )
+    seed_doc(conn, 1, redacted_text)
+    seed_doc(conn, 2, unredacted_text)
+    conn.commit()
+    g = create_match_group(conn)
+    add_group_member(conn, g, 1, 1.0)
+    add_group_member(conn, g, 2, 0.85)
+    conn.commit()
+
+    result = merge_group(conn, g, REDACTION_MARKERS, anchor_length=50)
+    assert result["recovered_count"] >= 2
+    assert "John Smith" in result["merged_text"]
+    assert "Sarah Johnson" in result["merged_text"]
+
+
+def test_alignment_merge_does_not_false_recover_unrelated_content(conn):
+    """Alignment rejects candidates where surrounding context doesn't match."""
+    redacted_text = (
+        "Section A: The investigation found [REDACTED] at the scene.\n"
+        "Section B: The report concluded with no further action.\n"
+    )
+    donor_text = (
+        "Section A: The budget review found surplus funds at the office.\n"
+        "Section B: The report concluded with no further action.\n"
+        "Section C: The [REDACTED] budget was approved.\n"
+    )
+    seed_doc(conn, 1, redacted_text)
+    seed_doc(conn, 2, donor_text)
+    conn.commit()
+    g = create_match_group(conn)
+    add_group_member(conn, g, 1, 1.0)
+    add_group_member(conn, g, 2, 0.7)
+    conn.commit()
+
+    result = merge_group(conn, g, REDACTION_MARKERS, anchor_length=50)
+    assert "surplus funds" not in result["merged_text"]
+    assert "[REDACTED]" in result["merged_text"]
+
+
 def test_run_merger_stores_results_and_marks_group_merged(conn):
     seed_doc(conn, 1, BASE_TEXT)
     seed_doc(conn, 2, DONOR_TEXT_A)
