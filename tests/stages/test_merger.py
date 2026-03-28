@@ -320,9 +320,9 @@ def test_merge_group_allows_legitimate_repeated_name_recovery(conn):
     conn.commit()
 
     result = merge_group(conn, g, REDACTION_MARKERS, anchor_length=50)
-    # Both redactions have unique surrounding context, so both should recover
-    assert result["recovered_count"] == 2
+    # Reverse merge uses unredacted doc as base — content is there directly
     assert result["merged_text"].count("Bill Clinton") == 2
+    assert "[REDACTED]" not in result["merged_text"]
 
 
 def test_confidence_field_marks_repeated_recoveries_as_questionable(conn):
@@ -386,6 +386,84 @@ def test_is_real_recovery_rejects_redaction_descriptions(conn):
 
     result = merge_group(conn, g, REDACTION_MARKERS, anchor_length=50)
     assert result["recovered_count"] == 0
+
+
+def test_reverse_merge_uses_unredacted_doc_as_base(conn):
+    """When a donor has 0 redactions, it becomes the base; merged text has no markers."""
+    redacted_text = (
+        "The attendees included [REDACTED] and Prince Andrew. "
+        "The flight departed from [REDACTED] at 9am. "
+        "They arrived at [REDACTED] by noon."
+    )
+    unredacted_text = (
+        "The attendees included Bill Clinton and Prince Andrew. "
+        "The flight departed from Palm Beach at 9am. "
+        "They arrived at Little St. James by noon."
+    )
+    seed_doc(conn, 1, redacted_text)
+    seed_doc(conn, 2, unredacted_text)
+    conn.commit()
+    g = create_match_group(conn)
+    add_group_member(conn, g, 1, 1.0)
+    add_group_member(conn, g, 2, 0.95)
+    conn.commit()
+
+    result = merge_group(conn, g, REDACTION_MARKERS, anchor_length=50)
+    assert "[REDACTED]" not in result["merged_text"]
+    assert "Bill Clinton" in result["merged_text"]
+    assert "Palm Beach" in result["merged_text"]
+    assert "Little St. James" in result["merged_text"]
+    assert result["total_redacted"] == 3
+
+
+def test_reverse_merge_recovers_when_normal_merge_fails(conn):
+    """Docs with structural differences: using unredacted as base avoids anchor failures."""
+    redacted_text = (
+        "(U) Interview of [REDACTED]\n"
+        "(U) Interview of [REDACTED]\n"
+        "(U) Proffer of [REDACTED]\n"
+        "EFTA02730496\n--- PAGE BREAK ---\n"
+    )
+    unredacted_text = (
+        "(U) Interview of Miguel Monge\n"
+        "(U) Interview of Darrius Dupree\n"
+        "(U) Interview of John MARRUGO\n"
+        "(U) Proffer of Jason Mojica\n"
+        "(U) Proffer of Christian Perez\n"
+        "(U) Proffer of Freddy Caraballo\n"
+        "EFTA02730942\n--- PAGE BREAK ---\n"
+    )
+    seed_doc(conn, 1, redacted_text)
+    seed_doc(conn, 2, unredacted_text)
+    conn.commit()
+    g = create_match_group(conn)
+    add_group_member(conn, g, 1, 1.0)
+    add_group_member(conn, g, 2, 0.85)
+    conn.commit()
+
+    result = merge_group(conn, g, REDACTION_MARKERS, anchor_length=50)
+    assert "[REDACTED]" not in result["merged_text"]
+    assert "Jason Mojica" in result["merged_text"]
+    assert result["total_redacted"] == 3
+
+
+def test_reverse_merge_skips_when_length_mismatch(conn):
+    """A short unredacted doc should not become base for a much longer redacted doc."""
+    long_redacted = (
+        "Section 1: The investigation found [REDACTED] at the scene.\n" * 20
+    )
+    short_unredacted = "Cover page: Case File 2005-0042\n"
+    seed_doc(conn, 1, long_redacted)
+    seed_doc(conn, 2, short_unredacted)
+    conn.commit()
+    g = create_match_group(conn)
+    add_group_member(conn, g, 1, 1.0)
+    add_group_member(conn, g, 2, 0.3)
+    conn.commit()
+
+    result = merge_group(conn, g, REDACTION_MARKERS, anchor_length=50)
+    assert result["total_redacted"] == 20
+    assert "Cover page" not in result["merged_text"][:50]
 
 
 def test_run_merger_stores_results_and_marks_group_merged(conn):
