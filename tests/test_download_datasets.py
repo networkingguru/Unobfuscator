@@ -20,9 +20,9 @@ from download_datasets import (
 
 
 def test_datasets_contains_expected_entries():
-    """All 8 missing datasets should be defined."""
+    """All 10 missing datasets should be defined."""
     ids = [d["id"] for d in DATASETS]
-    assert ids == [3, 4, 5, 6, 7, 8, 9, 12]
+    assert ids == [3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
 
 
 def test_datasets_have_required_fields():

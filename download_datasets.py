@@ -112,6 +112,22 @@ DATASETS = [
         "sha256": None,
     },
     {
+        "id": 10,
+        "url": "https://archive.org/download/data-set-10/DataSet%2010.zip",
+        "release_batch": "VOL00010",
+        "source_type": SOURCE_ARCHIVE_ORG,
+        "source_label": _ARCHIVE_ORG_LABEL,
+        "sha256": None,
+    },
+    {
+        "id": 11,
+        "url": "https://doj-files.geeken.dev/doj_zips/original_archives/DataSet%2011.zip",
+        "release_batch": "DataSet11",
+        "source_type": SOURCE_COMMUNITY_GEEKEN,
+        "source_label": _COMMUNITY_MIRROR_LABEL,
+        "sha256": None,
+    },
+    {
         "id": 12,
         "url": "https://archive.org/download/data-set-12_202601/DataSet%2012.zip",
         "source_type": SOURCE_ARCHIVE_ORG,
