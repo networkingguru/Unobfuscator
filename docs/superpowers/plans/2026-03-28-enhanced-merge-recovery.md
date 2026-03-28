@@ -463,14 +463,22 @@ def _alignment_recover(
         line_sm = SequenceMatcher(None, base_line, donor_line)
         line_ops = line_sm.get_opcodes()
 
-        # Find the opcode that covers this marker's position
+        # Find the opcode that covers this marker's position.
+        # Only use the candidate if this replace region contains exactly
+        # one marker — multi-marker replace regions produce garbled output.
         for tag, li1, li2, lj1, lj2 in line_ops:
             if tag == 'replace' and li1 <= pos_in_line < li2:
-                # Check that the replaced region actually contains our marker
                 if pos_in_line >= li1 and pos_in_line + len(marker) <= li2:
-                    candidate = donor_line[lj1:lj2].strip()
-                    if candidate and _is_real_recovery(candidate, redaction_markers):
-                        candidates[pos] = (candidate, donor_offsets[donor_line_idx] + lj1)
+                    # Count how many markers from our positions list fall in this opcode
+                    markers_in_region = sum(
+                        1 for p, m in positions
+                        if pos_to_line.get(p) == line_idx
+                        and li1 <= (p - line_offset) < li2
+                    )
+                    if markers_in_region == 1:
+                        candidate = donor_line[lj1:lj2].strip()
+                        if candidate and _is_real_recovery(candidate, redaction_markers):
+                            candidates[pos] = (candidate, donor_offsets[donor_line_idx] + lj1)
                 break
 
     return candidates
@@ -630,12 +638,16 @@ def test_multi_pass_recovers_when_adjacent_recovery_provides_anchors(conn):
     assert "Bill Clinton" in result["merged_text"]
     assert "Prince Andrew" in result["merged_text"]
     assert "Ghislaine Maxwell" in result["merged_text"]
+    # Verify no garbled/duplicated content
+    assert result["merged_text"].count("Bill Clinton") == 1
+    assert result["merged_text"].count("Prince Andrew") == 1
+    assert result["merged_text"].count("Ghislaine Maxwell") == 1
 ```
 
-- [ ] **Step 2: Run test to verify it fails (middle redaction skipped by quality floor)**
+- [ ] **Step 2: Run test to verify it fails**
 
 Run: `.venv/bin/python -m pytest tests/stages/test_merger.py::test_multi_pass_recovers_when_adjacent_recovery_provides_anchors -v`
-Expected: FAIL — only 2 of 3 recovered (middle one's anchors truncated to ", " by adjacent markers, below quality floor)
+Expected: FAIL — middle redaction's anchors are truncated to ", " (0 alpha < 8, skipped by quality floor in anchors; alignment also skips multi-marker replace regions and degenerate-context confirmation). Only pass 2 succeeds after A and C provide clean anchor context.
 
 - [ ] **Step 3: Implement multi-pass wrapper**
 
