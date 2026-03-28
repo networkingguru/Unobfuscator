@@ -558,6 +558,43 @@ def test_alignment_merge_does_not_false_recover_unrelated_content(conn):
     assert "[REDACTED]" in result["merged_text"]
 
 
+def test_multi_pass_recovers_when_adjacent_recovery_provides_anchors(conn):
+    """Pass 1 recovers outer redactions; pass 2 uses them as anchor context for inner ones."""
+    # Layout: good_anchor [A] , [B] , [C] good_anchor
+    # The separators between redactions are just ", " (2 chars, 0 alphanumeric).
+    # Pass 1: A's left anchor is good ("confirmed that"), C's right anchor is good
+    #         ("was already"). But B's anchors are truncated at adjacent markers,
+    #         leaving only ", " on each side -> alpha_content < 8, skipped.
+    # Pass 2: After A and C are recovered, B's anchors include "Bill Clinton, "
+    #         (left) and ", Ghislaine Maxwell" (right) -> alpha > 8, matches.
+    base_text = (
+        "The lead investigator confirmed that [REDACTED], [REDACTED], [REDACTED] "
+        "was already waiting according to the flight manifest records."
+    )
+    donor_text = (
+        "The lead investigator confirmed that Bill Clinton, Prince Andrew, Ghislaine Maxwell "
+        "was already waiting according to the flight manifest records. "
+        "Another [REDACTED] name appears elsewhere in the file."
+    )
+    seed_doc(conn, 1, base_text)
+    seed_doc(conn, 2, donor_text)
+    conn.commit()
+    g = create_match_group(conn)
+    add_group_member(conn, g, 1, 1.0)
+    add_group_member(conn, g, 2, 0.9)
+    conn.commit()
+
+    result = merge_group(conn, g, REDACTION_MARKERS, anchor_length=50)
+    assert result["recovered_count"] == 3
+    assert "Bill Clinton" in result["merged_text"]
+    assert "Prince Andrew" in result["merged_text"]
+    assert "Ghislaine Maxwell" in result["merged_text"]
+    # Verify no garbled/duplicated content
+    assert result["merged_text"].count("Bill Clinton") == 1
+    assert result["merged_text"].count("Prince Andrew") == 1
+    assert result["merged_text"].count("Ghislaine Maxwell") == 1
+
+
 def test_run_merger_stores_results_and_marks_group_merged(conn):
     seed_doc(conn, 1, BASE_TEXT)
     seed_doc(conn, 2, DONOR_TEXT_A)

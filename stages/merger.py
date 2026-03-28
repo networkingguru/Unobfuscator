@@ -468,76 +468,89 @@ def merge_group(
     recovered_segments = []
     merged = base_text
 
-    # Process in reverse order so string positions remain valid after substitution
-    for pos, marker in reversed(positions):
-        left_anchor, right_anchor = extract_anchors(base_text, pos, len(marker), anchor_length, redaction_markers)
+    max_passes = 3
+    for pass_num in range(max_passes):
+        current_positions = find_redaction_positions(merged, redaction_markers)
+        if not current_positions:
+            break
 
-        # Anchor quality floor: skip if combined anchors lack alphanumeric content
-        alpha_content = re.sub(r'[^a-zA-Z0-9]', '', left_anchor + right_anchor)
-        if len(alpha_content) < 8:
-            logger.debug("Skipping redaction at pos %d: anchor quality too low (%d alphanumeric chars)", pos, len(alpha_content))
-            continue
+        pre_pass_count = recovered_count
 
-        # Try progressively wider anchors if the default width fails
-        anchor_widths = sorted(set([anchor_length, 100, 150, 200]))
-        recovered_this = False
-        for width in anchor_widths:
-            if recovered_this:
-                break
-            if width == anchor_length:
-                left_w, right_w = left_anchor, right_anchor
-            else:
-                left_w, right_w = extract_anchors(
-                    merged, pos, len(marker), width, redaction_markers
-                )
+        # --- Anchor matching with adaptive widths ---
+        # Process in reverse order so string positions remain valid after substitution
+        for pos, marker in reversed(current_positions):
+            left_anchor, right_anchor = extract_anchors(merged, pos, len(marker), anchor_length, redaction_markers)
 
-            for donor_id, donor_text in donors:
-                recovered = find_text_between_anchors(donor_text, left_w, right_w)
-                if recovered and _is_real_recovery(recovered, redaction_markers):
-                    merged = merged[:pos] + recovered + merged[pos + len(marker):]
-                    recovered_count += 1
-                    alpha_w = re.sub(r'[^a-zA-Z0-9]', '', left_w + right_w)
-                    recovered_segments.append({
-                        "text": recovered,
-                        "source_doc_id": donor_id,
-                        "stage": "merge",
-                        "confidence": "high",
-                        "anchor_alpha_len": len(alpha_w),
-                    })
-                    if donor_id not in source_doc_ids:
-                        source_doc_ids.append(donor_id)
-                    recovered_this = True
+            # Anchor quality floor: skip if combined anchors lack alphanumeric content
+            alpha_content = re.sub(r'[^a-zA-Z0-9]', '', left_anchor + right_anchor)
+            if len(alpha_content) < 8:
+                logger.debug("Skipping redaction at pos %d (pass %d): anchor quality too low (%d alphanumeric chars)", pos, pass_num, len(alpha_content))
+                continue
+
+            # Try progressively wider anchors if the default width fails
+            anchor_widths = sorted(set([anchor_length, 100, 150, 200]))
+            recovered_this = False
+            for width in anchor_widths:
+                if recovered_this:
                     break
+                if width == anchor_length:
+                    left_w, right_w = left_anchor, right_anchor
+                else:
+                    left_w, right_w = extract_anchors(
+                        merged, pos, len(marker), width, redaction_markers
+                    )
 
-    # --- Alignment fallback for remaining redactions ---
-    remaining_positions = find_redaction_positions(merged, redaction_markers)
-    if remaining_positions and donors:
-        for donor_id, donor_text in donors:
-            if not remaining_positions:
-                break
-            alignment_candidates = _alignment_recover(
-                merged, donor_text, remaining_positions, redaction_markers
-            )
-            for pos, marker in reversed(remaining_positions):
-                if pos in alignment_candidates:
-                    candidate, donor_offset = alignment_candidates[pos]
-                    if _confirm_alignment_candidate(
-                        candidate, donor_text, merged, pos, len(marker),
-                        redaction_markers, donor_line_offset=donor_offset
-                    ):
-                        merged = merged[:pos] + candidate + merged[pos + len(marker):]
+                for donor_id, donor_text in donors:
+                    recovered = find_text_between_anchors(donor_text, left_w, right_w)
+                    if recovered and _is_real_recovery(recovered, redaction_markers):
+                        merged = merged[:pos] + recovered + merged[pos + len(marker):]
                         recovered_count += 1
+                        alpha_w = re.sub(r'[^a-zA-Z0-9]', '', left_w + right_w)
                         recovered_segments.append({
-                            "text": candidate,
+                            "text": recovered,
                             "source_doc_id": donor_id,
-                            "stage": "alignment",
+                            "stage": "merge",
                             "confidence": "high",
-                            "anchor_alpha_len": 0,
+                            "anchor_alpha_len": len(alpha_w),
                         })
                         if donor_id not in source_doc_ids:
                             source_doc_ids.append(donor_id)
-            # Re-scan for remaining after this donor (positions shifted)
-            remaining_positions = find_redaction_positions(merged, redaction_markers)
+                        recovered_this = True
+                        break
+
+        # --- Alignment fallback for remaining redactions ---
+        remaining_positions = find_redaction_positions(merged, redaction_markers)
+        if remaining_positions and donors:
+            for donor_id, donor_text in donors:
+                if not remaining_positions:
+                    break
+                alignment_candidates = _alignment_recover(
+                    merged, donor_text, remaining_positions, redaction_markers
+                )
+                for pos, marker in reversed(remaining_positions):
+                    if pos in alignment_candidates:
+                        candidate, donor_offset = alignment_candidates[pos]
+                        if _confirm_alignment_candidate(
+                            candidate, donor_text, merged, pos, len(marker),
+                            redaction_markers, donor_line_offset=donor_offset
+                        ):
+                            merged = merged[:pos] + candidate + merged[pos + len(marker):]
+                            recovered_count += 1
+                            recovered_segments.append({
+                                "text": candidate,
+                                "source_doc_id": donor_id,
+                                "stage": "alignment",
+                                "confidence": "high",
+                                "anchor_alpha_len": 0,
+                            })
+                            if donor_id not in source_doc_ids:
+                                source_doc_ids.append(donor_id)
+                # Re-scan for remaining after this donor (positions shifted)
+                remaining_positions = find_redaction_positions(merged, redaction_markers)
+
+        # Early exit if no progress this pass
+        if recovered_count == pre_pass_count:
+            break
 
     # Flag questionable recoveries: same text recovered 3+ times is suspicious
     from collections import Counter
