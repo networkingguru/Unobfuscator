@@ -327,21 +327,36 @@ def merge_group(
             logger.debug("Skipping redaction at pos %d: anchor quality too low (%d alphanumeric chars)", pos, len(alpha_content))
             continue
 
-        for donor_id, donor_text in donors:
-            recovered = find_text_between_anchors(donor_text, left_anchor, right_anchor)
-            if recovered and _is_real_recovery(recovered, redaction_markers):
-                merged = merged[:pos] + recovered + merged[pos + len(marker):]
-                recovered_count += 1
-                recovered_segments.append({
-                    "text": recovered,
-                    "source_doc_id": donor_id,
-                    "stage": "merge",
-                    "confidence": "high",
-                    "anchor_alpha_len": len(alpha_content),
-                })
-                if donor_id not in source_doc_ids:
-                    source_doc_ids.append(donor_id)
-                break  # Found recovery for this gap — move to next
+        # Try progressively wider anchors if the default width fails
+        anchor_widths = sorted(set([anchor_length, 100, 150, 200]))
+        recovered_this = False
+        for width in anchor_widths:
+            if recovered_this:
+                break
+            if width == anchor_length:
+                left_w, right_w = left_anchor, right_anchor
+            else:
+                left_w, right_w = extract_anchors(
+                    merged, pos, len(marker), width, redaction_markers
+                )
+
+            for donor_id, donor_text in donors:
+                recovered = find_text_between_anchors(donor_text, left_w, right_w)
+                if recovered and _is_real_recovery(recovered, redaction_markers):
+                    merged = merged[:pos] + recovered + merged[pos + len(marker):]
+                    recovered_count += 1
+                    alpha_w = re.sub(r'[^a-zA-Z0-9]', '', left_w + right_w)
+                    recovered_segments.append({
+                        "text": recovered,
+                        "source_doc_id": donor_id,
+                        "stage": "merge",
+                        "confidence": "high",
+                        "anchor_alpha_len": len(alpha_w),
+                    })
+                    if donor_id not in source_doc_ids:
+                        source_doc_ids.append(donor_id)
+                    recovered_this = True
+                    break
 
     # Flag questionable recoveries: same text recovered 3+ times is suspicious
     from collections import Counter

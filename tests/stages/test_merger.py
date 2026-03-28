@@ -466,6 +466,34 @@ def test_reverse_merge_skips_when_length_mismatch(conn):
     assert "Cover page" not in result["merged_text"][:50]
 
 
+def test_wider_anchors_recover_when_short_anchors_are_ambiguous(conn):
+    """50-char anchors are identical for two redactions; wider context resolves them."""
+    shared_pre = "the private counsel representing the individual "  # 48 chars
+    shared_suf = " during the confidential deposition proceedings. "  # 50 chars
+    base_text = (
+        "In January in the downtown office, " + shared_pre + "[REDACTED]" + shared_suf
+        + "In February in the uptown office, " + shared_pre + "[REDACTED]" + shared_suf
+    )
+    # Donor keeps a [REDACTED] elsewhere so reverse-merge doesn't kick in
+    donor_text = (
+        "In January in the downtown office, " + shared_pre + "Alan Dershowitz" + shared_suf
+        + "In February in the uptown office, " + shared_pre + "Leslie Wexner" + shared_suf
+        + "In March [REDACTED] attended a gala."
+    )
+    seed_doc(conn, 1, base_text)
+    seed_doc(conn, 2, donor_text)
+    conn.commit()
+    g = create_match_group(conn)
+    add_group_member(conn, g, 1, 1.0)
+    add_group_member(conn, g, 2, 0.9)
+    conn.commit()
+
+    result = merge_group(conn, g, REDACTION_MARKERS, anchor_length=50)
+    assert result["recovered_count"] == 2
+    assert "Alan Dershowitz" in result["merged_text"]
+    assert "Leslie Wexner" in result["merged_text"]
+
+
 def test_run_merger_stores_results_and_marks_group_merged(conn):
     seed_doc(conn, 1, BASE_TEXT)
     seed_doc(conn, 2, DONOR_TEXT_A)
