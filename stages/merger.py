@@ -389,31 +389,14 @@ def _confirm_alignment_candidate(
         return False
 
     # Both non-empty anchors must match (AND, not OR)
-    # Try exact/normalized substring first, then fall back to fuzzy ratio
+    # Exact or normalized substring matching only — no fuzzy fallback (spec compliance)
     norm_left = _normalize_for_anchor(left_ctx) if left_ctx else ""
     norm_right = _normalize_for_anchor(right_ctx) if right_ctx else ""
 
     def _ctx_matches(ctx, norm_ctx, region, norm_reg):
         if not ctx:
             return True
-        if ctx in region or norm_ctx in norm_reg:
-            return True
-        # Fuzzy fallback: check if context is similar enough to a region substring
-        # This handles OCR differences where characters are garbled but structure matches
-        from difflib import SequenceMatcher
-        # Slide a window of ctx length across the region and check best ratio
-        ctx_len = len(norm_ctx)
-        if ctx_len < 4:
-            return False
-        best = 0.0
-        for i in range(max(1, len(norm_reg) - ctx_len + 1)):
-            window = norm_reg[i:i + ctx_len]
-            ratio = SequenceMatcher(None, norm_ctx, window).ratio()
-            if ratio > best:
-                best = ratio
-            if best >= 0.7:
-                return True
-        return best >= 0.7
+        return ctx in region or norm_ctx in norm_reg
 
     left_ok = _ctx_matches(left_ctx, norm_left, donor_region, norm_region)
     right_ok = _ctx_matches(right_ctx, norm_right, donor_region, norm_region)
@@ -535,7 +518,6 @@ def merge_group(
             alignment_candidates = _alignment_recover(
                 merged, donor_text, remaining_positions, redaction_markers
             )
-            newly_recovered = []
             for pos, marker in reversed(remaining_positions):
                 if pos in alignment_candidates:
                     candidate, donor_offset = alignment_candidates[pos]
@@ -554,7 +536,6 @@ def merge_group(
                         })
                         if donor_id not in source_doc_ids:
                             source_doc_ids.append(donor_id)
-                        newly_recovered.append(pos)
             # Re-scan for remaining after this donor (positions shifted)
             remaining_positions = find_redaction_positions(merged, redaction_markers)
 
