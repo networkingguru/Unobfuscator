@@ -25,10 +25,49 @@ Phase 0 — Email fast-path     Match documents sharing identical From/To/Date/S
 Phase 1 — Fingerprinting      Build 128-bit MinHash signatures from 8-word shingles
 Phase 2 — LSH candidates      Use locality-sensitive hashing to find near-duplicate pairs (≥70% Jaccard)
 Phase 3 — Verification        Confirm pairs share substantial common text and complementary redactions
-Phase 4 — Merge & recover     Replace redaction markers with text recovered from the matching document
+Phase 4 — Merge & recover     Multi-strategy redaction recovery (see below)
 Phase 5 — PDF processing      Extract text hidden under black overlay rectangles (soft redactions)
+Phase 5.5 — Text recovery     Backfill missing text from Jmail, extract PDF text layers, OCR
 Phase 6 — Output generation   Produce annotated PDFs with recovered text highlighted
 ```
+
+### Phase 4 — Merge Strategies
+
+The merger uses four complementary techniques to maximize recovery while
+maintaining zero false positives:
+
+1. **Reverse merge** — when a group member has zero redactions (a fully
+   unredacted copy), use it as the merge base instead of patching into
+   the redacted version. Eliminates the anchor-matching bottleneck for
+   the highest-value cases.
+
+2. **Adaptive anchor widening** — if the default 50-character anchors
+   are ambiguous (match multiple positions), automatically retry with
+   100, 150, and 200-character anchors for disambiguation.
+
+3. **Sequence alignment fallback** — for redactions that anchors can't
+   reach (different page breaks, shifted content), align the base and
+   donor texts line-by-line using `difflib.SequenceMatcher`, then
+   confirm candidates via anchor context validation.
+
+4. **Multi-pass chain walking** — up to 3 passes, where each pass uses
+   prior recoveries as anchor context for adjacent redactions. Recovers
+   dense redaction blocks where middle entries only become matchable
+   after their neighbors are filled in.
+
+### Quality Safeguards
+
+- **Anchor uniqueness check** — rejects ambiguous matches where the
+  anchor pair appears at multiple positions in the donor
+- **Anchor quality floor** — skips redactions where combined anchor
+  context has fewer than 8 alphanumeric characters
+- **Content validation** — rejects recovered text that contains other
+  redaction markers, block characters, generic placeholders, or AI
+  image descriptions
+- **Confidence flagging** — marks recoveries of the same text 3+ times
+  as "questionable" (displayed as orange highlights in output PDFs)
+- **Alignment confirmation** — sequence alignment candidates must pass
+  both-sides anchor context validation with a quality floor
 
 See [PIPELINE.md](PIPELINE.md) for the full plain-English logic reference and
 [docs/USER_GUIDE.md](docs/USER_GUIDE.md) for detailed usage instructions.
@@ -54,6 +93,9 @@ pymupdf
 httpx
 pyyaml
 numpy
+pillow
+pytesseract
+pandas
 ```
 
 ---
@@ -65,23 +107,25 @@ git clone https://github.com/networkingguru/Unobfuscator.git
 cd Unobfuscator
 python3 -m venv venv
 source venv/bin/activate
-pip install click rich datasketch duckdb pymupdf httpx pyyaml numpy
+pip install -r requirements.txt
 ```
 
 ### Optional: download the local dataset archive
 
 The daemon fetches document text directly from the Jmail API and PDFs from
-justice.gov on demand. If you want to pre-cache the full PDF archive locally
-(datasets 3–9 and 12, which are not on justice.gov), run:
+justice.gov on demand. If you want to pre-cache the PDF archive locally, run:
 
 ```bash
 python download_datasets.py
 ```
 
-This downloads from [archive.org](https://archive.org) and a community mirror,
-verifies checksums where available, and extracts files into `pdf_cache/`.
-Disk usage varies by dataset; the script checks available space before each
-download and aborts if less than 10% would remain free.
+This downloads datasets 3–12 from [archive.org](https://archive.org) and
+community mirrors ([geeken.dev](https://justice.geeken.dev)), verifies
+checksums where available, and extracts files into `pdf_cache/`.
+Dataset 9 is excluded (community-reconstructed, cannot be verified against
+the DOJ original). Disk usage varies by dataset (~112 GB total for DS10 + DS11);
+the script checks available space before each download and aborts if less
+than 10% would remain free.
 
 ---
 
@@ -180,6 +224,7 @@ output/
 Each output PDF contains:
 - **Green highlights** — text recovered from another document version
 - **Yellow highlights** — the corresponding source passage in the donor document
+- **Orange highlights** — questionable recoveries (same text recovered 3+ times from different sources)
 - A metadata page listing source documents, recovery counts, and links to originals
 
 A cross-dataset entity summary (people, organizations, email addresses, phone
@@ -193,14 +238,26 @@ Edit `config.yaml` to adjust paths, thresholds, and redaction marker patterns:
 
 ```yaml
 output_dir: ./output
+cache_dir: ./pdf_cache
 db_path: ./data/unobfuscator.db
 
+workers:
+  pdf: 10                       # Parallel PDF processors
+  pdf_batch_size: 1000
+
 matching:
-  similarity_threshold: 0.70   # Jaccard similarity cutoff for LSH candidates
-  min_overlap_chars: 200       # Minimum common text to confirm a match
+  similarity_threshold: 0.70    # Jaccard similarity cutoff for LSH candidates
+  min_overlap_chars: 200        # Minimum common text to confirm a match
+  email_header_min_matches: 2   # Headers needed to group email chains
 
 polling:
   interval_minutes: 60
+
+ocr:
+  min_words_per_page: 50        # OCR quality filter
+
+memory:
+  limit_percent: 70             # RSS limit as % of total RAM
 ```
 
 ---
@@ -213,16 +270,21 @@ entity browser, and recovery timeline.
 
 ---
 
-## Data Source
+## Data Sources
 
-Document text and metadata are fetched read-only from the
+**Primary:** Document text and metadata are fetched read-only from the
 [Jmail API](https://jmail.world), which hosts the Epstein archive as Parquet
 files queryable via DuckDB. Original PDFs are fetched from justice.gov.
 
-For datasets not hosted on justice.gov, Unobfuscator falls back to
-[archive.org](https://archive.org) mirrors and community-hosted copies.
+**Fallback mirrors:** For datasets no longer hosted on justice.gov (bulk ZIP
+downloads were removed in Feb 2026), Unobfuscator uses
+[archive.org](https://archive.org) mirrors and
+[geeken.dev](https://justice.geeken.dev) community-hosted copies.
 All non-DOJ sources are tracked in `pdf_cache/provenance.json` with
 checksums and download timestamps.
+
+**Disaster recovery:** If the Jmail API is unavailable, the pipeline can
+rebuild from local PDFs using text layer extraction and OCR (Phase 5.5).
 
 ---
 
