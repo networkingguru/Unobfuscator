@@ -519,6 +519,12 @@ def _confirm_alignment_candidate(
     donor_region = donor_text[max(0, cand_pos - search_window):cand_pos + len(candidate) + search_window]
     norm_region = _normalize_for_anchor(donor_region)
 
+    # Quality floor: if combined context has < 4 alphanumeric chars after
+    # truncation, we can't meaningfully confirm — reject to avoid false positives
+    ctx_alpha = re.sub(r'[^a-zA-Z0-9]', '', left_ctx + right_ctx)
+    if len(ctx_alpha) < 4:
+        return False
+
     # Both non-empty anchors must match (AND, not OR) for zero false positives
     left_ok = (not left_ctx) or left_ctx in donor_region or _normalize_for_anchor(left_ctx) in norm_region
     right_ok = (not right_ctx) or right_ctx in donor_region or _normalize_for_anchor(right_ctx) in norm_region
@@ -664,7 +670,7 @@ In `merge_group`, wrap the anchor loop + alignment fallback in a multi-pass stru
                              pass_num + 1, pos, len(alpha_content))
                 continue
 
-            anchor_widths = [anchor_length, 100, 150, 200]
+            anchor_widths = sorted(set([anchor_length, 100, 150, 200]))
             recovered_this = False
             for width in anchor_widths:
                 if recovered_this:
