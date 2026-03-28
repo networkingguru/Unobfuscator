@@ -139,7 +139,7 @@ def test_merge_job_resets_group_and_reruns_merger(mock_text_batch, mock_meta, co
     """A pending 'merge' queue job causes the named group to be re-merged."""
     # Seed two documents with complementary text so the merger can recover a redaction.
     base_text = "The witness was [REDACTED] at the event."
-    donor_text = "The witness was Maxwell at the event."
+    donor_text = "The witness was Maxwell at the event. The date was [REDACTED]."
 
     for doc_id, text in ((20, base_text), (21, donor_text)):
         upsert_document(conn, {

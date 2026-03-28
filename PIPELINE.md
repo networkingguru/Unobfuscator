@@ -92,32 +92,29 @@ that documents with ≥70% overlap will share at least one bucket with
 
     FOR EACH match group with 2 or more members:
 
-      1. Pick the "base" document: the member with the most redaction markers.
+      1. Pick the "base" document:
+         - IF any member has 0 redaction markers AND similar text length
+           (within 3x): use the least-redacted member as base (reverse merge).
+           total_redacted is taken from the most-redacted member for reporting.
+         - OTHERWISE: use the member with the most redaction markers.
 
-      2. FOR EACH redaction marker in the base document:
-         a. Extract the 50 characters immediately BEFORE the marker ("left anchor")
-         b. Extract the 50 characters immediately AFTER the marker ("right anchor")
+      2. Multi-pass anchor matching (up to 3 passes, early exit on no progress):
+         FOR EACH redaction marker remaining in the merged text:
+           a. Extract anchors (left + right context around the marker).
+           b. Try progressively wider anchors: 50, 100, 150, 200 chars.
+           c. FOR EACH donor member, search for the anchor pair.
+              IF found uniquely: extract text between anchors as recovery.
+           d. Each pass uses the updated merged text (including prior recoveries)
+              as context, enabling chain walking through dense redaction blocks.
 
-         c. FOR EACH other member of the group:
-            Search for the left anchor in their text.
-            IF found:
-              Also search for the right anchor after that position.
-              IF right anchor also found:
-                Extract the text between those two anchor positions.
-                → This is the recovered text for this redaction.
-                → Record the source doc_id.
-                → STOP searching other members for this redaction.
+      3. Alignment fallback (after each anchor pass):
+         FOR EACH remaining unrecovered redaction:
+           a. Use difflib.SequenceMatcher on lines to align base and donor.
+           b. Read the aligned region from the donor as a candidate.
+           c. Confirm via anchor context (both left AND right must match).
+           d. Only accept if surrounding context validates the candidate.
 
-      3. Build merged_text:
-         Start with base document text.
-         Replace each redaction marker where recovery was successful
-         with the recovered text.
-
-      4. Store in merge_results:
-         - merged_text
-         - recovered_count (how many redaction gaps were filled)
-         - total_redacted (how many redaction gaps existed in base)
-         - source_doc_ids (which docs provided recovered text)
+      4. Build merged_text and store in merge_results.
 
 ---
 
