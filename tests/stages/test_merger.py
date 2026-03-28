@@ -614,3 +614,50 @@ def test_run_merger_stores_results_and_marks_group_merged(conn):
     assert row is not None
     assert row["merged"] == 1
     assert row["recovered_count"] >= 1
+
+
+def test_enhanced_merge_full_integration(conn):
+    """Exercise multiple techniques: no single member has complete text."""
+    # Member A: has names but locations redacted
+    member_a = (
+        "MEMORANDUM\nFrom: DOJ Office\nRe: Case Update\n\n"
+        "1. Subject John Smith was seen at [REDACTED] on March 10.\n"
+        "2. Witness Jane Doe confirmed John Smith was present at [REDACTED].\n"
+        "3. Captain James Lee transported John Smith via private aircraft.\n"
+        "4. Destination: [REDACTED]\n"
+    )
+    # Member B: has locations but names redacted
+    member_b = (
+        "MEMORANDUM\nFrom: DOJ Office\nRe: Case Update\n\n"
+        "1. Subject [REDACTED] was seen at Mar-a-Lago on March 10.\n"
+        "2. Witness [REDACTED] confirmed [REDACTED] was present at the Palm Beach estate.\n"
+        "3. [REDACTED] transported [REDACTED] via private aircraft.\n"
+        "4. Destination: Palm Beach International\n"
+    )
+    # Member C: complete text, structural variant (extra date line)
+    member_c = (
+        "MEMORANDUM\nFrom: DOJ Office\nDate: March 15, 2005\nRe: Case Update\n\n"
+        "1. Subject John Smith was seen at Mar-a-Lago on March 10.\n"
+        "2. Witness Jane Doe confirmed John Smith was present at the Palm Beach estate.\n"
+        "3. Captain James Lee transported John Smith via private aircraft.\n"
+        "4. Destination: Palm Beach International\n"
+    )
+    seed_doc(conn, 1, member_a)
+    seed_doc(conn, 2, member_b)
+    seed_doc(conn, 3, member_c)
+    conn.commit()
+    g = create_match_group(conn)
+    add_group_member(conn, g, 1, 1.0)
+    add_group_member(conn, g, 2, 0.85)
+    add_group_member(conn, g, 3, 0.80)
+    conn.commit()
+
+    result = merge_group(conn, g, REDACTION_MARKERS, anchor_length=50)
+    # Member C has 0 redactions — reverse merge uses it as base
+    assert "[REDACTED]" not in result["merged_text"]
+    assert "John Smith" in result["merged_text"]
+    assert "Mar-a-Lago" in result["merged_text"]
+    assert "Jane Doe" in result["merged_text"]
+    assert "Captain James Lee" in result["merged_text"]
+    assert "Palm Beach International" in result["merged_text"]
+    assert result["total_redacted"] >= 3
