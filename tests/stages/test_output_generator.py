@@ -120,9 +120,11 @@ def test_generate_output_pdf_marks_output_generated(conn, output_dir):
                         redaction_markers=["[REDACTED]"])
     conn.commit()
     row = conn.execute(
-        "SELECT output_generated FROM merge_results WHERE group_id = ?", (g,)
+        "SELECT output_generated, output_path FROM merge_results WHERE group_id = ?", (g,)
     ).fetchone()
     assert row["output_generated"] == 1
+    assert row["output_path"] is not None
+    assert row["output_path"].endswith("_merged.pdf")
 
 
 def test_metadata_page_includes_provenance_notice(conn, output_dir, tmp_path):

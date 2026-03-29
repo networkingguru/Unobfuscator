@@ -1,7 +1,11 @@
+import logging
+import os
 import sqlite3
 import json
 from pathlib import Path
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS documents (
@@ -54,7 +58,8 @@ CREATE TABLE IF NOT EXISTS merge_results (
     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     output_generated BOOLEAN DEFAULT 0,
     recovered_segments TEXT,
-    soft_recovered_count INTEGER DEFAULT 0
+    soft_recovered_count INTEGER DEFAULT 0,
+    output_path TEXT
 );
 
 CREATE TABLE IF NOT EXISTS release_batches (
@@ -189,20 +194,41 @@ def upsert_merge_result(conn, group_id: int, merged_text: str,
                         recovered_count: int, total_redacted: int,
                         source_doc_ids: list,
                         recovered_segments: list = None,
-                        soft_recovered_count: int = 0) -> None:
+                        soft_recovered_count: int = 0,
+                        output_path: str = None) -> None:
     existing = conn.execute(
-        "SELECT recovered_count FROM merge_results WHERE group_id = ?", (group_id,)
+        "SELECT recovered_count, output_generated FROM merge_results WHERE group_id = ?",
+        (group_id,)
     ).fetchone()
-    prev_count = existing["recovered_count"] if existing else 0
-    conn.execute("""
-        INSERT OR REPLACE INTO merge_results
-        (group_id, merged_text, recovered_count, previous_recovered_count,
-         total_redacted, source_doc_ids, recovered_segments,
-         soft_recovered_count, updated_at, output_generated)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, 0)
-    """, (group_id, merged_text, recovered_count, prev_count,
-          total_redacted, json.dumps(source_doc_ids),
-          json.dumps(recovered_segments or []), soft_recovered_count))
+    if existing:
+        prev_count = existing["recovered_count"]
+        # Preserve output_generated if recovered_count hasn't changed
+        if recovered_count == existing["recovered_count"]:
+            output_gen = existing["output_generated"]
+        else:
+            output_gen = 0
+        conn.execute("""
+            UPDATE merge_results SET
+                merged_text = ?, recovered_count = ?, previous_recovered_count = ?,
+                total_redacted = ?, source_doc_ids = ?, recovered_segments = ?,
+                soft_recovered_count = ?, output_path = COALESCE(?, output_path),
+                updated_at = CURRENT_TIMESTAMP, output_generated = ?
+            WHERE group_id = ?
+        """, (merged_text, recovered_count, prev_count,
+              total_redacted, json.dumps(source_doc_ids),
+              json.dumps(recovered_segments or []), soft_recovered_count,
+              output_path, output_gen, group_id))
+    else:
+        conn.execute("""
+            INSERT INTO merge_results
+            (group_id, merged_text, recovered_count, previous_recovered_count,
+             total_redacted, source_doc_ids, recovered_segments,
+             soft_recovered_count, output_path, updated_at, output_generated)
+            VALUES (?, ?, ?, 0, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, 0)
+        """, (group_id, merged_text, recovered_count,
+              total_redacted, json.dumps(source_doc_ids),
+              json.dumps(recovered_segments or []), soft_recovered_count,
+              output_path))
 
 
 def get_config(conn, key: str, default=None):
@@ -260,10 +286,10 @@ def get_documents_by_ids(conn, doc_ids: list[str]) -> list[dict]:
     return [by_id[sid] for sid in str_ids if sid in by_id]
 
 
-def mark_output_generated(conn, group_id: int) -> None:
+def mark_output_generated(conn, group_id: int, output_path: str = None) -> None:
     conn.execute(
-        "UPDATE merge_results SET output_generated = 1, updated_at = CURRENT_TIMESTAMP "
-        "WHERE group_id = ?", (group_id,)
+        "UPDATE merge_results SET output_generated = 1, output_path = COALESCE(?, output_path), "
+        "updated_at = CURRENT_TIMESTAMP WHERE group_id = ?", (output_path, group_id)
     )
 
 
@@ -341,6 +367,11 @@ def _migrate_text_recovery_columns(conn) -> None:
             conn.execute(f"ALTER TABLE documents ADD COLUMN {col} {typedef}")
         except Exception:
             pass
+    # Migrate merge_results for output_path column
+    try:
+        conn.execute("ALTER TABLE merge_results ADD COLUMN output_path TEXT")
+    except Exception:
+        pass
     conn.execute("""
         UPDATE documents SET text_source = 'jmail'
         WHERE extracted_text IS NOT NULL AND extracted_text != ''
@@ -385,3 +416,72 @@ def get_docs_needing_backfill(conn, known_batches: set, limit: int = 1000) -> li
         LIMIT ?
     """, (*known_batches, limit)).fetchall()
     return [dict(r) for r in rows]
+
+
+def cleanup_stale_outputs(conn) -> int:
+    """Remove output files for groups that no longer have recoveries.
+
+    Finds merge_results rows where recovered_count = 0 but output_generated = 1
+    or output_path is set. Deletes the PDF file if it exists, then resets the
+    output_generated flag and output_path.
+
+    Returns the count of cleaned-up entries.
+    """
+    rows = conn.execute("""
+        SELECT group_id, output_path FROM merge_results
+        WHERE recovered_count = 0
+          AND (output_generated = 1 OR output_path IS NOT NULL)
+    """).fetchall()
+    count = 0
+    for row in rows:
+        group_id = row["group_id"]
+        path = row["output_path"]
+        if path and os.path.exists(path):
+            try:
+                os.remove(path)
+                logger.info("Cleanup: deleted stale PDF for group %d: %s", group_id, path)
+            except OSError as e:
+                logger.warning("Cleanup: could not delete %s for group %d: %s", path, group_id, e)
+                continue
+        conn.execute("""
+            UPDATE merge_results
+            SET output_generated = 0, output_path = NULL, updated_at = CURRENT_TIMESTAMP
+            WHERE group_id = ?
+        """, (group_id,))
+        count += 1
+    if count:
+        logger.info("Cleanup: reset %d stale output entries", count)
+    return count
+
+
+def reconcile_output_dir(conn, output_dir: str) -> int:
+    """Delete orphan PDFs on disk that are not referenced by valid merge results.
+
+    Walks output_dir recursively for PDF files. Any PDF not in the set of
+    output_paths for groups with output_generated=1 and recovered_count > 0
+    is deleted.
+
+    Returns the count of deleted files.
+    """
+    valid_rows = conn.execute("""
+        SELECT output_path FROM merge_results
+        WHERE output_generated = 1 AND recovered_count > 0 AND output_path IS NOT NULL
+    """).fetchall()
+    valid_paths = {os.path.abspath(r["output_path"]) for r in valid_rows}
+
+    deleted = 0
+    output_root = Path(output_dir)
+    if not output_root.is_dir():
+        return 0
+    for pdf_path in output_root.rglob("*.pdf"):
+        abs_path = str(pdf_path.resolve())
+        if abs_path not in valid_paths:
+            try:
+                pdf_path.unlink()
+                logger.info("Reconcile: deleted orphan PDF %s", abs_path)
+                deleted += 1
+            except OSError as e:
+                logger.warning("Reconcile: could not delete %s: %s", abs_path, e)
+    if deleted:
+        logger.info("Reconcile: deleted %d orphan PDFs from %s", deleted, output_dir)
+    return deleted

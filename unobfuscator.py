@@ -22,7 +22,7 @@ from core.db import (
     get_pending_pdf_documents, get_documents_by_ids, reset_group_merged,
     set_config, get_config, get_unindexed_batch_ids, mark_batch_fully_indexed,
     mark_pdf_processed, append_soft_redaction_text, upsert_fingerprint,
-    get_doc_group, get_pending_output_groups
+    get_doc_group, get_pending_output_groups, cleanup_stale_outputs
 )
 from core.config import load_config, get as cfg_get
 from core.api import fetch_release_batches, fetch_person_document_ids
@@ -325,6 +325,12 @@ def _run_one_cycle(conn, cfg: dict) -> None:
     # Re-run merger only if groups were actually reset above.
     if remerge_needed and not _shutdown_requested:
         run_merger(conn, redaction_markers=markers)
+
+    if not _shutdown_requested:
+        stale = cleanup_stale_outputs(conn)
+        if stale:
+            logger.info("Cleanup: removed %d stale output entries after merge", stale)
+        conn.commit()
 
     if not _shutdown_requested:
         num_workers = cfg_get(cfg, "workers.pdf", default=10)
@@ -634,12 +640,20 @@ def status(ctx, doc):
     fps = conn.execute("SELECT COUNT(*) FROM document_fingerprints").fetchone()[0]
 
     merge_stats = conn.execute("""
-        SELECT COUNT(*),
-               SUM(CASE WHEN output_generated=1 THEN 1 ELSE 0 END),
+        SELECT SUM(CASE WHEN output_generated=1 THEN 1 ELSE 0 END),
                COALESCE(SUM(recovered_count), 0)
         FROM merge_results
     """).fetchone()
-    groups, output_count, recovered = (v or 0 for v in merge_stats)
+    output_count, recovered = (v or 0 for v in merge_stats)
+    merger_stats = conn.execute("""
+        SELECT SUM(CASE WHEN mg.merged=1 THEN 1 ELSE 0 END),
+               COUNT(*)
+        FROM match_groups mg
+        JOIN (SELECT group_id FROM match_group_members
+              GROUP BY group_id HAVING COUNT(*) >= 2) multi
+          ON mg.group_id = multi.group_id
+    """).fetchone()
+    groups_merged, groups_total = (v or 0 for v in merger_stats)
 
     text_sources = conn.execute(
         "SELECT text_source, COUNT(*) FROM documents "
@@ -673,7 +687,7 @@ def status(ctx, doc):
     t.add_row("Stage 2 Matcher", matcher_detail)
     if lsh_warning:
         t.add_row("LSH Warning", f"[yellow]{lsh_warning}[/yellow]")
-    t.add_row("Stage 3 Merger", f"{groups:,} groups merged")
+    t.add_row("Stage 3 Merger", f"{groups_merged:,} / {groups_total:,} groups merged")
     t.add_row("Stage 4 PDF Processor", f"{pdf_done:,} / {pdf_total:,} PDFs done")
     t.add_row("Text Recovery", f"{ocr_done:,} processed, {ocr_pending:,} pending")
     if source_str:

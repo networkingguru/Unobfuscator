@@ -9,7 +9,8 @@ from core.db import (
 )
 from core.db import (
     get_docs_needing_text_recovery, get_docs_needing_backfill,
-    update_extracted_text, mark_ocr_processed
+    update_extracted_text, mark_ocr_processed,
+    mark_output_generated, cleanup_stale_outputs, reconcile_output_dir
 )
 
 
@@ -230,6 +231,88 @@ def test_migration_sets_text_source_for_existing_docs(conn):
     conn.commit()
     row = conn.execute("SELECT text_source FROM documents WHERE id = ?", (SAMPLE_DOC["id"],)).fetchone()
     assert row["text_source"] == "jmail"
+
+
+def test_upsert_merge_result_preserves_output_generated_when_count_unchanged(conn):
+    """output_generated should not reset when recovered_count stays the same."""
+    g = create_match_group(conn)
+    conn.commit()
+    upsert_merge_result(conn, g, "text", 3, 5, [1, 2])
+    conn.commit()
+    mark_output_generated(conn, g, output_path="/tmp/test.pdf")
+    conn.commit()
+    # Re-upsert with same recovered_count
+    upsert_merge_result(conn, g, "text v2", 3, 5, [1, 2])
+    conn.commit()
+    row = conn.execute(
+        "SELECT output_generated, output_path FROM merge_results WHERE group_id = ?", (g,)
+    ).fetchone()
+    assert row["output_generated"] == 1
+    assert row["output_path"] == "/tmp/test.pdf"
+
+
+def test_upsert_merge_result_resets_output_generated_when_count_changes(conn):
+    """output_generated must reset when recovered_count changes."""
+    g = create_match_group(conn)
+    conn.commit()
+    upsert_merge_result(conn, g, "text", 3, 5, [1, 2])
+    conn.commit()
+    mark_output_generated(conn, g, output_path="/tmp/test.pdf")
+    conn.commit()
+    # Re-upsert with different recovered_count
+    upsert_merge_result(conn, g, "text v2", 5, 5, [1, 2])
+    conn.commit()
+    row = conn.execute(
+        "SELECT output_generated, output_path FROM merge_results WHERE group_id = ?", (g,)
+    ).fetchone()
+    assert row["output_generated"] == 0
+
+
+def test_cleanup_stale_outputs_deletes_files(conn, tmp_path):
+    """cleanup_stale_outputs should delete PDFs for groups with 0 recoveries."""
+    g = create_match_group(conn)
+    conn.commit()
+    pdf = tmp_path / "stale.pdf"
+    pdf.write_text("fake pdf")
+    upsert_merge_result(conn, g, "text", 1, 5, [1], output_path=str(pdf))
+    conn.commit()
+    mark_output_generated(conn, g, output_path=str(pdf))
+    conn.commit()
+    # Simulate recovery dropping to 0
+    upsert_merge_result(conn, g, "text", 0, 5, [1], output_path=str(pdf))
+    conn.commit()
+    # output_generated should have been reset since count changed (1 -> 0)
+    # but output_path is still set
+    cleaned = cleanup_stale_outputs(conn)
+    conn.commit()
+    assert cleaned == 1
+    assert not pdf.exists()
+    row = conn.execute(
+        "SELECT output_generated, output_path FROM merge_results WHERE group_id = ?", (g,)
+    ).fetchone()
+    assert row["output_generated"] == 0
+    assert row["output_path"] is None
+
+
+def test_reconcile_output_dir_removes_orphan_pdfs(conn, tmp_path):
+    """reconcile_output_dir should delete PDFs not referenced by valid groups."""
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    # Create orphan PDF
+    orphan = output_dir / "orphan.pdf"
+    orphan.write_text("orphan")
+    # Create valid PDF with matching DB entry
+    valid = output_dir / "valid.pdf"
+    valid.write_text("valid")
+    g = create_match_group(conn)
+    conn.commit()
+    upsert_merge_result(conn, g, "text", 2, 5, [1])
+    mark_output_generated(conn, g, output_path=str(valid))
+    conn.commit()
+    deleted = reconcile_output_dir(conn, str(output_dir))
+    assert deleted == 1
+    assert not orphan.exists()
+    assert valid.exists()
 
 
 def test_busy_timeout_is_30000ms(db_path):

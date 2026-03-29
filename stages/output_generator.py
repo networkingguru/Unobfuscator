@@ -282,7 +282,7 @@ def generate_output_pdf(
     finally:
         pdf.close()
 
-    mark_output_generated(conn, group_id)
+    mark_output_generated(conn, group_id, output_path=output_path)
     return output_path
 
 
