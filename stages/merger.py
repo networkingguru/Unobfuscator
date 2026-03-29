@@ -3,6 +3,7 @@
 Logic reference: PIPELINE.md — Phase 4 (Merging)
 """
 
+import bisect
 import logging
 import re
 from typing import Optional
@@ -263,7 +264,7 @@ def _alignment_recover(
 
     Returns dict mapping redaction position -> (candidate text, donor_line_char_offset).
     The donor_line_char_offset enables positional confirmation instead of global search.
-    Works on lines for O(n) performance (handles 200KB+ docs in <20ms).
+    Works on lines with O(P log L) position mapping via bisect.
     """
     from difflib import SequenceMatcher
 
@@ -283,14 +284,12 @@ def _alignment_recover(
         donor_offsets.append(offset)
         offset += len(line)
 
-    # Map each redaction position to its line index
+    # Map each redaction position to its line index (O(P log L) via bisect)
     pos_to_line = {}
     for pos, marker in positions:
-        for i, line_offset in enumerate(base_offsets):
-            line_end = line_offset + len(base_lines[i])
-            if line_offset <= pos < line_end:
-                pos_to_line[pos] = i
-                break
+        line_idx = bisect.bisect_right(base_offsets, pos) - 1
+        if 0 <= line_idx < len(base_lines) and pos < base_offsets[line_idx] + len(base_lines[line_idx]):
+            pos_to_line[pos] = line_idx
 
     # Align lines
     sm = SequenceMatcher(None, base_lines, donor_lines)
