@@ -36,3 +36,19 @@ def test_get_returns_default_for_missing_key(config_file):
 def test_load_config_raises_on_missing_file():
     with pytest.raises(FileNotFoundError):
         load_config("/nonexistent/config.yaml")
+
+
+def test_resolve_cache_dir_reads_from_config(tmp_path, monkeypatch):
+    from core import config as config_module
+    cfg = {"cache_dir": "./my_custom_cache"}
+    (tmp_path / "config.yaml").write_text(yaml.dump(cfg))
+    monkeypatch.setattr(config_module, "_PROJECT_ROOT", tmp_path)
+    result = config_module._resolve_cache_dir()
+    assert result == tmp_path / "my_custom_cache"
+
+
+def test_resolve_cache_dir_falls_back_without_config(tmp_path, monkeypatch):
+    from core import config as config_module
+    monkeypatch.setattr(config_module, "_PROJECT_ROOT", tmp_path)
+    result = config_module._resolve_cache_dir()
+    assert result == tmp_path / "pdf_cache"
