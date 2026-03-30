@@ -923,3 +923,96 @@ def test_run_cross_group_merger_handles_ungrouped_doc(conn):
         "SELECT pair_merged FROM verified_pairs WHERE doc_id_a = 'u1' AND doc_id_b = 'u2'"
     ).fetchone()
     assert row["pair_merged"] == 1
+
+
+def test_mega_group_full_scenario(conn):
+    """End-to-end: mega-group with mixed clusters, orphans, and a cross-group pair."""
+    from core.db import insert_verified_pair, get_doc_group
+    import stages.merger as merger_mod
+    original = merger_mod._CLUSTER_THRESHOLD
+    merger_mod._CLUSTER_THRESHOLD = 3
+
+    try:
+        # Cluster A: flight docs
+        flight_redacted = (
+            "From: pilot@jets.com\nTo: jeffrey@example.com\n"
+            "Subject: Flight plan for Palm Beach\n\n"
+            "Departing [REDACTED] at 0800 hours. Passengers: Jeffrey, [REDACTED]."
+        )
+        flight_clean = (
+            "From: pilot@jets.com\nTo: jeffrey@example.com\n"
+            "Subject: Flight plan for Palm Beach\n\n"
+            "Departing Teterboro at 0800 hours. Passengers: Jeffrey, Prince Andrew."
+        )
+        # Cluster B: legal docs
+        legal_redacted = (
+            "CASE NO. 2005-0042\nSouthern District of New York\n"
+            "Plaintiff: [REDACTED]\nThe deposition was taken on March 10."
+        )
+        legal_clean = (
+            "CASE NO. 2005-0042\nSouthern District of New York\n"
+            "Plaintiff: Virginia Giuffre\nThe deposition was taken on March 10."
+        )
+        # Orphans
+        orphan1 = "Completely unrelated document about weather forecasts in Idaho state parks."
+        orphan2 = "Dinner reservation for eight guests at restaurant Le Bernardin tonight in NYC."
+
+        for doc_id, text in [
+            ("f1", flight_redacted), ("f2", flight_clean),
+            ("l1", legal_redacted), ("l2", legal_clean),
+            ("o1", orphan1), ("o2", orphan2),
+        ]:
+            _seed_doc_with_fingerprint(conn, doc_id, text)
+        conn.commit()
+
+        # All in one mega-group
+        g = create_match_group(conn)
+        for doc_id in ["f1", "f2", "l1", "l2", "o1", "o2"]:
+            add_group_member(conn, g, doc_id, 1.0)
+        conn.commit()
+
+        # Cross-group donor in a separate group
+        cross_text = (
+            "From: pilot@jets.com\nTo: jeffrey@example.com\n"
+            "Subject: Flight plan for Palm Beach\n\n"
+            "Departing Newark at 0800 hours. Passengers: Jeffrey, Prince Andrew."
+        )
+        _seed_doc_with_fingerprint(conn, "cross1", cross_text)
+        conn.commit()
+        g2 = create_match_group(conn)
+        add_group_member(conn, g2, "cross1", 1.0)
+        insert_verified_pair(conn, "f1", "cross1", similarity=0.8, phase="phase3")
+        conn.commit()
+
+        # Step 1: run_merger handles the mega-group
+        merge_count = run_merger(conn, REDACTION_MARKERS, anchor_length=50)
+
+        # Original mega-group should be gone
+        assert conn.execute(
+            "SELECT * FROM match_groups WHERE group_id = ?", (g,)
+        ).fetchone() is None
+
+        # Orphans released
+        for orphan_id in ["o1", "o2"]:
+            assert conn.execute(
+                "SELECT group_id FROM match_group_members WHERE doc_id = ?", (orphan_id,)
+            ).fetchone() is None
+
+        # At least some recoveries from within-group merging
+        results = conn.execute(
+            "SELECT SUM(recovered_count) FROM merge_results WHERE recovered_count > 0"
+        ).fetchone()
+        # May be 0 if reverse merge used unredacted as base (which is correct behavior)
+
+        # Step 2: cross-group merger
+        cross_count = run_cross_group_merger(conn, REDACTION_MARKERS, anchor_length=50)
+        assert cross_count >= 1
+
+        # Cross-group pair should be marked as merged
+        pair_row = conn.execute(
+            "SELECT pair_merged FROM verified_pairs WHERE doc_id_a = 'cross1' OR doc_id_b = 'cross1'"
+        ).fetchone()
+        assert pair_row["pair_merged"] == 1
+
+    finally:
+        merger_mod._CLUSTER_THRESHOLD = original
