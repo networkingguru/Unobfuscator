@@ -47,6 +47,21 @@ CREATE TABLE IF NOT EXISTS match_group_members (
     PRIMARY KEY (group_id, doc_id)
 );
 
+CREATE TABLE IF NOT EXISTS verified_pairs (
+    doc_id_a TEXT NOT NULL REFERENCES documents(id),
+    doc_id_b TEXT NOT NULL REFERENCES documents(id),
+    similarity REAL,
+    phase TEXT NOT NULL,
+    pair_merged BOOLEAN DEFAULT 0,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (doc_id_a, doc_id_b),
+    CHECK (doc_id_a < doc_id_b)
+);
+
+CREATE INDEX IF NOT EXISTS idx_verified_pairs_doc_a ON verified_pairs(doc_id_a);
+CREATE INDEX IF NOT EXISTS idx_verified_pairs_doc_b ON verified_pairs(doc_id_b);
+CREATE INDEX IF NOT EXISTS idx_verified_pairs_unmerged ON verified_pairs(pair_merged) WHERE pair_merged = 0;
+
 CREATE TABLE IF NOT EXISTS merge_results (
     group_id INTEGER PRIMARY KEY REFERENCES match_groups(group_id),
     merged_text TEXT,
@@ -188,6 +203,63 @@ def merge_groups(conn, group_id_keep: int, group_id_remove: int) -> None:
     # Reset merged flag so the kept group is re-merged with all members
     conn.execute("UPDATE match_groups SET merged = 0 WHERE group_id = ?",
                  (group_id_keep,))
+
+
+def insert_verified_pair(conn, doc_a: str, doc_b: str, similarity: float, phase: str) -> None:
+    """Record a verified document pair. Order is normalized (a < b)."""
+    a, b = (str(doc_a), str(doc_b)) if str(doc_a) < str(doc_b) else (str(doc_b), str(doc_a))
+    conn.execute("""
+        INSERT OR IGNORE INTO verified_pairs (doc_id_a, doc_id_b, similarity, phase)
+        VALUES (?, ?, ?, ?)
+    """, (a, b, similarity, phase))
+
+
+def get_verified_pairs_for_doc(conn, doc_id: str) -> list[dict]:
+    """Return all verified pairs involving a document."""
+    rows = conn.execute("""
+        SELECT * FROM verified_pairs
+        WHERE doc_id_a = ? OR doc_id_b = ?
+    """, (str(doc_id), str(doc_id))).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_cross_group_pairs(conn) -> list[dict]:
+    """Return verified pairs where docs are in different groups or one is ungrouped."""
+    rows = conn.execute("""
+        SELECT vp.*, ma.group_id AS group_a, mb.group_id AS group_b
+        FROM verified_pairs vp
+        LEFT JOIN match_group_members ma ON ma.doc_id = vp.doc_id_a
+        LEFT JOIN match_group_members mb ON mb.doc_id = vp.doc_id_b
+        WHERE ma.group_id IS NULL OR mb.group_id IS NULL
+           OR ma.group_id != mb.group_id
+    """).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_unmerged_cross_group_pairs(conn) -> list[dict]:
+    """Return unmerged verified pairs where docs are in different groups OR one is ungrouped.
+
+    Uses LEFT JOINs so pairs where one doc is ungrouped (no match_group_members row)
+    are also returned. group_a/group_b will be NULL for ungrouped docs.
+    """
+    rows = conn.execute("""
+        SELECT vp.*, ma.group_id AS group_a, mb.group_id AS group_b
+        FROM verified_pairs vp
+        LEFT JOIN match_group_members ma ON ma.doc_id = vp.doc_id_a
+        LEFT JOIN match_group_members mb ON mb.doc_id = vp.doc_id_b
+        WHERE vp.pair_merged = 0
+          AND (ma.group_id IS NULL OR mb.group_id IS NULL
+               OR ma.group_id != mb.group_id)
+    """).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_group_member_count(conn, group_id: int) -> int:
+    """Return the number of members in a match group."""
+    row = conn.execute(
+        "SELECT COUNT(*) FROM match_group_members WHERE group_id = ?", (group_id,)
+    ).fetchone()
+    return row[0]
 
 
 def upsert_merge_result(conn, group_id: int, merged_text: str,
@@ -370,6 +442,24 @@ def _migrate_text_recovery_columns(conn) -> None:
     # Migrate merge_results for output_path column
     try:
         conn.execute("ALTER TABLE merge_results ADD COLUMN output_path TEXT")
+    except Exception:
+        pass
+    try:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS verified_pairs (
+                doc_id_a TEXT NOT NULL,
+                doc_id_b TEXT NOT NULL,
+                similarity REAL,
+                phase TEXT NOT NULL,
+                pair_merged BOOLEAN DEFAULT 0,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (doc_id_a, doc_id_b),
+                CHECK (doc_id_a < doc_id_b)
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_verified_pairs_doc_a ON verified_pairs(doc_id_a)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_verified_pairs_doc_b ON verified_pairs(doc_id_b)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_verified_pairs_unmerged ON verified_pairs(pair_merged) WHERE pair_merged = 0")
     except Exception:
         pass
     conn.execute("""

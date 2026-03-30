@@ -12,6 +12,10 @@ from core.db import (
     update_extracted_text, mark_ocr_processed,
     mark_output_generated, cleanup_stale_outputs, reconcile_output_dir
 )
+from core.db import (
+    insert_verified_pair, get_verified_pairs_for_doc,
+    get_cross_group_pairs, get_unmerged_cross_group_pairs,
+)
 
 
 @pytest.fixture
@@ -321,3 +325,87 @@ def test_busy_timeout_is_30000ms(db_path):
     row = conn.execute("PRAGMA busy_timeout").fetchone()
     assert row[0] == 30000
     conn.close()
+
+
+def test_insert_verified_pair_stores_record(conn):
+    for i in [1, 2]:
+        upsert_document(conn, {**SAMPLE_DOC, "id": i, "original_filename": f"{i}.pdf"})
+    conn.commit()
+    insert_verified_pair(conn, "1", "2", similarity=0.85, phase="phase3")
+    conn.commit()
+    pairs = get_verified_pairs_for_doc(conn, "1")
+    assert len(pairs) == 1
+    assert pairs[0]["doc_id_a"] == "1"
+    assert pairs[0]["doc_id_b"] == "2"
+    assert pairs[0]["similarity"] == 0.85
+    assert pairs[0]["phase"] == "phase3"
+
+
+def test_insert_verified_pair_normalizes_order(conn):
+    """doc_id_a < doc_id_b regardless of insertion order."""
+    for i in [1, 2]:
+        upsert_document(conn, {**SAMPLE_DOC, "id": i, "original_filename": f"{i}.pdf"})
+    conn.commit()
+    insert_verified_pair(conn, "2", "1", similarity=0.9, phase="phase0")
+    conn.commit()
+    pairs = get_verified_pairs_for_doc(conn, "1")
+    assert pairs[0]["doc_id_a"] == "1"
+    assert pairs[0]["doc_id_b"] == "2"
+
+
+def test_insert_verified_pair_ignores_duplicate(conn):
+    for i in [1, 2]:
+        upsert_document(conn, {**SAMPLE_DOC, "id": i, "original_filename": f"{i}.pdf"})
+    conn.commit()
+    insert_verified_pair(conn, "1", "2", similarity=0.85, phase="phase3")
+    insert_verified_pair(conn, "1", "2", similarity=0.90, phase="phase3")
+    conn.commit()
+    pairs = get_verified_pairs_for_doc(conn, "1")
+    assert len(pairs) == 1
+
+
+def test_get_cross_group_pairs_finds_pairs_in_different_groups(conn):
+    for i in [1, 2]:
+        upsert_document(conn, {**SAMPLE_DOC, "id": i, "original_filename": f"{i}.pdf"})
+    conn.commit()
+    g1 = create_match_group(conn)
+    g2 = create_match_group(conn)
+    add_group_member(conn, g1, "1", 1.0)
+    add_group_member(conn, g2, "2", 1.0)
+    insert_verified_pair(conn, "1", "2", similarity=0.85, phase="phase3")
+    conn.commit()
+    pairs = get_cross_group_pairs(conn)
+    assert len(pairs) == 1
+    assert pairs[0]["doc_id_a"] == "1"
+    assert pairs[0]["doc_id_b"] == "2"
+
+
+def test_get_cross_group_pairs_includes_ungrouped_doc(conn):
+    """Pairs where one doc is ungrouped should still be returned."""
+    for i in [1, 2]:
+        upsert_document(conn, {**SAMPLE_DOC, "id": i, "original_filename": f"{i}.pdf"})
+    conn.commit()
+    g1 = create_match_group(conn)
+    add_group_member(conn, g1, "1", 1.0)
+    insert_verified_pair(conn, "1", "2", similarity=0.85, phase="match")
+    conn.commit()
+    pairs = get_unmerged_cross_group_pairs(conn)
+    assert len(pairs) == 1
+    assert pairs[0]["group_a"] is not None
+    assert pairs[0]["group_b"] is None
+
+
+def test_get_unmerged_cross_group_pairs_excludes_merged(conn):
+    for i in [1, 2]:
+        upsert_document(conn, {**SAMPLE_DOC, "id": i, "original_filename": f"{i}.pdf"})
+    conn.commit()
+    g1 = create_match_group(conn)
+    g2 = create_match_group(conn)
+    add_group_member(conn, g1, "1", 1.0)
+    add_group_member(conn, g2, "2", 1.0)
+    insert_verified_pair(conn, "1", "2", similarity=0.85, phase="phase3")
+    conn.commit()
+    conn.execute("UPDATE verified_pairs SET pair_merged = 1 WHERE doc_id_a = '1' AND doc_id_b = '2'")
+    conn.commit()
+    pairs = get_unmerged_cross_group_pairs(conn)
+    assert len(pairs) == 0
