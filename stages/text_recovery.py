@@ -210,8 +210,10 @@ def _process_single_doc(conn, doc: dict, redaction_markers: list[str],
         return True
 
     if not _is_tesseract_available():
-        logger.warning("Tesseract not installed — skipping OCR for %s", doc_id)
-        mark_ocr_processed(conn, doc_id)
+        logger.warning("Tesseract not installed — skipping OCR for %s (will retry when available)", doc_id)
+        # Do NOT mark as processed — leave ocr_processed=0 so the pipeline
+        # retries when tesseract is installed. Previously this called
+        # mark_ocr_processed(), permanently losing 64K docs' OCR opportunity.
         return False
 
     try:

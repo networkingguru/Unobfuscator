@@ -103,12 +103,21 @@ pandas
 ## Installation
 
 ```bash
+# System dependencies (Ubuntu/Debian)
+sudo apt-get install tesseract-ocr
+
+# macOS
+# brew install tesseract
+
 git clone https://github.com/networkingguru/Unobfuscator.git
 cd Unobfuscator
 python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
 ```
+
+> **Note:** Tesseract is required for OCR of scanned documents (~4.6% of the corpus).
+> Without it, the pipeline runs but those documents will have no text and cannot be matched.
 
 ### Optional: download the local dataset archive
 
