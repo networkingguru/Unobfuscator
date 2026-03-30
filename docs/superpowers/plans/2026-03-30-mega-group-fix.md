@@ -355,7 +355,7 @@ _MERGE_SIZE_LIMIT = 1000
 Replace `_assign_to_group()` at lines 732-748 with:
 
 ```python
-def _assign_to_group(conn, doc_a, doc_b, similarity: float) -> None:
+def _assign_to_group(conn, doc_a: str, doc_b: str, similarity: float) -> None:
     """Assign two documents to a shared match group.
 
     When both docs are already in different groups and either group exceeds
@@ -1130,40 +1130,48 @@ def run_cross_group_merger(
             ).fetchone()
 
             if existing and existing["merged_text"]:
-                # Apply cross-group recovered segments to the EXISTING merged_text
-                # (not the 2-doc result's merged_text, which would lose prior recoveries)
+                # Apply cross-group recoveries to the EXISTING merged_text.
+                # Iterate remaining redaction positions in reverse order and
+                # use anchor matching against the cross-group donor text
+                # (same logic as merge_group's anchor loop).
                 updated_text = existing["merged_text"]
-                new_segments = result.get("recovered_segments", [])
+                donor_text = text_b if count_a >= count_b else text_a  # the less-redacted doc
                 applied_count = 0
-                for seg in new_segments:
-                    # Try to find and replace the redaction in existing text
-                    for marker in redaction_markers:
-                        left_a, right_a = extract_anchors(
-                            updated_text,
-                            updated_text.find(marker) if marker in updated_text else -1,
-                            len(marker), anchor_length, redaction_markers
-                        )
-                        recovered = find_text_between_anchors(
-                            result["merged_text"], left_a, right_a
-                        )
-                        if recovered and _is_real_recovery(recovered, redaction_markers):
-                            pos = updated_text.find(marker)
-                            if pos >= 0:
-                                updated_text = updated_text[:pos] + recovered + updated_text[pos + len(marker):]
-                                applied_count += 1
-                                break
+                new_segments = []
 
-                prior_sources = json.loads(existing["source_doc_ids"]) if existing["source_doc_ids"] else []
-                prior_segments = json.loads(existing["recovered_segments"]) if existing["recovered_segments"] else []
-                new_sources = [s for s in result["source_doc_ids"] if s not in prior_sources]
-                upsert_merge_result(
-                    conn, target_group,
-                    updated_text,
-                    existing["recovered_count"] + applied_count,
-                    existing["total_redacted"],
-                    prior_sources + new_sources,
-                    recovered_segments=prior_segments + new_segments,
-                )
+                positions = find_redaction_positions(updated_text, redaction_markers)
+                for pos, marker in reversed(positions):
+                    left_anchor, right_anchor = extract_anchors(
+                        updated_text, pos, len(marker), anchor_length, redaction_markers
+                    )
+                    alpha_content = re.sub(r'[^a-zA-Z0-9]', '', left_anchor + right_anchor)
+                    if len(alpha_content) < 8:
+                        continue
+                    recovered = find_text_between_anchors(donor_text, left_anchor, right_anchor)
+                    if recovered and _is_real_recovery(recovered, redaction_markers):
+                        updated_text = updated_text[:pos] + recovered + updated_text[pos + len(marker):]
+                        applied_count += 1
+                        new_segments.append({
+                            "text": recovered,
+                            "source_doc_id": doc_b_id if count_a >= count_b else doc_a_id,
+                            "stage": "cross_group",
+                            "confidence": "high",
+                            "anchor_alpha_len": len(alpha_content),
+                        })
+
+                if applied_count > 0:
+                    prior_sources = json.loads(existing["source_doc_ids"]) if existing["source_doc_ids"] else []
+                    prior_segments = json.loads(existing["recovered_segments"]) if existing["recovered_segments"] else []
+                    donor_id = doc_b_id if count_a >= count_b else doc_a_id
+                    new_sources = [donor_id] if donor_id not in prior_sources else []
+                    upsert_merge_result(
+                        conn, target_group,
+                        updated_text,
+                        existing["recovered_count"] + applied_count,
+                        existing["total_redacted"],
+                        prior_sources + new_sources,
+                        recovered_segments=prior_segments + new_segments,
+                    )
             else:
                 # No prior merge result — use the 2-doc result directly
                 upsert_merge_result(
