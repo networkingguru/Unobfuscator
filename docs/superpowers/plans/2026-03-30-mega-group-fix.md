@@ -249,7 +249,7 @@ git commit -m "feat: add verified_pairs table for cross-group pair tracking"
 - Modify: `tests/stages/test_matcher.py:438-456`
 - Test: `tests/stages/test_matcher.py`
 
-**Design note:** Small groups (both below `_MERGE_SIZE_LIMIT = 1000`) still merge normally via `merge_groups()`. This preserves Phase 0/3 grouping semantics for the 99.8% of groups that have <100 members. Only when a merge would create or enlarge a mega-group does it record a verified pair instead.
+**Design note:** Small groups (both below `_MERGE_SIZE_LIMIT = 500`) still merge normally via `merge_groups()`. This preserves Phase 0/3 grouping semantics for the 99.8% of groups that have <100 members. Only when a merge would create or enlarge a mega-group does it record a verified pair instead.
 
 - [ ] **Step 1: Write failing tests for the new behavior**
 
@@ -308,6 +308,35 @@ def test_assign_to_group_still_merges_small_groups(conn):
     assert get_doc_group(conn, "a") == get_doc_group(conn, "b")
 
 
+def test_assign_to_group_blocks_add_when_group_exceeds_limit(conn):
+    """When one doc is ungrouped but the other's group exceeds limit, create new group."""
+    seed_doc(conn, "a", "text a")
+    seed_doc(conn, "b", "text b")
+    g1 = create_match_group(conn)
+    add_group_member(conn, g1, "a", 1.0)
+    conn.commit()
+
+    import stages.matcher as matcher_mod
+    original = matcher_mod._MERGE_SIZE_LIMIT
+    matcher_mod._MERGE_SIZE_LIMIT = 1  # any group with >=1 member triggers the guard
+    try:
+        _assign_to_group(conn, "a", "b", similarity=0.85)
+        conn.commit()
+
+        # doc_b should be in a DIFFERENT group from doc_a
+        group_a = get_doc_group(conn, "a")
+        group_b = get_doc_group(conn, "b")
+        assert group_a == g1
+        assert group_b is not None
+        assert group_b != g1
+
+        # A verified pair should be recorded
+        pairs = get_verified_pairs_for_doc(conn, "a")
+        assert len(pairs) == 1
+    finally:
+        matcher_mod._MERGE_SIZE_LIMIT = original
+
+
 def test_assign_to_group_still_adds_to_existing_group(conn):
     """When only one doc is grouped, add the other to that group (unchanged)."""
     seed_doc(conn, "a", "text a")
@@ -349,7 +378,7 @@ Add the size limit constant near the top of `matcher.py` (after line 36):
 # Maximum group size before merge_groups() is blocked. Groups at or above
 # this size will record a verified_pair instead of merging, preventing
 # the transitive chaining that creates mega-groups (82K+ members).
-_MERGE_SIZE_LIMIT = 1000
+_MERGE_SIZE_LIMIT = 500
 ```
 
 Replace `_assign_to_group()` at lines 732-748 with:
@@ -379,9 +408,23 @@ def _assign_to_group(conn, doc_a: str, doc_b: str, similarity: float) -> None:
                 merge_groups(conn, group_a, group_b)
         # else: same group, nothing to do
     elif group_a is not None:
-        add_group_member(conn, group_a, doc_b, similarity)
+        size_a = get_group_member_count(conn, group_a)
+        if size_a >= _MERGE_SIZE_LIMIT:
+            # Group is too large — create a new group for doc_b instead
+            new_group = create_match_group(conn)
+            add_group_member(conn, new_group, doc_b, similarity)
+            insert_verified_pair(conn, doc_a, doc_b, similarity, phase="match")
+        else:
+            add_group_member(conn, group_a, doc_b, similarity)
     elif group_b is not None:
-        add_group_member(conn, group_b, doc_a, similarity)
+        size_b = get_group_member_count(conn, group_b)
+        if size_b >= _MERGE_SIZE_LIMIT:
+            # Group is too large — create a new group for doc_a instead
+            new_group = create_match_group(conn)
+            add_group_member(conn, new_group, doc_a, similarity)
+            insert_verified_pair(conn, doc_a, doc_b, similarity, phase="match")
+        else:
+            add_group_member(conn, group_b, doc_a, similarity)
     else:
         new_group = create_match_group(conn)
         add_group_member(conn, new_group, doc_a, 1.0)
@@ -1061,130 +1104,75 @@ def run_cross_group_merger(
             count += 1
             continue
 
-        # Temporarily move docs into a 2-member temp group to run the full
-        # merge_group() pipeline. Protected by SAVEPOINT so a crash during the
-        # swap doesn't permanently orphan docs.
-        conn.execute("SAVEPOINT cross_merge")
-        try:
-            # Save original group memberships
-            orig_a = conn.execute(
-                "SELECT group_id, similarity FROM match_group_members WHERE doc_id = ?",
-                (doc_a_id,)
-            ).fetchone()
-            orig_b = conn.execute(
-                "SELECT group_id, similarity FROM match_group_members WHERE doc_id = ?",
-                (doc_b_id,)
-            ).fetchone()
+        # Direct anchor matching — no temp groups, no SAVEPOINT needed.
+        # Use the more-redacted doc's text (or existing merged_text) as base,
+        # the less-redacted doc's text as donor.
+        if count_a >= count_b:
+            base_id, donor_id = doc_a_id, doc_b_id
+            donor_text = text_b
+            target_group = group_a
+        else:
+            base_id, donor_id = doc_b_id, doc_a_id
+            donor_text = text_a
+            target_group = group_b
 
-            # Create temp group and move docs into it
-            temp_gid = conn.execute("INSERT INTO match_groups (merged) VALUES (0)").lastrowid
-            conn.execute(
-                "UPDATE match_group_members SET group_id = ? WHERE doc_id = ?",
-                (temp_gid, doc_a_id)
+        # Use existing merged_text as base if available (it may have prior recoveries)
+        existing = conn.execute(
+            "SELECT merged_text, recovered_count, total_redacted, "
+            "source_doc_ids, recovered_segments FROM merge_results WHERE group_id = ?",
+            (target_group,)
+        ).fetchone()
+
+        if existing and existing["merged_text"]:
+            base_text = existing["merged_text"]
+            prior_count = existing["recovered_count"]
+            prior_total = existing["total_redacted"]
+            prior_sources = json.loads(existing["source_doc_ids"]) if existing["source_doc_ids"] else []
+            prior_segments = json.loads(existing["recovered_segments"]) if existing["recovered_segments"] else []
+        else:
+            base_text = text_a if count_a >= count_b else text_b
+            prior_count = 0
+            prior_total = len(find_redaction_positions(base_text, redaction_markers))
+            prior_sources = [base_id]
+            prior_segments = []
+
+        # Anchor matching loop — same pattern as merge_group's core loop
+        updated_text = base_text
+        applied_count = 0
+        new_segments = []
+
+        positions = find_redaction_positions(updated_text, redaction_markers)
+        for pos, marker in reversed(positions):
+            left_anchor, right_anchor = extract_anchors(
+                updated_text, pos, len(marker), anchor_length, redaction_markers
             )
-            conn.execute(
-                "UPDATE match_group_members SET group_id = ? WHERE doc_id = ?",
-                (temp_gid, doc_b_id)
+            alpha_content = re.sub(r'[^a-zA-Z0-9]', '', left_anchor + right_anchor)
+            if len(alpha_content) < 8:
+                continue
+            recovered = find_text_between_anchors(donor_text, left_anchor, right_anchor)
+            if recovered and _is_real_recovery(recovered, redaction_markers):
+                updated_text = updated_text[:pos] + recovered + updated_text[pos + len(marker):]
+                applied_count += 1
+                new_segments.append({
+                    "text": recovered,
+                    "source_doc_id": donor_id,
+                    "stage": "cross_group",
+                    "confidence": "high",
+                    "anchor_alpha_len": len(alpha_content),
+                })
+
+        if applied_count > 0:
+            all_sources = prior_sources + ([donor_id] if donor_id not in prior_sources else [])
+            upsert_merge_result(
+                conn, target_group,
+                updated_text,
+                prior_count + applied_count,
+                prior_total,
+                all_sources,
+                recovered_segments=prior_segments + new_segments,
             )
-
-            result = merge_group(conn, temp_gid, redaction_markers, anchor_length)
-
-            # Restore original group memberships
-            if orig_a:
-                conn.execute(
-                    "UPDATE match_group_members SET group_id = ?, similarity = ? WHERE doc_id = ?",
-                    (orig_a["group_id"], orig_a["similarity"], doc_a_id)
-                )
-            if orig_b:
-                conn.execute(
-                    "UPDATE match_group_members SET group_id = ?, similarity = ? WHERE doc_id = ?",
-                    (orig_b["group_id"], orig_b["similarity"], doc_b_id)
-                )
-            # Delete the temp group
-            conn.execute("DELETE FROM match_groups WHERE group_id = ?", (temp_gid,))
-            conn.execute("RELEASE cross_merge")
-        except Exception:
-            conn.execute("ROLLBACK TO cross_merge")
-            conn.execute("RELEASE cross_merge")
-            logger.warning("Cross-group merge failed for pair (%s, %s), skipping",
-                           doc_a_id, doc_b_id)
-            conn.execute(
-                "UPDATE verified_pairs SET pair_merged = 1 "
-                "WHERE doc_id_a = ? AND doc_id_b = ?",
-                (doc_a_id, doc_b_id)
-            )
-            count += 1
-            continue
-
-        # If we recovered anything, apply the recovered segments to the
-        # existing merge_result for the target group. We do NOT replace the
-        # existing merged_text (which contains recoveries from all group members)
-        # with the 2-doc merge text (which would lose prior recoveries).
-        if result["recovered_count"] > 0:
-            target_group = group_a if count_a >= count_b else group_b
-
-            existing = conn.execute(
-                "SELECT merged_text, recovered_count, total_redacted, "
-                "source_doc_ids, recovered_segments FROM merge_results WHERE group_id = ?",
-                (target_group,)
-            ).fetchone()
-
-            if existing and existing["merged_text"]:
-                # Apply cross-group recoveries to the EXISTING merged_text.
-                # Iterate remaining redaction positions in reverse order and
-                # use anchor matching against the cross-group donor text
-                # (same logic as merge_group's anchor loop).
-                updated_text = existing["merged_text"]
-                donor_text = text_b if count_a >= count_b else text_a  # the less-redacted doc
-                applied_count = 0
-                new_segments = []
-
-                positions = find_redaction_positions(updated_text, redaction_markers)
-                for pos, marker in reversed(positions):
-                    left_anchor, right_anchor = extract_anchors(
-                        updated_text, pos, len(marker), anchor_length, redaction_markers
-                    )
-                    alpha_content = re.sub(r'[^a-zA-Z0-9]', '', left_anchor + right_anchor)
-                    if len(alpha_content) < 8:
-                        continue
-                    recovered = find_text_between_anchors(donor_text, left_anchor, right_anchor)
-                    if recovered and _is_real_recovery(recovered, redaction_markers):
-                        updated_text = updated_text[:pos] + recovered + updated_text[pos + len(marker):]
-                        applied_count += 1
-                        new_segments.append({
-                            "text": recovered,
-                            "source_doc_id": doc_b_id if count_a >= count_b else doc_a_id,
-                            "stage": "cross_group",
-                            "confidence": "high",
-                            "anchor_alpha_len": len(alpha_content),
-                        })
-
-                if applied_count > 0:
-                    prior_sources = json.loads(existing["source_doc_ids"]) if existing["source_doc_ids"] else []
-                    prior_segments = json.loads(existing["recovered_segments"]) if existing["recovered_segments"] else []
-                    donor_id = doc_b_id if count_a >= count_b else doc_a_id
-                    new_sources = [donor_id] if donor_id not in prior_sources else []
-                    upsert_merge_result(
-                        conn, target_group,
-                        updated_text,
-                        existing["recovered_count"] + applied_count,
-                        existing["total_redacted"],
-                        prior_sources + new_sources,
-                        recovered_segments=prior_segments + new_segments,
-                    )
-            else:
-                # No prior merge result — use the 2-doc result directly
-                upsert_merge_result(
-                    conn, target_group,
-                    result["merged_text"],
-                    result["recovered_count"],
-                    result["total_redacted"],
-                    result["source_doc_ids"],
-                    recovered_segments=result.get("recovered_segments", []),
-                )
-
             logger.info("Cross-group pair (%s, %s): recovered %d redactions for group %d",
-                        doc_a_id, doc_b_id, result["recovered_count"], target_group)
+                        doc_a_id, doc_b_id, applied_count, target_group)
 
         conn.execute(
             "UPDATE verified_pairs SET pair_merged = 1 "
