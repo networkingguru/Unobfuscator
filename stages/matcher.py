@@ -35,6 +35,10 @@ _HEADER_PATTERNS = [
 # complementary redactions are present (secondary confirmation signal).
 _SECONDARY_OVERLAP_THRESHOLD = 500
 
+# Maximum group size allowed before blocking a merge/add. Groups at or above
+# this limit will have the pair recorded as a verified_pair instead of merging.
+_MERGE_SIZE_LIMIT = 500
+
 # --- Rolling-hash constants ---
 _RH_BASE1, _RH_MOD1 = 131, (1 << 61) - 1   # Mersenne prime
 _RH_BASE2, _RH_MOD2 = 137, (1 << 59) - 55  # large prime, different size
@@ -729,18 +733,39 @@ def _phase3_progress(conn, checked, total, confirmed, rejected,
         callback(checked, total, confirmed)
 
 
-def _assign_to_group(conn, doc_a: int, doc_b: int, similarity: float) -> None:
-    """Assign two documents to a shared match group, merging if needed."""
+def _assign_to_group(conn, doc_a: str, doc_b: str, similarity: float) -> None:
+    """Assign two documents to a shared match group.
+
+    When both docs are already in different groups and either group exceeds
+    _MERGE_SIZE_LIMIT, record a verified pair instead of merging the groups.
+    When one doc is ungrouped but the other's group exceeds the limit,
+    leave the ungrouped doc ungrouped and record the pair.
+    """
+    from core.db import insert_verified_pair, get_group_member_count
+
     group_a = get_doc_group(conn, doc_a)
     group_b = get_doc_group(conn, doc_b)
 
     if group_a is not None and group_b is not None:
         if group_a != group_b:
-            merge_groups(conn, group_a, group_b)
+            size_a = get_group_member_count(conn, group_a)
+            size_b = get_group_member_count(conn, group_b)
+            if size_a >= _MERGE_SIZE_LIMIT or size_b >= _MERGE_SIZE_LIMIT:
+                insert_verified_pair(conn, doc_a, doc_b, similarity, phase="match")
+            else:
+                merge_groups(conn, group_a, group_b)
     elif group_a is not None:
-        add_group_member(conn, group_a, doc_b, similarity)
+        size_a = get_group_member_count(conn, group_a)
+        if size_a >= _MERGE_SIZE_LIMIT:
+            insert_verified_pair(conn, doc_a, doc_b, similarity, phase="match")
+        else:
+            add_group_member(conn, group_a, doc_b, similarity)
     elif group_b is not None:
-        add_group_member(conn, group_b, doc_a, similarity)
+        size_b = get_group_member_count(conn, group_b)
+        if size_b >= _MERGE_SIZE_LIMIT:
+            insert_verified_pair(conn, doc_a, doc_b, similarity, phase="match")
+        else:
+            add_group_member(conn, group_b, doc_a, similarity)
     else:
         new_group = create_match_group(conn)
         add_group_member(conn, new_group, doc_a, 1.0)

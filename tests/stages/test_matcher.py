@@ -3,7 +3,8 @@ import numpy as np
 from datasketch import MinHash
 from core.db import (
     init_db, get_connection, upsert_document, upsert_fingerprint,
-    get_doc_group, create_match_group, add_group_member, get_config
+    get_doc_group, create_match_group, add_group_member, get_config,
+    insert_verified_pair, get_verified_pairs_for_doc, get_group_member_count,
 )
 from unittest.mock import patch
 from stages.matcher import (
@@ -11,6 +12,7 @@ from stages.matcher import (
     load_fingerprints, run_phase2_lsh_candidates,
     find_longest_common_substring, run_phase3_verify_and_group,
     _get_total_ram_bytes, _get_rss_bytes, _check_memory, MemoryLimitExceeded,
+    _assign_to_group, _MERGE_SIZE_LIMIT,
 )
 from stages.indexer import build_fingerprint, clean_text
 
@@ -620,3 +622,90 @@ def test_memory_limit_exceeded_has_correct_attributes():
     assert exc.limit_mb == 8192
     assert exc.limit_pct == 50
     assert exc.total_mb == 16384
+
+
+# --- _assign_to_group size-guard tests ---
+
+
+def test_assign_to_group_blocks_merge_when_group_exceeds_limit(conn):
+    """When one group exceeds _MERGE_SIZE_LIMIT, record pair instead of merging."""
+    seed_doc(conn, "a", "text a")
+    seed_doc(conn, "b", "text b")
+    g1 = create_match_group(conn)
+    g2 = create_match_group(conn)
+    add_group_member(conn, g1, "a", 1.0)
+    add_group_member(conn, g2, "b", 1.0)
+    conn.commit()
+
+    import stages.matcher as matcher_mod
+    original = matcher_mod._MERGE_SIZE_LIMIT
+    matcher_mod._MERGE_SIZE_LIMIT = 1
+    try:
+        _assign_to_group(conn, "a", "b", similarity=0.85)
+        conn.commit()
+        assert get_doc_group(conn, "a") == g1
+        assert get_doc_group(conn, "b") == g2
+        pairs = get_verified_pairs_for_doc(conn, "a")
+        assert len(pairs) == 1
+        assert pairs[0]["similarity"] == 0.85
+    finally:
+        matcher_mod._MERGE_SIZE_LIMIT = original
+
+
+def test_assign_to_group_still_merges_small_groups(conn):
+    """When both groups are below _MERGE_SIZE_LIMIT, merge normally."""
+    seed_doc(conn, "a", "text a")
+    seed_doc(conn, "b", "text b")
+    g1 = create_match_group(conn)
+    g2 = create_match_group(conn)
+    add_group_member(conn, g1, "a", 1.0)
+    add_group_member(conn, g2, "b", 1.0)
+    conn.commit()
+    _assign_to_group(conn, "a", "b", similarity=0.85)
+    conn.commit()
+    assert get_doc_group(conn, "a") == get_doc_group(conn, "b")
+
+
+def test_assign_to_group_blocks_add_when_group_exceeds_limit(conn):
+    """When one doc is ungrouped but the other's group exceeds limit, leave ungrouped."""
+    seed_doc(conn, "a", "text a")
+    seed_doc(conn, "b", "text b")
+    g1 = create_match_group(conn)
+    add_group_member(conn, g1, "a", 1.0)
+    conn.commit()
+
+    import stages.matcher as matcher_mod
+    original = matcher_mod._MERGE_SIZE_LIMIT
+    matcher_mod._MERGE_SIZE_LIMIT = 1
+    try:
+        _assign_to_group(conn, "a", "b", similarity=0.85)
+        conn.commit()
+        assert get_doc_group(conn, "a") == g1
+        assert get_doc_group(conn, "b") is None
+        pairs = get_verified_pairs_for_doc(conn, "a")
+        assert len(pairs) == 1
+    finally:
+        matcher_mod._MERGE_SIZE_LIMIT = original
+
+
+def test_assign_to_group_still_adds_to_existing_group(conn):
+    """When only one doc is grouped, add the other to that group (unchanged)."""
+    seed_doc(conn, "a", "text a")
+    seed_doc(conn, "b", "text b")
+    g1 = create_match_group(conn)
+    add_group_member(conn, g1, "a", 1.0)
+    conn.commit()
+    _assign_to_group(conn, "a", "b", similarity=0.9)
+    conn.commit()
+    assert get_doc_group(conn, "b") == g1
+
+
+def test_assign_to_group_still_creates_new_group(conn):
+    """When neither doc is grouped, create a new group (unchanged)."""
+    seed_doc(conn, "a", "text a")
+    seed_doc(conn, "b", "text b")
+    conn.commit()
+    _assign_to_group(conn, "a", "b", similarity=0.75)
+    conn.commit()
+    assert get_doc_group(conn, "a") is not None
+    assert get_doc_group(conn, "a") == get_doc_group(conn, "b")
