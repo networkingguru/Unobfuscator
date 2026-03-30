@@ -432,10 +432,13 @@ def _assign_to_group(conn, doc_a: str, doc_b: str, similarity: float) -> None:
     elif group_a is not None:
         size_a = get_group_member_count(conn, group_a)
         if size_a >= _MERGE_SIZE_LIMIT:
-            # Group is too large — leave doc_b ungrouped so LSH can
-            # re-evaluate it next cycle. Record the pair for cross-group merging.
-            # Do NOT create a singleton group (it would trap doc_b permanently
-            # since LSH skips already-grouped docs).
+            # Group is too large — leave doc_b ungrouped and record the pair
+            # for cross-group merging. Do NOT create a singleton group (it would
+            # trap doc_b since LSH skips already-grouped docs).
+            # Note: if doc_b's only match is doc_a (in the large group), LSH
+            # won't find it (large-group members are excluded from the LSH index).
+            # In that case, the cross-group merger handles recovery via the
+            # verified_pair recorded here.
             insert_verified_pair(conn, doc_a, doc_b, similarity, phase="match")
         else:
             add_group_member(conn, group_a, doc_b, similarity)
@@ -773,6 +776,10 @@ def cluster_and_split_group(
     logger.info("Splitting group %d (%d members) into sub-groups...", group_id, len(member_ids))
 
     fingerprints = _load_group_fingerprints(conn, group_id, num_perm=num_perm)
+    if not fingerprints:
+        logger.warning("Group %d: no fingerprints available for any member, skipping split", group_id)
+        return [group_id]  # Return original group unchanged — can't cluster without fingerprints
+
     members_without_fp = member_ids - set(fingerprints.keys())
 
     clusters, orphans = _find_clusters(fingerprints, threshold=lsh_threshold, num_perm=num_perm)
@@ -1227,11 +1234,12 @@ def run_cross_group_merger(
             prior_sources = [base_id]
             prior_segments = []
 
-        # Anchor matching loop — same pattern as merge_group's core loop
+        # Anchor matching + alignment fallback — mirrors merge_group's full pipeline
         updated_text = base_text
         applied_count = 0
         new_segments = []
 
+        # --- Pass 1: Anchor matching ---
         positions = find_redaction_positions(updated_text, redaction_markers)
         for pos, marker in reversed(positions):
             left_anchor, right_anchor = extract_anchors(
@@ -1251,6 +1259,29 @@ def run_cross_group_merger(
                     "confidence": "high",
                     "anchor_alpha_len": len(alpha_content),
                 })
+
+        # --- Pass 2: Alignment fallback for remaining redactions ---
+        remaining = find_redaction_positions(updated_text, redaction_markers)
+        if remaining:
+            alignment_candidates = _alignment_recover(
+                updated_text, donor_text, remaining, redaction_markers
+            )
+            for pos, marker in reversed(remaining):
+                if pos in alignment_candidates:
+                    candidate, donor_offset = alignment_candidates[pos]
+                    if _confirm_alignment_candidate(
+                        candidate, donor_text, updated_text, pos, len(marker),
+                        redaction_markers, donor_line_offset=donor_offset
+                    ):
+                        updated_text = updated_text[:pos] + candidate + updated_text[pos + len(marker):]
+                        applied_count += 1
+                        new_segments.append({
+                            "text": candidate,
+                            "source_doc_id": donor_id,
+                            "stage": "cross_group_alignment",
+                            "confidence": "high",
+                            "anchor_alpha_len": 0,
+                        })
 
         if applied_count > 0:
             all_sources = prior_sources + ([donor_id] if donor_id not in prior_sources else [])
@@ -1351,7 +1382,13 @@ run_merger(conn, redaction_markers=markers,
 
 Move the `run_cross_group_merger` import to the top of the file with the other merger imports.
 
-- [ ] **Step 3: Run daemon tests**
+- [ ] **Step 3: Update daemon tests**
+
+Read `tests/test_daemon.py` to check if `_run_one_cycle` or `run_merger` is patched/mocked. If so, add a corresponding mock for `run_cross_group_merger`:
+
+```python
+patch("unobfuscator.run_cross_group_merger", return_value=0)
+```
 
 Run: `cd /root/Unobfuscator && .venv/bin/pytest tests/test_daemon.py -v`
 
