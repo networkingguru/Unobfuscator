@@ -93,6 +93,22 @@ def test_get_cross_group_pairs_finds_pairs_in_different_groups(conn):
     assert pairs[0]["doc_id_b"] == "2"
 
 
+def test_get_cross_group_pairs_includes_ungrouped_doc(conn):
+    """Pairs where one doc is ungrouped should still be returned."""
+    for i in [1, 2]:
+        upsert_document(conn, {**SAMPLE_DOC, "id": i, "original_filename": f"{i}.pdf"})
+    conn.commit()
+    g1 = create_match_group(conn)
+    add_group_member(conn, g1, "1", 1.0)
+    # "2" is NOT in any group
+    insert_verified_pair(conn, "1", "2", similarity=0.85, phase="match")
+    conn.commit()
+    pairs = get_unmerged_cross_group_pairs(conn)
+    assert len(pairs) == 1
+    assert pairs[0]["group_a"] is not None  # doc "1" is grouped
+    assert pairs[0]["group_b"] is None  # doc "2" is ungrouped
+
+
 def test_get_unmerged_cross_group_pairs_excludes_merged(conn):
     for i in [1, 2]:
         upsert_document(conn, {**SAMPLE_DOC, "id": i, "original_filename": f"{i}.pdf"})
@@ -183,26 +199,33 @@ def get_verified_pairs_for_doc(conn, doc_id: str) -> list[dict]:
 
 
 def get_cross_group_pairs(conn) -> list[dict]:
-    """Return verified pairs where the two docs are in different groups."""
+    """Return verified pairs where docs are in different groups or one is ungrouped."""
     rows = conn.execute("""
         SELECT vp.*, ma.group_id AS group_a, mb.group_id AS group_b
         FROM verified_pairs vp
-        JOIN match_group_members ma ON ma.doc_id = vp.doc_id_a
-        JOIN match_group_members mb ON mb.doc_id = vp.doc_id_b
-        WHERE ma.group_id != mb.group_id
+        LEFT JOIN match_group_members ma ON ma.doc_id = vp.doc_id_a
+        LEFT JOIN match_group_members mb ON mb.doc_id = vp.doc_id_b
+        WHERE ma.group_id IS NULL OR mb.group_id IS NULL
+           OR ma.group_id != mb.group_id
     """).fetchall()
     return [dict(r) for r in rows]
 
 
 def get_unmerged_cross_group_pairs(conn) -> list[dict]:
-    """Return unmerged verified pairs where the two docs are in different groups."""
+    """Return unmerged verified pairs where docs are in different groups OR one is ungrouped.
+
+    Uses LEFT JOINs so pairs where one doc is ungrouped (no match_group_members row)
+    are also returned — these are docs that were blocked from joining a large group
+    by the _MERGE_SIZE_LIMIT guard. group_a/group_b will be NULL for ungrouped docs.
+    """
     rows = conn.execute("""
         SELECT vp.*, ma.group_id AS group_a, mb.group_id AS group_b
         FROM verified_pairs vp
-        JOIN match_group_members ma ON ma.doc_id = vp.doc_id_a
-        JOIN match_group_members mb ON mb.doc_id = vp.doc_id_b
-        WHERE ma.group_id != mb.group_id
-          AND vp.pair_merged = 0
+        LEFT JOIN match_group_members ma ON ma.doc_id = vp.doc_id_a
+        LEFT JOIN match_group_members mb ON mb.doc_id = vp.doc_id_b
+        WHERE vp.pair_merged = 0
+          AND (ma.group_id IS NULL OR mb.group_id IS NULL
+               OR ma.group_id != mb.group_id)
     """).fetchall()
     return [dict(r) for r in rows]
 
@@ -300,7 +323,7 @@ def test_assign_to_group_still_merges_small_groups(conn):
     add_group_member(conn, g2, "b", 1.0)
     conn.commit()
 
-    # Default limit is 1000 — both groups have 1 member, well under limit
+    # Default limit is 500 — both groups have 1 member, well under limit
     _assign_to_group(conn, "a", "b", similarity=0.85)
     conn.commit()
 
@@ -431,7 +454,7 @@ def _assign_to_group(conn, doc_a: str, doc_b: str, similarity: float) -> None:
 
 - [ ] **Step 4: Update the existing `test_phase3_merges_two_existing_groups` test**
 
-This test at `tests/stages/test_matcher.py:438-456` asserts groups merge when both docs are in separate groups. With the new code, small groups still merge (both groups have 1 member, well below 1000), so **this test should still pass unchanged**. Verify this.
+This test at `tests/stages/test_matcher.py:438-456` asserts groups merge when both docs are in separate groups. With the new code, small groups still merge (both groups have 1 member, well below 500), so **this test should still pass unchanged**. Verify this.
 
 If it fails (unlikely), the issue would be the import of `get_group_member_count`. Debug and fix.
 
@@ -455,7 +478,7 @@ git add stages/matcher.py tests/stages/test_matcher.py
 git commit -m "feat: block transitive group merging above size limit
 
 _assign_to_group() now checks group sizes before merging. Groups below
-_MERGE_SIZE_LIMIT (1000) merge normally, preserving Phase 0/3 grouping
+_MERGE_SIZE_LIMIT (500) merge normally, preserving Phase 0/3 grouping
 semantics. Groups at or above the limit record a verified_pair instead,
 preventing the transitive chaining that created 82K-member mega-groups."
 ```
@@ -971,9 +994,50 @@ def test_run_cross_group_merger_recovers_redactions(conn):
     assert "John Smith" in mr["merged_text"]
 ```
 
+- [ ] **Step 2b: Write test for cross-group pair with ungrouped doc**
+
+```python
+def test_run_cross_group_merger_handles_ungrouped_doc(conn):
+    """Cross-group pairs where one doc is ungrouped should still recover redactions."""
+    base = (
+        "The witness identified [REDACTED] at the Palm Beach estate on March 10. "
+        "The deposition was recorded by the court reporter."
+    )
+    donor = (
+        "The witness identified Prince Andrew at the Palm Beach estate on March 10. "
+        "The deposition was recorded by the court reporter."
+    )
+    seed_doc(conn, "u1", base)
+    seed_doc(conn, "u2", donor)
+    conn.commit()
+
+    # u2 is in a group, u1 is ungrouped (simulating the size-limit guard)
+    g2 = create_match_group(conn)
+    add_group_member(conn, g2, "u2", 1.0)
+    conn.commit()
+
+    # Record the pair (u1 is ungrouped)
+    from core.db import insert_verified_pair
+    insert_verified_pair(conn, "u1", "u2", similarity=0.9, phase="match")
+    conn.commit()
+
+    count = run_cross_group_merger(conn, REDACTION_MARKERS, anchor_length=50)
+    assert count == 1
+
+    # u1 should now be in a group (created by cross-group merger)
+    from core.db import get_doc_group
+    assert get_doc_group(conn, "u1") is not None
+
+    # The pair should be marked as merged
+    row = conn.execute(
+        "SELECT pair_merged FROM verified_pairs WHERE doc_id_a = 'u1' AND doc_id_b = 'u2'"
+    ).fetchone()
+    assert row["pair_merged"] == 1
+```
+
 - [ ] **Step 3: Run tests to verify they fail**
 
-Run: `cd /root/Unobfuscator && .venv/bin/pytest tests/stages/test_merger.py::test_run_merger_splits_large_group_then_merges_subgroups tests/stages/test_merger.py::test_run_cross_group_merger_recovers_redactions -v`
+Run: `cd /root/Unobfuscator && .venv/bin/pytest tests/stages/test_merger.py::test_run_merger_splits_large_group_then_merges_subgroups tests/stages/test_merger.py::test_run_cross_group_merger_recovers_redactions tests/stages/test_merger.py::test_run_cross_group_merger_handles_ungrouped_doc -v`
 
 Expected: FAIL.
 
@@ -1128,11 +1192,20 @@ def run_cross_group_merger(
         if count_a >= count_b:
             base_id, donor_id = doc_a_id, doc_b_id
             donor_text = text_b
-            target_group = group_a
+            target_group = group_a  # may be None if doc_a is ungrouped
         else:
             base_id, donor_id = doc_b_id, doc_a_id
             donor_text = text_a
-            target_group = group_b
+            target_group = group_b  # may be None if doc_b is ungrouped
+
+        # If the target doc is ungrouped, create a group for it so we can
+        # store the merge result. This is safe: the doc was intentionally
+        # left ungrouped by the size-limit guard, and now we have a verified
+        # recovery to store.
+        if target_group is None:
+            from core.db import create_match_group, add_group_member
+            target_group = create_match_group(conn)
+            add_group_member(conn, target_group, base_id, 1.0)
 
         # Use existing merged_text as base if available (it may have prior recoveries)
         existing = conn.execute(
@@ -1447,7 +1520,7 @@ merges that chain unrelated documents together.
 ## Fix (3 layers)
 1. Sub-cluster large groups using within-group LSH, split into permanent sub-groups
 2. Release orphan documents for re-evaluation by the LSH pipeline
-3. Block transitive group merging above _MERGE_SIZE_LIMIT (1000), record verified_pairs instead
+3. Block transitive group merging above _MERGE_SIZE_LIMIT (500), record verified_pairs instead
 4. Cross-group pair merger processes verified pairs using full merge_group() pipeline
 
 ## Impact
