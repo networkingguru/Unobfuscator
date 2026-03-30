@@ -728,7 +728,10 @@ def cluster_and_split_group(
     return new_group_ids
 
 
-def run_merger(conn, redaction_markers: list[str], anchor_length: int = 50) -> int:
+def run_merger(
+    conn, redaction_markers: list[str], anchor_length: int = 50,
+    shutdown_check=None,
+) -> int:
     """Run merger on all unmerged match groups with 2+ members. Returns count processed."""
     groups = conn.execute("""
         SELECT group_id FROM match_groups
@@ -736,9 +739,29 @@ def run_merger(conn, redaction_markers: list[str], anchor_length: int = 50) -> i
         AND (SELECT COUNT(*) FROM match_group_members WHERE group_id = match_groups.group_id) >= 2
     """).fetchall()
 
+    new_sub_groups = []
     count = 0
     for row in groups:
+        if shutdown_check and shutdown_check():
+            break
+
         group_id = row["group_id"]
+        member_count = conn.execute(
+            "SELECT COUNT(*) FROM match_group_members WHERE group_id = ?", (group_id,)
+        ).fetchone()[0]
+        if member_count < 2:
+            continue
+
+        if member_count > _CLUSTER_THRESHOLD:
+            logger.info("Group %d has %d members — splitting into sub-groups",
+                        group_id, member_count)
+            new_ids = cluster_and_split_group(
+                conn, group_id, redaction_markers,
+                shutdown_check=shutdown_check,
+            )
+            new_sub_groups.extend(new_ids)
+            continue
+
         result = merge_group(conn, group_id, redaction_markers, anchor_length)
         upsert_merge_result(
             conn, group_id,
@@ -754,4 +777,187 @@ def run_merger(conn, redaction_markers: list[str], anchor_length: int = 50) -> i
         conn.commit()
         count += 1
 
+    # Phase 2: Process newly created sub-groups
+    for sub_gid in new_sub_groups:
+        if shutdown_check and shutdown_check():
+            break
+        member_count = conn.execute(
+            "SELECT COUNT(*) FROM match_group_members WHERE group_id = ?", (sub_gid,)
+        ).fetchone()[0]
+        if member_count < 2:
+            continue
+        result = merge_group(conn, sub_gid, redaction_markers, anchor_length)
+        upsert_merge_result(
+            conn, sub_gid,
+            result["merged_text"],
+            result["recovered_count"],
+            result["total_redacted"],
+            result["source_doc_ids"],
+            recovered_segments=result.get("recovered_segments", [])
+        )
+        conn.execute(
+            "UPDATE match_groups SET merged = 1 WHERE group_id = ?", (sub_gid,)
+        )
+        conn.commit()
+        count += 1
+
+    return count
+
+
+def run_cross_group_merger(
+    conn, redaction_markers: list[str], anchor_length: int = 50,
+    shutdown_check=None,
+) -> int:
+    """Attempt redaction recovery on cross-group verified pairs.
+
+    Uses direct anchor matching + alignment fallback against the donor text.
+    No temp groups needed. Updates merge_result for the target group.
+    """
+    from core.db import get_unmerged_cross_group_pairs
+
+    pairs = get_unmerged_cross_group_pairs(conn)
+    if not pairs:
+        return 0
+
+    logger.info("Processing %d cross-group verified pairs", len(pairs))
+    count = 0
+
+    for pair in pairs:
+        if shutdown_check and shutdown_check():
+            break
+
+        doc_a_id = pair["doc_id_a"]
+        doc_b_id = pair["doc_id_b"]
+        group_a = pair["group_a"]
+        group_b = pair["group_b"]
+
+        row_a = conn.execute(
+            "SELECT extracted_text FROM documents WHERE id = ?", (doc_a_id,)
+        ).fetchone()
+        text_a = (row_a["extracted_text"] if row_a else "") or ""
+        row_b = conn.execute(
+            "SELECT extracted_text FROM documents WHERE id = ?", (doc_b_id,)
+        ).fetchone()
+        text_b = (row_b["extracted_text"] if row_b else "") or ""
+
+        count_a = sum(text_a.count(m) for m in redaction_markers)
+        count_b = sum(text_b.count(m) for m in redaction_markers)
+
+        if count_a == 0 and count_b == 0:
+            conn.execute(
+                "UPDATE verified_pairs SET pair_merged = 1 "
+                "WHERE doc_id_a = ? AND doc_id_b = ?",
+                (doc_a_id, doc_b_id)
+            )
+            count += 1
+            continue
+
+        if count_a >= count_b:
+            base_id, donor_id = doc_a_id, doc_b_id
+            donor_text = text_b
+            target_group = group_a
+        else:
+            base_id, donor_id = doc_b_id, doc_a_id
+            donor_text = text_a
+            target_group = group_b
+
+        # If target doc is ungrouped, create a group for it
+        if target_group is None:
+            from core.db import create_match_group, add_group_member
+            target_group = create_match_group(conn)
+            add_group_member(conn, target_group, base_id, 1.0)
+
+        # Use existing merged_text as base if available
+        existing = conn.execute(
+            "SELECT merged_text, recovered_count, total_redacted, "
+            "source_doc_ids, recovered_segments FROM merge_results WHERE group_id = ?",
+            (target_group,)
+        ).fetchone()
+
+        if existing and existing["merged_text"]:
+            base_text = existing["merged_text"]
+            prior_count = existing["recovered_count"]
+            prior_total = existing["total_redacted"]
+            prior_sources = json.loads(existing["source_doc_ids"]) if existing["source_doc_ids"] else []
+            prior_segments = json.loads(existing["recovered_segments"]) if existing["recovered_segments"] else []
+        else:
+            base_text = text_a if count_a >= count_b else text_b
+            prior_count = 0
+            prior_total = len(find_redaction_positions(base_text, redaction_markers))
+            prior_sources = [base_id]
+            prior_segments = []
+
+        # Anchor matching + alignment fallback
+        updated_text = base_text
+        applied_count = 0
+        new_segments = []
+
+        # Pass 1: Anchor matching
+        positions = find_redaction_positions(updated_text, redaction_markers)
+        for pos, marker in reversed(positions):
+            left_anchor, right_anchor = extract_anchors(
+                updated_text, pos, len(marker), anchor_length, redaction_markers
+            )
+            alpha_content = re.sub(r'[^a-zA-Z0-9]', '', left_anchor + right_anchor)
+            if len(alpha_content) < 8:
+                continue
+            recovered = find_text_between_anchors(donor_text, left_anchor, right_anchor)
+            if recovered and _is_real_recovery(recovered, redaction_markers):
+                updated_text = updated_text[:pos] + recovered + updated_text[pos + len(marker):]
+                applied_count += 1
+                new_segments.append({
+                    "text": recovered,
+                    "source_doc_id": donor_id,
+                    "stage": "cross_group",
+                    "confidence": "high",
+                    "anchor_alpha_len": len(alpha_content),
+                })
+
+        # Pass 2: Alignment fallback
+        remaining = find_redaction_positions(updated_text, redaction_markers)
+        if remaining:
+            alignment_candidates = _alignment_recover(
+                updated_text, donor_text, remaining, redaction_markers
+            )
+            for pos, marker in reversed(remaining):
+                if pos in alignment_candidates:
+                    candidate, donor_offset = alignment_candidates[pos]
+                    if _confirm_alignment_candidate(
+                        candidate, donor_text, updated_text, pos, len(marker),
+                        redaction_markers, donor_line_offset=donor_offset
+                    ):
+                        updated_text = updated_text[:pos] + candidate + updated_text[pos + len(marker):]
+                        applied_count += 1
+                        new_segments.append({
+                            "text": candidate,
+                            "source_doc_id": donor_id,
+                            "stage": "cross_group_alignment",
+                            "confidence": "high",
+                            "anchor_alpha_len": 0,
+                        })
+
+        if applied_count > 0:
+            all_sources = prior_sources + ([donor_id] if donor_id not in prior_sources else [])
+            upsert_merge_result(
+                conn, target_group,
+                updated_text,
+                prior_count + applied_count,
+                prior_total,
+                all_sources,
+                recovered_segments=prior_segments + new_segments,
+            )
+            logger.info("Cross-group pair (%s, %s): recovered %d redactions for group %d",
+                        doc_a_id, doc_b_id, applied_count, target_group)
+
+        conn.execute(
+            "UPDATE verified_pairs SET pair_merged = 1 "
+            "WHERE doc_id_a = ? AND doc_id_b = ?",
+            (doc_a_id, doc_b_id)
+        )
+        count += 1
+
+        if count % 100 == 0:
+            conn.commit()
+
+    conn.commit()
     return count

@@ -8,7 +8,7 @@ from core.db import (
 from stages.merger import (
     find_redaction_positions, extract_anchors,
     find_text_between_anchors, merge_group, run_merger,
-    cluster_and_split_group,
+    cluster_and_split_group, run_cross_group_merger,
 )
 
 REDACTION_MARKERS = ["[REDACTED]", "[b(6)]"]
@@ -790,3 +790,136 @@ def test_cluster_and_split_handles_recursive_large_component(conn):
             assert row is not None, f"Doc d{i} should still be in a group"
     finally:
         merger_mod._CLUSTER_THRESHOLD = original
+
+
+def test_run_merger_splits_large_group_then_merges_subgroups(conn):
+    """Groups exceeding _CLUSTER_THRESHOLD should be split, then each sub-group merged."""
+    import stages.merger as merger_mod
+    original = merger_mod._CLUSTER_THRESHOLD
+    merger_mod._CLUSTER_THRESHOLD = 3
+
+    try:
+        base_a = (
+            "From: jeffrey@example.com\nTo: pilot@example.com\n"
+            "Subject: Flight schedule for the weekend trip\n\n"
+            "The flight to [REDACTED] departs at 9am from Palm Beach airport terminal."
+        )
+        donor_a = (
+            "From: jeffrey@example.com\nTo: pilot@example.com\n"
+            "Subject: Flight schedule for the weekend trip\n\n"
+            "The flight to Little St. James departs at 9am from Palm Beach airport terminal."
+        )
+        orphan1 = "From: a@b.com\nCompletely different content alpha beta gamma delta."
+        orphan2 = "From: c@d.com\nCompletely different content epsilon zeta eta theta."
+
+        _seed_doc_with_fingerprint(conn, "m1", base_a)
+        _seed_doc_with_fingerprint(conn, "m2", donor_a)
+        _seed_doc_with_fingerprint(conn, "m3", orphan1)
+        _seed_doc_with_fingerprint(conn, "m4", orphan2)
+        conn.commit()
+
+        g = create_match_group(conn)
+        for doc_id in ["m1", "m2", "m3", "m4"]:
+            add_group_member(conn, g, doc_id, 1.0)
+        conn.commit()
+
+        count = run_merger(conn, REDACTION_MARKERS, anchor_length=50)
+
+        original_group = conn.execute(
+            "SELECT * FROM match_groups WHERE group_id = ?", (g,)
+        ).fetchone()
+        assert original_group is None
+
+        # Check that merge happened: merged text has the recovered content
+        # (reverse merge uses unredacted doc as base, so recovered_count may be 0
+        # but the merged_text should contain the unredacted content)
+        results = conn.execute(
+            "SELECT merged_text, total_redacted FROM merge_results"
+        ).fetchall()
+        assert len(results) >= 1
+        found_recovery = any(
+            "Little St. James" in (r["merged_text"] or "") for r in results
+        )
+        assert found_recovery, "Expected 'Little St. James' in some merge result"
+
+        for orphan_id in ["m3", "m4"]:
+            row = conn.execute(
+                "SELECT group_id FROM match_group_members WHERE doc_id = ?", (orphan_id,)
+            ).fetchone()
+            assert row is None, f"Orphan {orphan_id} should be ungrouped"
+    finally:
+        merger_mod._CLUSTER_THRESHOLD = original
+
+
+def test_run_cross_group_merger_recovers_redactions(conn):
+    """Cross-group pairs should recover redactions."""
+    base = (
+        "The investigation found [REDACTED] at the scene on March 10. "
+        "The evidence was collected by officer Johnson at the precinct."
+    )
+    donor = (
+        "The investigation found John Smith at the scene on March 10. "
+        "The evidence was collected by officer Johnson at the precinct."
+    )
+    seed_doc(conn, "x1", base)
+    seed_doc(conn, "x2", donor)
+    conn.commit()
+
+    g1 = create_match_group(conn)
+    g2 = create_match_group(conn)
+    add_group_member(conn, g1, "x1", 1.0)
+    add_group_member(conn, g2, "x2", 1.0)
+    conn.commit()
+
+    from core.db import insert_verified_pair
+    insert_verified_pair(conn, "x1", "x2", similarity=0.9, phase="phase3")
+    conn.commit()
+
+    count = run_cross_group_merger(conn, REDACTION_MARKERS, anchor_length=50)
+    assert count == 1
+
+    row = conn.execute(
+        "SELECT pair_merged FROM verified_pairs WHERE doc_id_a = 'x1' AND doc_id_b = 'x2'"
+    ).fetchone()
+    assert row["pair_merged"] == 1
+
+    mr = conn.execute(
+        "SELECT recovered_count, merged_text FROM merge_results WHERE group_id = ?", (g1,)
+    ).fetchone()
+    assert mr is not None
+    assert mr["recovered_count"] >= 1
+    assert "John Smith" in mr["merged_text"]
+
+
+def test_run_cross_group_merger_handles_ungrouped_doc(conn):
+    """Cross-group pairs where one doc is ungrouped should still recover redactions."""
+    base = (
+        "The witness identified [REDACTED] at the Palm Beach estate on March 10. "
+        "The deposition was recorded by the court reporter."
+    )
+    donor = (
+        "The witness identified Prince Andrew at the Palm Beach estate on March 10. "
+        "The deposition was recorded by the court reporter."
+    )
+    seed_doc(conn, "u1", base)
+    seed_doc(conn, "u2", donor)
+    conn.commit()
+
+    g2 = create_match_group(conn)
+    add_group_member(conn, g2, "u2", 1.0)
+    conn.commit()
+
+    from core.db import insert_verified_pair
+    insert_verified_pair(conn, "u1", "u2", similarity=0.9, phase="match")
+    conn.commit()
+
+    count = run_cross_group_merger(conn, REDACTION_MARKERS, anchor_length=50)
+    assert count == 1
+
+    from core.db import get_doc_group
+    assert get_doc_group(conn, "u1") is not None
+
+    row = conn.execute(
+        "SELECT pair_merged FROM verified_pairs WHERE doc_id_a = 'u1' AND doc_id_b = 'u2'"
+    ).fetchone()
+    assert row["pair_merged"] == 1
