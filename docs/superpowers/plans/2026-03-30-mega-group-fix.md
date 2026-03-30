@@ -4,7 +4,7 @@
 
 **Goal:** Fix the merger hang caused by mega-groups (60K-82K members) by sub-clustering genuine matches within them, releasing orphan documents for re-evaluation, and preventing transitive group merging from re-forming mega-groups.
 
-**Architecture:** Three-layer fix: (1) Pre-merge clustering uses existing MinHash fingerprints + within-group LSH to find genuine sub-clusters in seconds, then **splits the mega-group into permanent sub-groups** — each gets its own group_id and merge_result, preserving full fidelity. Orphan documents (86% of mega-group members) are released for re-evaluation by the LSH pipeline. (2) `_assign_to_group()` is modified to record cross-group pairs in a new `verified_pairs` table instead of calling `merge_groups()` — but only when one or both groups exceed `_MERGE_SIZE_LIMIT` (default 1000). Small groups still merge normally to preserve Phase 0/3 grouping semantics. (3) A new cross-group merger step reuses the full `merge_group()` pipeline on verified pairs between different groups.
+**Architecture:** Three-layer fix: (1) Pre-merge clustering uses existing MinHash fingerprints + within-group LSH to find genuine sub-clusters in seconds, then **splits the mega-group into permanent sub-groups** — each gets its own group_id and merge_result, preserving full fidelity. Orphan documents (86% of mega-group members) are released for re-evaluation by the LSH pipeline. (2) `_assign_to_group()` is modified to record cross-group pairs in a new `verified_pairs` table instead of calling `merge_groups()` — but only when one or both groups exceed `_MERGE_SIZE_LIMIT` (default 500). Small groups still merge normally to preserve Phase 0/3 grouping semantics. (3) A new cross-group merger step reuses the full `merge_group()` pipeline on verified pairs between different groups.
 
 **Tech Stack:** Python 3.12, SQLite (WAL mode), datasketch (MinHash/MinHashLSH), numpy
 
@@ -309,7 +309,7 @@ def test_assign_to_group_still_merges_small_groups(conn):
 
 
 def test_assign_to_group_blocks_add_when_group_exceeds_limit(conn):
-    """When one doc is ungrouped but the other's group exceeds limit, create new group."""
+    """When one doc is ungrouped but the other's group exceeds limit, leave ungrouped."""
     seed_doc(conn, "a", "text a")
     seed_doc(conn, "b", "text b")
     g1 = create_match_group(conn)
@@ -323,12 +323,11 @@ def test_assign_to_group_blocks_add_when_group_exceeds_limit(conn):
         _assign_to_group(conn, "a", "b", similarity=0.85)
         conn.commit()
 
-        # doc_b should be in a DIFFERENT group from doc_a
-        group_a = get_doc_group(conn, "a")
-        group_b = get_doc_group(conn, "b")
-        assert group_a == g1
-        assert group_b is not None
-        assert group_b != g1
+        # doc_a stays in its group
+        assert get_doc_group(conn, "a") == g1
+        # doc_b should remain UNGROUPED (not in a singleton group)
+        # so LSH can re-evaluate it next cycle
+        assert get_doc_group(conn, "b") is None
 
         # A verified pair should be recorded
         pairs = get_verified_pairs_for_doc(conn, "a")
@@ -410,18 +409,17 @@ def _assign_to_group(conn, doc_a: str, doc_b: str, similarity: float) -> None:
     elif group_a is not None:
         size_a = get_group_member_count(conn, group_a)
         if size_a >= _MERGE_SIZE_LIMIT:
-            # Group is too large — create a new group for doc_b instead
-            new_group = create_match_group(conn)
-            add_group_member(conn, new_group, doc_b, similarity)
+            # Group is too large — leave doc_b ungrouped so LSH can
+            # re-evaluate it next cycle. Record the pair for cross-group merging.
+            # Do NOT create a singleton group (it would trap doc_b permanently
+            # since LSH skips already-grouped docs).
             insert_verified_pair(conn, doc_a, doc_b, similarity, phase="match")
         else:
             add_group_member(conn, group_a, doc_b, similarity)
     elif group_b is not None:
         size_b = get_group_member_count(conn, group_b)
         if size_b >= _MERGE_SIZE_LIMIT:
-            # Group is too large — create a new group for doc_a instead
-            new_group = create_match_group(conn)
-            add_group_member(conn, new_group, doc_a, similarity)
+            # Group is too large — leave doc_a ungrouped (same rationale as above)
             insert_verified_pair(conn, doc_a, doc_b, similarity, phase="match")
         else:
             add_group_member(conn, group_b, doc_a, similarity)
@@ -644,7 +642,10 @@ Add constants after the existing imports:
 
 ```python
 # Groups with more members than this are sub-clustered before merging.
-_CLUSTER_THRESHOLD = 500
+# Set higher than _MERGE_SIZE_LIMIT (in matcher.py) to create a buffer zone:
+# groups that organically grow to 500-2000 are simply capped (no new members
+# via merge), but not disrupted. Only truly pathological groups get sub-clustered.
+_CLUSTER_THRESHOLD = 2000
 ```
 
 Add the implementation before `run_merger()`:
@@ -780,11 +781,26 @@ def cluster_and_split_group(
                 group_id, len(final_clusters), len(orphans),
                 len(orphans) / max(len(member_ids), 1) * 100)
 
-    # Step 1: Remove ALL members from the original group
+    # Step 1: Clean up the original group.
+    # Delete output PDF if it exists (prevents orphan files on disk).
+    existing_result = conn.execute(
+        "SELECT output_path, recovered_count, output_generated FROM merge_results WHERE group_id = ?",
+        (group_id,)
+    ).fetchone()
+    if existing_result and existing_result["output_path"]:
+        import os
+        try:
+            os.remove(existing_result["output_path"])
+            logger.info("Removed output PDF for group %d before split: %s",
+                        group_id, existing_result["output_path"])
+        except OSError:
+            pass
+    if existing_result and existing_result["recovered_count"] and existing_result["recovered_count"] > 0:
+        logger.warning("Group %d had %d prior recoveries — will be re-merged in sub-groups",
+                       group_id, existing_result["recovered_count"])
+
     conn.execute("DELETE FROM match_group_members WHERE group_id = ?", (group_id,))
-    # Delete any existing merge result for the original group
     conn.execute("DELETE FROM merge_results WHERE group_id = ?", (group_id,))
-    # Delete the original group itself
     conn.execute("DELETE FROM match_groups WHERE group_id = ?", (group_id,))
 
     # Step 2: Create permanent sub-groups
@@ -1085,12 +1101,14 @@ def run_cross_group_merger(
         group_b = pair["group_b"]
 
         # Determine which group has the more-redacted doc
-        text_a = (conn.execute(
+        row_a = conn.execute(
             "SELECT extracted_text FROM documents WHERE id = ?", (doc_a_id,)
-        ).fetchone() or {}).get("extracted_text", "") or ""
-        text_b = (conn.execute(
+        ).fetchone()
+        text_a = (row_a["extracted_text"] if row_a else "") or ""
+        row_b = conn.execute(
             "SELECT extracted_text FROM documents WHERE id = ?", (doc_b_id,)
-        ).fetchone() or {}).get("extracted_text", "") or ""
+        ).fetchone()
+        text_b = (row_b["extracted_text"] if row_b else "") or ""
 
         count_a = sum(text_a.count(m) for m in redaction_markers)
         count_b = sum(text_b.count(m) for m in redaction_markers)
@@ -1247,11 +1265,15 @@ if not _shutdown_requested:
         logger.info("Stage 3: processed %d cross-group pairs", cross_count)
 ```
 
-Also update the existing `run_merger` call to pass `shutdown_check`:
+Update BOTH existing `run_merger` calls to pass `shutdown_check`. There are two calls in `_run_one_cycle`:
 
+1. Line 305: `merged_count = run_merger(conn, redaction_markers=markers)` — the primary merge pass
+2. Line 327: `run_merger(conn, redaction_markers=markers)` — the re-merge pass after processing the merge queue
+
+Both must become:
 ```python
-merged_count = run_merger(conn, redaction_markers=markers,
-                          shutdown_check=lambda: _shutdown_requested)
+run_merger(conn, redaction_markers=markers,
+           shutdown_check=lambda: _shutdown_requested)
 ```
 
 Move the `run_cross_group_merger` import to the top of the file with the other merger imports.
