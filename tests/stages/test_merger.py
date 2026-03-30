@@ -1,12 +1,14 @@
 import pytest
 import json
+from datasketch import MinHash
 from core.db import (
     init_db, get_connection, upsert_document, create_match_group,
-    add_group_member, upsert_merge_result
+    add_group_member, upsert_merge_result, upsert_fingerprint
 )
 from stages.merger import (
     find_redaction_positions, extract_anchors,
-    find_text_between_anchors, merge_group, run_merger
+    find_text_between_anchors, merge_group, run_merger,
+    cluster_and_split_group,
 )
 
 REDACTION_MARKERS = ["[REDACTED]", "[b(6)]"]
@@ -661,3 +663,130 @@ def test_enhanced_merge_full_integration(conn):
     assert "Captain James Lee" in result["merged_text"]
     assert "Palm Beach International" in result["merged_text"]
     assert result["total_redacted"] >= 3
+
+
+# --- Sub-clustering helpers and tests ---
+
+def _seed_doc_with_fingerprint(conn, doc_id, text, num_perm=128):
+    """Seed a document and compute+store its MinHash fingerprint."""
+    seed_doc(conn, doc_id, text)
+    mh = MinHash(num_perm=num_perm)
+    for shingle in [text[i:i+5] for i in range(len(text) - 4)]:
+        mh.update(shingle.encode('utf-8'))
+    upsert_fingerprint(conn, doc_id, mh.hashvalues.tobytes(), max(len(text) - 4, 0))
+
+
+def test_cluster_and_split_creates_permanent_subgroups(conn):
+    """A mega-group with 2 unrelated sub-clusters should be split into 2 permanent groups."""
+    base_a = (
+        "From: jeffrey@example.com\nTo: pilot@example.com\n"
+        "Subject: Flight schedule for the weekend trip\n\n"
+        "The flight to [REDACTED] departs at 9am from Palm Beach airport terminal."
+    )
+    donor_a = (
+        "From: jeffrey@example.com\nTo: pilot@example.com\n"
+        "Subject: Flight schedule for the weekend trip\n\n"
+        "The flight to Little St. James departs at 9am from Palm Beach airport terminal."
+    )
+    base_b = (
+        "CASE NO. 2005-0042\nSouthern District of New York\n"
+        "Plaintiff: [REDACTED]\n"
+        "The deposition was taken on March 10, 2005 at the courthouse."
+    )
+    donor_b = (
+        "CASE NO. 2005-0042\nSouthern District of New York\n"
+        "Plaintiff: Virginia Giuffre\n"
+        "The deposition was taken on March 10, 2005 at the courthouse."
+    )
+    _seed_doc_with_fingerprint(conn, "a1", base_a)
+    _seed_doc_with_fingerprint(conn, "a2", donor_a)
+    _seed_doc_with_fingerprint(conn, "b1", base_b)
+    _seed_doc_with_fingerprint(conn, "b2", donor_b)
+    conn.commit()
+
+    g = create_match_group(conn)
+    for doc_id in ["a1", "a2", "b1", "b2"]:
+        add_group_member(conn, g, doc_id, 1.0)
+    conn.commit()
+
+    new_group_ids = cluster_and_split_group(conn, g, REDACTION_MARKERS)
+
+    original = conn.execute("SELECT * FROM match_groups WHERE group_id = ?", (g,)).fetchone()
+    assert original is None, "Original mega-group should be deleted after splitting"
+    assert len(new_group_ids) >= 2
+    for gid in new_group_ids:
+        count = conn.execute(
+            "SELECT COUNT(*) FROM match_group_members WHERE group_id = ?", (gid,)
+        ).fetchone()[0]
+        assert count == 2
+
+
+def test_cluster_and_split_releases_orphans(conn):
+    """Documents with no within-group match should be released."""
+    base = (
+        "From: jeffrey@example.com\nTo: pilot@example.com\n"
+        "Subject: Flight plan details\n\nPassenger [REDACTED] on the manifest today."
+    )
+    donor = (
+        "From: jeffrey@example.com\nTo: pilot@example.com\n"
+        "Subject: Flight plan details\n\nPassenger Bill Clinton on the manifest today."
+    )
+    orphan = (
+        "From: accountant@example.com\nTo: bank@example.com\n"
+        "Subject: Wire transfer instructions\n\nPlease transfer $50,000 to account number."
+    )
+    _seed_doc_with_fingerprint(conn, "r1", base)
+    _seed_doc_with_fingerprint(conn, "r2", donor)
+    _seed_doc_with_fingerprint(conn, "orphan", orphan)
+    conn.commit()
+
+    g = create_match_group(conn)
+    add_group_member(conn, g, "r1", 1.0)
+    add_group_member(conn, g, "r2", 1.0)
+    add_group_member(conn, g, "orphan", 1.0)
+    conn.commit()
+
+    new_group_ids = cluster_and_split_group(conn, g, REDACTION_MARKERS)
+
+    orphan_group = conn.execute(
+        "SELECT group_id FROM match_group_members WHERE doc_id = 'orphan'"
+    ).fetchone()
+    assert orphan_group is None, "Orphan doc should be released from all groups"
+
+    r1_group = conn.execute(
+        "SELECT group_id FROM match_group_members WHERE doc_id = 'r1'"
+    ).fetchone()
+    assert r1_group is not None
+
+
+def test_cluster_and_split_handles_recursive_large_component(conn):
+    """If a connected component still exceeds the cluster threshold, it is accepted."""
+    import stages.merger as merger_mod
+    original = merger_mod._CLUSTER_THRESHOLD
+    merger_mod._CLUSTER_THRESHOLD = 2
+
+    try:
+        texts = [
+            ("The investigation revealed important details about the case on March 10 "
+             "in Palm Beach Florida. The witness testified under oath that the events "
+             "took place at the residence on the evening of the incident. Version " + str(i))
+            for i in range(4)
+        ]
+        for i, text in enumerate(texts):
+            _seed_doc_with_fingerprint(conn, f"d{i}", text)
+        conn.commit()
+
+        g = create_match_group(conn)
+        for i in range(4):
+            add_group_member(conn, g, f"d{i}", 1.0)
+        conn.commit()
+
+        new_group_ids = cluster_and_split_group(conn, g, REDACTION_MARKERS)
+
+        for i in range(4):
+            row = conn.execute(
+                "SELECT group_id FROM match_group_members WHERE doc_id = ?", (f"d{i}",)
+            ).fetchone()
+            assert row is not None, f"Doc d{i} should still be in a group"
+    finally:
+        merger_mod._CLUSTER_THRESHOLD = original

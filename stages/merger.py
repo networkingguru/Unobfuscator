@@ -4,12 +4,19 @@ Logic reference: PIPELINE.md — Phase 4 (Merging)
 """
 
 import bisect
+import json
 import logging
+import os
 import re
+from collections import defaultdict, deque
 from typing import Optional
+
+import numpy as np
 from core.db import upsert_merge_result
 
 logger = logging.getLogger(__name__)
+
+_CLUSTER_THRESHOLD = 2000
 
 
 def _normalize_for_anchor(text: str) -> str:
@@ -565,6 +572,160 @@ def merge_group(
         "source_doc_ids": [base_id] + source_doc_ids,
         "recovered_segments": recovered_segments,
     }
+
+
+def _load_group_fingerprints(conn, group_id: int, num_perm: int = 128) -> dict:
+    """Load MinHash fingerprints for all members of a group."""
+    from datasketch import MinHash
+    rows = conn.execute("""
+        SELECT f.doc_id, f.minhash_sig
+        FROM match_group_members m
+        JOIN document_fingerprints f ON f.doc_id = m.doc_id
+        WHERE m.group_id = ?
+    """, (group_id,)).fetchall()
+    result = {}
+    for row in rows:
+        mh = MinHash(num_perm=num_perm)
+        mh.hashvalues = np.frombuffer(row["minhash_sig"], dtype=np.uint64).copy()
+        result[row["doc_id"]] = mh
+    return result
+
+
+def _find_clusters(
+    fingerprints: dict, threshold: float = 0.70, num_perm: int = 128
+) -> tuple[list[set], set]:
+    """Use LSH to find connected components (sub-clusters) within fingerprints.
+
+    Returns (clusters, orphans) where clusters is a list of sets of doc_ids
+    (each with >=2 members) and orphans is the set of doc_ids with no match.
+    """
+    from datasketch import MinHashLSH
+
+    if not fingerprints:
+        return [], set()
+
+    lsh = MinHashLSH(threshold=threshold, num_perm=num_perm)
+    for doc_id, mh in fingerprints.items():
+        try:
+            lsh.insert(doc_id, mh)
+        except ValueError:
+            pass
+
+    graph = defaultdict(set)
+    has_match = set()
+    for doc_id, mh in fingerprints.items():
+        neighbors = lsh.query(mh)
+        for n in neighbors:
+            if n != doc_id:
+                graph[doc_id].add(n)
+                graph[n].add(doc_id)
+                has_match.add(doc_id)
+                has_match.add(n)
+
+    visited = set()
+    clusters = []
+    for node in graph:
+        if node in visited:
+            continue
+        cluster = set()
+        queue = deque([node])
+        while queue:
+            n = queue.popleft()
+            if n in visited:
+                continue
+            visited.add(n)
+            cluster.add(n)
+            queue.extend(graph[n] - visited)
+        if len(cluster) >= 2:
+            clusters.append(cluster)
+
+    orphans = set(fingerprints.keys()) - has_match
+    return clusters, orphans
+
+
+def cluster_and_split_group(
+    conn, group_id: int, redaction_markers: list[str],
+    lsh_threshold: float = 0.70, num_perm: int = 128,
+    shutdown_check=None,
+) -> list[int]:
+    """Split a mega-group into permanent sub-groups based on text similarity."""
+    from core.db import create_match_group, add_group_member
+
+    member_ids = {row["doc_id"] for row in conn.execute(
+        "SELECT doc_id FROM match_group_members WHERE group_id = ?", (group_id,)
+    ).fetchall()}
+
+    logger.info("Splitting group %d (%d members) into sub-groups...", group_id, len(member_ids))
+
+    fingerprints = _load_group_fingerprints(conn, group_id, num_perm=num_perm)
+    if not fingerprints:
+        logger.warning("Group %d: no fingerprints available for any member, skipping split", group_id)
+        return [group_id]
+
+    members_without_fp = member_ids - set(fingerprints.keys())
+
+    clusters, orphans = _find_clusters(fingerprints, threshold=lsh_threshold, num_perm=num_perm)
+    orphans = orphans | members_without_fp
+
+    # Iterative sub-clustering with increasing threshold
+    final_clusters = []
+    work_queue = [(cluster, lsh_threshold) for cluster in clusters]
+    while work_queue:
+        cluster, current_threshold = work_queue.pop()
+        if len(cluster) > _CLUSTER_THRESHOLD and current_threshold < 0.95:
+            higher_threshold = min(current_threshold + 0.05, 0.95)
+            sub_fps = {doc_id: fingerprints[doc_id] for doc_id in cluster if doc_id in fingerprints}
+            sub_clusters, sub_orphans = _find_clusters(sub_fps, threshold=higher_threshold, num_perm=num_perm)
+            orphans = orphans | sub_orphans
+            for sc in sub_clusters:
+                work_queue.append((sc, higher_threshold))
+        else:
+            if len(cluster) > _CLUSTER_THRESHOLD:
+                logger.warning("Sub-cluster of %d members still exceeds threshold at "
+                               "max threshold 0.95 — accepting as-is", len(cluster))
+            final_clusters.append(cluster)
+
+    logger.info("Group %d: %d sub-clusters, %d orphans (%.1f%%)",
+                group_id, len(final_clusters), len(orphans),
+                len(orphans) / max(len(member_ids), 1) * 100)
+
+    # Clean up original group
+    existing_result = conn.execute(
+        "SELECT output_path, recovered_count, output_generated FROM merge_results WHERE group_id = ?",
+        (group_id,)
+    ).fetchone()
+    if existing_result and existing_result["output_path"]:
+        try:
+            os.remove(existing_result["output_path"])
+            logger.info("Removed output PDF for group %d before split: %s",
+                        group_id, existing_result["output_path"])
+        except OSError:
+            pass
+    if existing_result and existing_result["recovered_count"] and existing_result["recovered_count"] > 0:
+        logger.warning("Group %d had %d prior recoveries — will be re-merged in sub-groups",
+                       group_id, existing_result["recovered_count"])
+
+    conn.execute("DELETE FROM match_group_members WHERE group_id = ?", (group_id,))
+    conn.execute("DELETE FROM merge_results WHERE group_id = ?", (group_id,))
+    conn.execute("DELETE FROM match_groups WHERE group_id = ?", (group_id,))
+
+    # Create permanent sub-groups
+    new_group_ids = []
+    for cluster_doc_ids in final_clusters:
+        new_gid = conn.execute("INSERT INTO match_groups (merged) VALUES (0)").lastrowid
+        for doc_id in cluster_doc_ids:
+            conn.execute(
+                "INSERT OR IGNORE INTO match_group_members (group_id, doc_id, similarity) "
+                "VALUES (?, ?, 1.0)",
+                (new_gid, doc_id)
+            )
+        new_group_ids.append(new_gid)
+
+    logger.info("Group %d: split into %d sub-groups, released %d orphans",
+                group_id, len(new_group_ids), len(orphans))
+
+    conn.commit()
+    return new_group_ids
 
 
 def run_merger(conn, redaction_markers: list[str], anchor_length: int = 50) -> int:
