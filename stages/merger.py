@@ -892,7 +892,7 @@ def run_cross_group_merger(
         applied_count = 0
         new_segments = []
 
-        # Pass 1: Anchor matching
+        # Pass 1: Anchor matching with adaptive widths
         positions = find_redaction_positions(updated_text, redaction_markers)
         for pos, marker in reversed(positions):
             left_anchor, right_anchor = extract_anchors(
@@ -901,17 +901,32 @@ def run_cross_group_merger(
             alpha_content = re.sub(r'[^a-zA-Z0-9]', '', left_anchor + right_anchor)
             if len(alpha_content) < 8:
                 continue
-            recovered = find_text_between_anchors(donor_text, left_anchor, right_anchor)
-            if recovered and _is_real_recovery(recovered, redaction_markers):
-                updated_text = updated_text[:pos] + recovered + updated_text[pos + len(marker):]
-                applied_count += 1
-                new_segments.append({
-                    "text": recovered,
-                    "source_doc_id": donor_id,
-                    "stage": "cross_group",
-                    "confidence": "high",
-                    "anchor_alpha_len": len(alpha_content),
-                })
+
+            # Try progressively wider anchors if the default width fails
+            anchor_widths = sorted(set([anchor_length, 100, 150, 200]))
+            recovered_this = False
+            for width in anchor_widths:
+                if recovered_this:
+                    break
+                if width == anchor_length:
+                    left_w, right_w = left_anchor, right_anchor
+                else:
+                    left_w, right_w = extract_anchors(
+                        updated_text, pos, len(marker), width, redaction_markers
+                    )
+                recovered = find_text_between_anchors(donor_text, left_w, right_w)
+                if recovered and _is_real_recovery(recovered, redaction_markers):
+                    updated_text = updated_text[:pos] + recovered + updated_text[pos + len(marker):]
+                    applied_count += 1
+                    alpha_w = re.sub(r'[^a-zA-Z0-9]', '', left_w + right_w)
+                    new_segments.append({
+                        "text": recovered,
+                        "source_doc_id": donor_id,
+                        "stage": "cross_group",
+                        "confidence": "high",
+                        "anchor_alpha_len": len(alpha_w),
+                    })
+                    recovered_this = True
 
         # Pass 2: Alignment fallback
         remaining = find_redaction_positions(updated_text, redaction_markers)
