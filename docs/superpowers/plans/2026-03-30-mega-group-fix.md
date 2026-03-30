@@ -4,7 +4,7 @@
 
 **Goal:** Fix the merger hang caused by mega-groups (60K-82K members) by sub-clustering genuine matches within them, releasing orphan documents for re-evaluation, and preventing transitive group merging from re-forming mega-groups.
 
-**Architecture:** Three-layer fix: (1) Pre-merge clustering uses existing MinHash fingerprints + within-group LSH to find genuine sub-clusters in seconds, then merges each sub-cluster with the existing `merge_group()` logic unchanged. (2) Orphan documents (86% of mega-group members that have no genuine match) are released from the group so the LSH pipeline can re-evaluate them against the full corpus. (3) `_assign_to_group()` is modified to record cross-group pairs in a new `verified_pairs` table instead of calling `merge_groups()`, preventing transitive chaining from creating new mega-groups. A new merger step processes cross-group pairs for redaction recovery.
+**Architecture:** Three-layer fix: (1) Pre-merge clustering uses existing MinHash fingerprints + within-group LSH to find genuine sub-clusters in seconds, then **splits the mega-group into permanent sub-groups** — each gets its own group_id and merge_result, preserving full fidelity. Orphan documents (86% of mega-group members) are released for re-evaluation by the LSH pipeline. (2) `_assign_to_group()` is modified to record cross-group pairs in a new `verified_pairs` table instead of calling `merge_groups()` — but only when one or both groups exceed `_MERGE_SIZE_LIMIT` (default 1000). Small groups still merge normally to preserve Phase 0/3 grouping semantics. (3) A new cross-group merger step reuses the full `merge_group()` pipeline on verified pairs between different groups.
 
 **Tech Stack:** Python 3.12, SQLite (WAL mode), datasketch (MinHash/MinHashLSH), numpy
 
@@ -15,8 +15,8 @@
 | File | Action | Responsibility |
 |------|--------|---------------|
 | `core/db.py` | Modify | Add `verified_pairs` table to schema, add helper functions |
-| `stages/merger.py` | Modify | Add `cluster_and_merge_group()`, cross-group pair merging |
-| `stages/matcher.py` | Modify | Change `_assign_to_group()` to record pairs instead of merging groups |
+| `stages/merger.py` | Modify | Add `cluster_and_split_group()`, cross-group pair merging |
+| `stages/matcher.py` | Modify | Change `_assign_to_group()` to block merges above size limit |
 | `tests/core/test_db.py` | Modify | Tests for verified_pairs CRUD |
 | `tests/stages/test_merger.py` | Modify | Tests for sub-clustering and cross-group merging |
 | `tests/stages/test_matcher.py` | Modify | Tests for the new `_assign_to_group()` behavior |
@@ -103,7 +103,6 @@ def test_get_unmerged_cross_group_pairs_excludes_merged(conn):
     add_group_member(conn, g2, "2", 1.0)
     insert_verified_pair(conn, "1", "2", similarity=0.85, phase="phase3")
     conn.commit()
-    # Mark pair as merged
     conn.execute("UPDATE verified_pairs SET pair_merged = 1 WHERE doc_id_a = '1' AND doc_id_b = '2'")
     conn.commit()
     pairs = get_unmerged_cross_group_pairs(conn)
@@ -120,7 +119,7 @@ Expected: All FAIL with `ImportError` (functions don't exist yet).
 
 In `core/db.py`, add to the `SCHEMA` string after the `match_group_members` table (after line 48):
 
-```python
+```sql
 CREATE TABLE IF NOT EXISTS verified_pairs (
     doc_id_a TEXT NOT NULL REFERENCES documents(id),
     doc_id_b TEXT NOT NULL REFERENCES documents(id),
@@ -137,7 +136,7 @@ CREATE INDEX IF NOT EXISTS idx_verified_pairs_doc_b ON verified_pairs(doc_id_b);
 CREATE INDEX IF NOT EXISTS idx_verified_pairs_unmerged ON verified_pairs(pair_merged) WHERE pair_merged = 0;
 ```
 
-Also add a migration in `_migrate_text_recovery_columns()` (or add a new migration function called from `init_db`) to create this table on existing databases:
+Also add a migration in `_migrate_text_recovery_columns()` to create this table on existing databases:
 
 ```python
 try:
@@ -206,6 +205,14 @@ def get_unmerged_cross_group_pairs(conn) -> list[dict]:
           AND vp.pair_merged = 0
     """).fetchall()
     return [dict(r) for r in rows]
+
+
+def get_group_member_count(conn, group_id: int) -> int:
+    """Return the number of members in a match group."""
+    row = conn.execute(
+        "SELECT COUNT(*) FROM match_group_members WHERE group_id = ?", (group_id,)
+    ).fetchone()
+    return row[0]
 ```
 
 - [ ] **Step 5: Update imports in test file**
@@ -235,60 +242,76 @@ git commit -m "feat: add verified_pairs table for cross-group pair tracking"
 
 ---
 
-### Task 2: Modify `_assign_to_group()` to Record Pairs Instead of Merging Groups
+### Task 2: Modify `_assign_to_group()` to Block Large Group Merges
 
 **Files:**
 - Modify: `stages/matcher.py:732-748`
+- Modify: `tests/stages/test_matcher.py:438-456`
 - Test: `tests/stages/test_matcher.py`
 
-- [ ] **Step 1: Write failing test for the new behavior**
+**Design note:** Small groups (both below `_MERGE_SIZE_LIMIT = 1000`) still merge normally via `merge_groups()`. This preserves Phase 0/3 grouping semantics for the 99.8% of groups that have <100 members. Only when a merge would create or enlarge a mega-group does it record a verified pair instead.
 
-Add to `tests/stages/test_matcher.py`. First check existing test structure and imports, then add:
+- [ ] **Step 1: Write failing tests for the new behavior**
+
+Read `tests/stages/test_matcher.py` to understand the existing `conn` fixture and `seed_doc` helper. Then add these tests:
 
 ```python
-from core.db import (
-    create_match_group, add_group_member, get_doc_group,
-    insert_verified_pair, get_verified_pairs_for_doc,
-)
-from stages.matcher import _assign_to_group
+from core.db import insert_verified_pair, get_verified_pairs_for_doc, get_group_member_count
+from stages.matcher import _assign_to_group, _MERGE_SIZE_LIMIT
 
 
-def _seed_doc(conn, doc_id, text="sample text"):
-    from core.db import upsert_document
-    upsert_document(conn, {
-        "id": doc_id, "source": "test", "release_batch": "VOL00001",
-        "original_filename": f"{doc_id}.pdf", "page_count": 1,
-        "size_bytes": 100, "description": "", "extracted_text": text,
-    })
-
-
-def test_assign_to_group_records_pair_instead_of_merging(conn):
-    """When both docs are in different groups, record a verified pair, don't merge."""
-    _seed_doc(conn, "a")
-    _seed_doc(conn, "b")
+def test_assign_to_group_blocks_merge_when_group_exceeds_limit(conn):
+    """When one group exceeds _MERGE_SIZE_LIMIT, record pair instead of merging."""
+    seed_doc(conn, "a", "text a")
+    seed_doc(conn, "b", "text b")
     g1 = create_match_group(conn)
     g2 = create_match_group(conn)
     add_group_member(conn, g1, "a", 1.0)
     add_group_member(conn, g2, "b", 1.0)
     conn.commit()
 
+    # Simulate g1 being a large group by patching the limit low
+    import stages.matcher as matcher_mod
+    original = matcher_mod._MERGE_SIZE_LIMIT
+    matcher_mod._MERGE_SIZE_LIMIT = 1  # any group with >=1 member triggers the guard
+    try:
+        _assign_to_group(conn, "a", "b", similarity=0.85)
+        conn.commit()
+
+        # Groups should NOT have been merged
+        assert get_doc_group(conn, "a") == g1
+        assert get_doc_group(conn, "b") == g2
+
+        # But a verified pair should be recorded
+        pairs = get_verified_pairs_for_doc(conn, "a")
+        assert len(pairs) == 1
+        assert pairs[0]["similarity"] == 0.85
+    finally:
+        matcher_mod._MERGE_SIZE_LIMIT = original
+
+
+def test_assign_to_group_still_merges_small_groups(conn):
+    """When both groups are below _MERGE_SIZE_LIMIT, merge normally."""
+    seed_doc(conn, "a", "text a")
+    seed_doc(conn, "b", "text b")
+    g1 = create_match_group(conn)
+    g2 = create_match_group(conn)
+    add_group_member(conn, g1, "a", 1.0)
+    add_group_member(conn, g2, "b", 1.0)
+    conn.commit()
+
+    # Default limit is 1000 — both groups have 1 member, well under limit
     _assign_to_group(conn, "a", "b", similarity=0.85)
     conn.commit()
 
-    # Groups should NOT have been merged
-    assert get_doc_group(conn, "a") == g1
-    assert get_doc_group(conn, "b") == g2
-
-    # But a verified pair should be recorded
-    pairs = get_verified_pairs_for_doc(conn, "a")
-    assert len(pairs) == 1
-    assert pairs[0]["similarity"] == 0.85
+    # Groups SHOULD have been merged
+    assert get_doc_group(conn, "a") == get_doc_group(conn, "b")
 
 
 def test_assign_to_group_still_adds_to_existing_group(conn):
-    """When only one doc is grouped, add the other to that group (unchanged behavior)."""
-    _seed_doc(conn, "a")
-    _seed_doc(conn, "b")
+    """When only one doc is grouped, add the other to that group (unchanged)."""
+    seed_doc(conn, "a", "text a")
+    seed_doc(conn, "b", "text b")
     g1 = create_match_group(conn)
     add_group_member(conn, g1, "a", 1.0)
     conn.commit()
@@ -300,9 +323,9 @@ def test_assign_to_group_still_adds_to_existing_group(conn):
 
 
 def test_assign_to_group_still_creates_new_group(conn):
-    """When neither doc is grouped, create a new group (unchanged behavior)."""
-    _seed_doc(conn, "a")
-    _seed_doc(conn, "b")
+    """When neither doc is grouped, create a new group (unchanged)."""
+    seed_doc(conn, "a", "text a")
+    seed_doc(conn, "b", "text b")
     conn.commit()
 
     _assign_to_group(conn, "a", "b", similarity=0.75)
@@ -312,35 +335,48 @@ def test_assign_to_group_still_creates_new_group(conn):
     assert get_doc_group(conn, "a") == get_doc_group(conn, "b")
 ```
 
-NOTE: You will need to adapt these tests to match the existing test file's fixture pattern. Read `tests/stages/test_matcher.py` to check the existing `conn` fixture and imports before writing.
-
 - [ ] **Step 2: Run tests to verify the first test fails**
 
-Run: `cd /root/Unobfuscator && .venv/bin/pytest tests/stages/test_matcher.py::test_assign_to_group_records_pair_instead_of_merging -v`
+Run: `cd /root/Unobfuscator && .venv/bin/pytest tests/stages/test_matcher.py::test_assign_to_group_blocks_merge_when_group_exceeds_limit -v`
 
-Expected: FAIL — `_assign_to_group` currently calls `merge_groups()`.
+Expected: FAIL — `_MERGE_SIZE_LIMIT` doesn't exist yet, and `_assign_to_group` still calls `merge_groups()` unconditionally.
 
 - [ ] **Step 3: Modify `_assign_to_group()` in `stages/matcher.py`**
 
-Replace lines 732-748 with:
+Add the size limit constant near the top of `matcher.py` (after line 36):
+
+```python
+# Maximum group size before merge_groups() is blocked. Groups at or above
+# this size will record a verified_pair instead of merging, preventing
+# the transitive chaining that creates mega-groups (82K+ members).
+_MERGE_SIZE_LIMIT = 1000
+```
+
+Replace `_assign_to_group()` at lines 732-748 with:
 
 ```python
 def _assign_to_group(conn, doc_a, doc_b, similarity: float) -> None:
     """Assign two documents to a shared match group.
 
-    When both docs are already in different groups, record a verified pair
-    instead of merging the groups. This prevents transitive chaining that
-    creates mega-groups (82K+ members) from unrelated documents.
+    When both docs are already in different groups and either group exceeds
+    _MERGE_SIZE_LIMIT, record a verified pair instead of merging the groups.
+    This prevents transitive chaining that creates mega-groups (82K+ members)
+    while preserving normal grouping for small groups.
     """
-    from core.db import insert_verified_pair
+    from core.db import insert_verified_pair, get_group_member_count
 
     group_a = get_doc_group(conn, doc_a)
     group_b = get_doc_group(conn, doc_b)
 
     if group_a is not None and group_b is not None:
         if group_a != group_b:
-            # Record cross-group pair instead of merging groups
-            insert_verified_pair(conn, doc_a, doc_b, similarity, phase="match")
+            size_a = get_group_member_count(conn, group_a)
+            size_b = get_group_member_count(conn, group_b)
+            if size_a >= _MERGE_SIZE_LIMIT or size_b >= _MERGE_SIZE_LIMIT:
+                # Block merge — record cross-group pair instead
+                insert_verified_pair(conn, doc_a, doc_b, similarity, phase="match")
+            else:
+                merge_groups(conn, group_a, group_b)
         # else: same group, nothing to do
     elif group_a is not None:
         add_group_member(conn, group_a, doc_b, similarity)
@@ -352,77 +388,101 @@ def _assign_to_group(conn, doc_a, doc_b, similarity: float) -> None:
         add_group_member(conn, new_group, doc_b, similarity)
 ```
 
-Also update the imports at the top of `matcher.py` (line 19-22): add `insert_verified_pair` if not already imported via the local import above (the local import is fine and avoids circular issues).
+- [ ] **Step 4: Update the existing `test_phase3_merges_two_existing_groups` test**
 
-- [ ] **Step 4: Run all tests to verify**
+This test at `tests/stages/test_matcher.py:438-456` asserts groups merge when both docs are in separate groups. With the new code, small groups still merge (both groups have 1 member, well below 1000), so **this test should still pass unchanged**. Verify this.
 
-Run: `cd /root/Unobfuscator && .venv/bin/pytest tests/stages/test_matcher.py tests/core/test_db.py -v`
+If it fails (unlikely), the issue would be the import of `get_group_member_count`. Debug and fix.
 
-Expected: All PASS. The `test_merge_groups_reassigns_members` test in `test_db.py` still passes because it tests `merge_groups()` directly, not `_assign_to_group()`.
+- [ ] **Step 5: Run all matcher tests**
 
-- [ ] **Step 5: Run full test suite to check for regressions**
+Run: `cd /root/Unobfuscator && .venv/bin/pytest tests/stages/test_matcher.py -v`
+
+Expected: All PASS — including `test_phase3_merges_two_existing_groups` (small groups still merge).
+
+- [ ] **Step 6: Run full test suite**
 
 Run: `cd /root/Unobfuscator && .venv/bin/pytest -v`
 
-Expected: All tests PASS. No existing test should call `_assign_to_group` expecting merge behavior.
+Expected: All tests PASS.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
 cd /root/Unobfuscator
 git add stages/matcher.py tests/stages/test_matcher.py
-git commit -m "feat: replace transitive group merging with cross-group pair tracking
+git commit -m "feat: block transitive group merging above size limit
 
-_assign_to_group() no longer calls merge_groups() when both docs are
-in different groups. Instead, it records the relationship in the new
-verified_pairs table. This prevents the transitive chaining that
-created mega-groups of 82K+ members from unrelated emails."
+_assign_to_group() now checks group sizes before merging. Groups below
+_MERGE_SIZE_LIMIT (1000) merge normally, preserving Phase 0/3 grouping
+semantics. Groups at or above the limit record a verified_pair instead,
+preventing the transitive chaining that created 82K-member mega-groups."
 ```
 
 ---
 
-### Task 3: Add Sub-Clustering to the Merger for Large Groups
+### Task 3: Add Sub-Clustering That Splits Mega-Groups Into Permanent Sub-Groups
 
 **Files:**
-- Modify: `stages/merger.py:570-596` (run_merger)
-- Modify: `stages/merger.py` (new functions)
+- Modify: `stages/merger.py` (new functions, modify run_merger)
 - Test: `tests/stages/test_merger.py`
 
-- [ ] **Step 1: Write failing test for sub-cluster merge**
+**Design note:** Unlike the v1 plan which used temporary groups, this splits the mega-group into permanent sub-groups. Each sub-cluster gets its own `group_id` and `merge_result`. The original mega-group is deleted after splitting. Orphan docs are released (removed from all groups) so the LSH pipeline re-evaluates them.
+
+- [ ] **Step 1: Add `_seed_doc_with_fingerprint` helper to test file**
+
+Add to `tests/stages/test_merger.py` after the existing `seed_doc` helper:
+
+```python
+from datasketch import MinHash
+from core.db import upsert_fingerprint
+
+
+def _seed_doc_with_fingerprint(conn, doc_id, text, num_perm=128):
+    """Seed a document and compute+store its MinHash fingerprint."""
+    seed_doc(conn, doc_id, text)
+    mh = MinHash(num_perm=num_perm)
+    for shingle in [text[i:i+5] for i in range(len(text) - 4)]:
+        mh.update(shingle.encode('utf-8'))
+    upsert_fingerprint(conn, doc_id, mh.hashvalues.tobytes(), max(len(text) - 4, 0))
+```
+
+- [ ] **Step 2: Write failing tests for cluster_and_split_group**
 
 Add to `tests/stages/test_merger.py`:
 
 ```python
-from stages.merger import cluster_and_merge_group
+from stages.merger import cluster_and_split_group
 
-def test_cluster_and_merge_group_splits_unrelated_docs(conn):
-    """A group with 2 unrelated sub-clusters should merge each independently."""
-    # Sub-cluster 1: email about flights
+
+def test_cluster_and_split_creates_permanent_subgroups(conn):
+    """A mega-group with 2 unrelated sub-clusters should be split into 2 permanent groups."""
+    # Sub-cluster 1: flight docs
     base_a = (
         "From: jeffrey@example.com\nTo: pilot@example.com\n"
-        "Subject: Flight schedule\n\n"
-        "The flight to [REDACTED] departs at 9am from Palm Beach."
+        "Subject: Flight schedule for the weekend trip\n\n"
+        "The flight to [REDACTED] departs at 9am from Palm Beach airport terminal."
     )
     donor_a = (
         "From: jeffrey@example.com\nTo: pilot@example.com\n"
-        "Subject: Flight schedule\n\n"
-        "The flight to Little St. James departs at 9am from Palm Beach."
+        "Subject: Flight schedule for the weekend trip\n\n"
+        "The flight to Little St. James departs at 9am from Palm Beach airport terminal."
     )
-    # Sub-cluster 2: completely different email about dinner
+    # Sub-cluster 2: completely different content
     base_b = (
-        "From: chef@example.com\nTo: staff@example.com\n"
-        "Subject: Dinner menu\n\n"
-        "Tonight's guest of honor is [REDACTED] arriving at 7pm."
+        "CASE NO. 2005-0042\nSouthern District of New York\n"
+        "Plaintiff: [REDACTED]\n"
+        "The deposition was taken on March 10, 2005 at the courthouse."
     )
     donor_b = (
-        "From: chef@example.com\nTo: staff@example.com\n"
-        "Subject: Dinner menu\n\n"
-        "Tonight's guest of honor is Prince Andrew arriving at 7pm."
+        "CASE NO. 2005-0042\nSouthern District of New York\n"
+        "Plaintiff: Virginia Giuffre\n"
+        "The deposition was taken on March 10, 2005 at the courthouse."
     )
-    seed_doc(conn, "a1", base_a)
-    seed_doc(conn, "a2", donor_a)
-    seed_doc(conn, "b1", base_b)
-    seed_doc(conn, "b2", donor_b)
+    _seed_doc_with_fingerprint(conn, "a1", base_a)
+    _seed_doc_with_fingerprint(conn, "a2", donor_a)
+    _seed_doc_with_fingerprint(conn, "b1", base_b)
+    _seed_doc_with_fingerprint(conn, "b2", donor_b)
     conn.commit()
 
     g = create_match_group(conn)
@@ -430,31 +490,40 @@ def test_cluster_and_merge_group_splits_unrelated_docs(conn):
         add_group_member(conn, g, doc_id, 1.0)
     conn.commit()
 
-    # Cluster threshold of 0.70 should split into 2 sub-clusters
-    result = cluster_and_merge_group(conn, g, REDACTION_MARKERS, anchor_length=50)
-    assert "Little St. James" in result["merged_text"]
-    assert "Prince Andrew" in result["merged_text"]
-    assert result["recovered_count"] == 2
+    new_group_ids = cluster_and_split_group(conn, g, REDACTION_MARKERS)
+
+    # Original group should be deleted
+    original = conn.execute("SELECT * FROM match_groups WHERE group_id = ?", (g,)).fetchone()
+    assert original is None, "Original mega-group should be deleted after splitting"
+
+    # Should have created 2 new permanent groups
+    assert len(new_group_ids) >= 2
+
+    # Each sub-group should have 2 members
+    for gid in new_group_ids:
+        count = conn.execute(
+            "SELECT COUNT(*) FROM match_group_members WHERE group_id = ?", (gid,)
+        ).fetchone()[0]
+        assert count == 2
 
 
-def test_cluster_and_merge_group_releases_orphans(conn):
-    """Documents with no within-group match should be released (removed from group)."""
-    # 2 related docs + 1 orphan
+def test_cluster_and_split_releases_orphans(conn):
+    """Documents with no within-group match should be released (removed from all groups)."""
     base = (
         "From: jeffrey@example.com\nTo: pilot@example.com\n"
-        "Subject: Flight\n\nThe passenger was [REDACTED] on the manifest."
+        "Subject: Flight plan details\n\nPassenger [REDACTED] on the manifest today."
     )
     donor = (
         "From: jeffrey@example.com\nTo: pilot@example.com\n"
-        "Subject: Flight\n\nThe passenger was Bill Clinton on the manifest."
+        "Subject: Flight plan details\n\nPassenger Bill Clinton on the manifest today."
     )
     orphan = (
         "From: accountant@example.com\nTo: bank@example.com\n"
-        "Subject: Wire transfer\n\nPlease transfer $50,000 to account [REDACTED]."
+        "Subject: Wire transfer instructions\n\nPlease transfer $50,000 to account number."
     )
-    seed_doc(conn, "r1", base)
-    seed_doc(conn, "r2", donor)
-    seed_doc(conn, "orphan", orphan)
+    _seed_doc_with_fingerprint(conn, "r1", base)
+    _seed_doc_with_fingerprint(conn, "r2", donor)
+    _seed_doc_with_fingerprint(conn, "orphan", orphan)
     conn.commit()
 
     g = create_match_group(conn)
@@ -463,44 +532,81 @@ def test_cluster_and_merge_group_releases_orphans(conn):
     add_group_member(conn, g, "orphan", 1.0)
     conn.commit()
 
-    result = cluster_and_merge_group(conn, g, REDACTION_MARKERS, anchor_length=50)
+    new_group_ids = cluster_and_split_group(conn, g, REDACTION_MARKERS)
 
-    # Orphan should have been removed from the group
+    # Orphan should not be in any group
     orphan_group = conn.execute(
         "SELECT group_id FROM match_group_members WHERE doc_id = 'orphan'"
     ).fetchone()
-    assert orphan_group is None, "Orphan doc should be released from group"
+    assert orphan_group is None, "Orphan doc should be released from all groups"
 
-    # Related docs should still be in the group
-    assert conn.execute(
+    # Related docs should be in one of the new groups
+    r1_group = conn.execute(
         "SELECT group_id FROM match_group_members WHERE doc_id = 'r1'"
-    ).fetchone() is not None
+    ).fetchone()
+    assert r1_group is not None
+
+
+def test_cluster_and_split_handles_recursive_large_component(conn):
+    """If a connected component still exceeds the cluster threshold, it is recursively split."""
+    import stages.merger as merger_mod
+    original = merger_mod._CLUSTER_THRESHOLD
+    merger_mod._CLUSTER_THRESHOLD = 2  # Very low threshold for testing
+
+    try:
+        # 4 docs that are all somewhat similar (they'll form one big component)
+        texts = [
+            "The investigation revealed details about the case on March 10 in Palm Beach Florida version " + str(i)
+            for i in range(4)
+        ]
+        for i, text in enumerate(texts):
+            _seed_doc_with_fingerprint(conn, f"d{i}", text)
+        conn.commit()
+
+        g = create_match_group(conn)
+        for i in range(4):
+            add_group_member(conn, g, f"d{i}", 1.0)
+        conn.commit()
+
+        new_group_ids = cluster_and_split_group(conn, g, REDACTION_MARKERS)
+
+        # All docs should still be in some group (not lost)
+        for i in range(4):
+            row = conn.execute(
+                "SELECT group_id FROM match_group_members WHERE doc_id = ?", (f"d{i}",)
+            ).fetchone()
+            assert row is not None, f"Doc d{i} should still be in a group"
+    finally:
+        merger_mod._CLUSTER_THRESHOLD = original
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [ ] **Step 2b: Run tests to verify they fail**
 
-Run: `cd /root/Unobfuscator && .venv/bin/pytest tests/stages/test_merger.py::test_cluster_and_merge_group_splits_unrelated_docs tests/stages/test_merger.py::test_cluster_and_merge_group_releases_orphans -v`
+Run: `cd /root/Unobfuscator && .venv/bin/pytest tests/stages/test_merger.py::test_cluster_and_split_creates_permanent_subgroups tests/stages/test_merger.py::test_cluster_and_split_releases_orphans -v`
 
-Expected: FAIL with `ImportError` (function doesn't exist yet).
+Expected: FAIL with `ImportError`.
 
-- [ ] **Step 3: Implement `cluster_and_merge_group()`**
+- [ ] **Step 3: Implement `cluster_and_split_group()` and helpers**
 
-Add to `stages/merger.py` before `run_merger()` (before line 570). Add necessary imports at the top of the file:
+Add imports at the top of `stages/merger.py`:
 
 ```python
+import json
 import struct
 import numpy as np
 from collections import defaultdict, deque
 ```
 
-Then add the function:
+Add constants after the existing imports:
 
 ```python
-# Threshold for sub-clustering large groups.  Groups with more members
-# than this are sub-clustered before merging to avoid O(n*d) donor iteration.
-_CLUSTER_THRESHOLD = 50
+# Groups with more members than this are sub-clustered before merging.
+_CLUSTER_THRESHOLD = 500
+```
 
+Add the implementation before `run_merger()`:
 
+```python
 def _load_group_fingerprints(conn, group_id: int, num_perm: int = 128) -> dict:
     """Load MinHash fingerprints for all members of a group."""
     from datasketch import MinHash
@@ -518,16 +624,18 @@ def _load_group_fingerprints(conn, group_id: int, num_perm: int = 128) -> dict:
     return result
 
 
-def _find_clusters(fingerprints: dict, threshold: float = 0.70, num_perm: int = 128) -> tuple[list[set], set]:
+def _find_clusters(
+    fingerprints: dict, threshold: float = 0.70, num_perm: int = 128
+) -> tuple[list[set], set]:
     """Use LSH to find connected components (sub-clusters) within fingerprints.
 
     Returns (clusters, orphans) where clusters is a list of sets of doc_ids
-    and orphans is the set of doc_ids with no match.
+    (each with >=2 members) and orphans is the set of doc_ids with no match.
     """
     from datasketch import MinHashLSH
 
     if not fingerprints:
-        return [], set()
+        return [], set(fingerprints.keys())
 
     lsh = MinHashLSH(threshold=threshold, num_perm=num_perm)
     for doc_id, mh in fingerprints.items():
@@ -570,169 +678,153 @@ def _find_clusters(fingerprints: dict, threshold: float = 0.70, num_perm: int = 
     return clusters, orphans
 
 
-def cluster_and_merge_group(
-    conn, group_id: int, redaction_markers: list[str], anchor_length: int = 50,
+def cluster_and_split_group(
+    conn, group_id: int, redaction_markers: list[str],
     lsh_threshold: float = 0.70, num_perm: int = 128,
-) -> dict:
-    """Sub-cluster a large group by text similarity, merge each cluster, release orphans.
+    shutdown_check=None,
+) -> list[int]:
+    """Split a mega-group into permanent sub-groups based on text similarity.
 
     1. Load pre-computed MinHash fingerprints for group members
     2. Build within-group LSH index to find genuine pairs
     3. Extract connected components as sub-clusters
-    4. Merge each sub-cluster with existing merge_group() logic
-    5. Remove orphan documents from the group
-    6. Return aggregated results (best merged_text per sub-cluster)
+    4. If any component still exceeds _CLUSTER_THRESHOLD, recursively split
+       it with a higher LSH threshold
+    5. Create a permanent new group for each sub-cluster
+    6. Remove orphan documents from all groups (released for LSH re-eval)
+    7. Delete the original mega-group
+    8. Return list of new group_ids
+
+    Each new group gets merged by the normal run_merger() loop.
     """
+    from core.db import create_match_group, add_group_member
+
     member_ids = {row["doc_id"] for row in conn.execute(
         "SELECT doc_id FROM match_group_members WHERE group_id = ?", (group_id,)
     ).fetchall()}
 
-    logger.info("Clustering group %d (%d members) before merge...", group_id, len(member_ids))
+    logger.info("Splitting group %d (%d members) into sub-groups...", group_id, len(member_ids))
 
     fingerprints = _load_group_fingerprints(conn, group_id, num_perm=num_perm)
-    # Members without fingerprints are treated as orphans
     members_without_fp = member_ids - set(fingerprints.keys())
 
     clusters, orphans = _find_clusters(fingerprints, threshold=lsh_threshold, num_perm=num_perm)
     orphans = orphans | members_without_fp
 
+    # Recursive sub-clustering: if a component is still too large, re-cluster
+    # with progressively higher thresholds to break it apart further.
+    # Bounded: threshold increases by 0.05 each level, capped at 0.95.
+    final_clusters = []
+    work_queue = [(cluster, lsh_threshold) for cluster in clusters]
+    while work_queue:
+        cluster, current_threshold = work_queue.pop()
+        if len(cluster) > _CLUSTER_THRESHOLD and current_threshold < 0.95:
+            higher_threshold = min(current_threshold + 0.05, 0.95)
+            sub_fps = {doc_id: fingerprints[doc_id] for doc_id in cluster if doc_id in fingerprints}
+            sub_clusters, sub_orphans = _find_clusters(sub_fps, threshold=higher_threshold, num_perm=num_perm)
+            orphans = orphans | sub_orphans
+            for sc in sub_clusters:
+                # Re-queue for further splitting if still too large
+                work_queue.append((sc, higher_threshold))
+        else:
+            # Accept this cluster (either small enough or threshold maxed out)
+            if len(cluster) > _CLUSTER_THRESHOLD:
+                logger.warning("Sub-cluster of %d members still exceeds threshold at "
+                               "max threshold 0.95 — accepting as-is", len(cluster))
+            final_clusters.append(cluster)
+
     logger.info("Group %d: %d sub-clusters, %d orphans (%.1f%%)",
-                group_id, len(clusters), len(orphans),
+                group_id, len(final_clusters), len(orphans),
                 len(orphans) / max(len(member_ids), 1) * 100)
 
-    # Merge each sub-cluster independently using temporary groups
-    all_recovered_count = 0
-    all_total_redacted = 0
-    all_source_doc_ids = []
-    all_recovered_segments = []
-    best_merged_text = ""
-    best_recovered = -1
+    # Step 1: Remove ALL members from the original group
+    conn.execute("DELETE FROM match_group_members WHERE group_id = ?", (group_id,))
+    # Delete any existing merge result for the original group
+    conn.execute("DELETE FROM merge_results WHERE group_id = ?", (group_id,))
+    # Delete the original group itself
+    conn.execute("DELETE FROM match_groups WHERE group_id = ?", (group_id,))
 
-    for cluster_doc_ids in clusters:
-        # Create a temporary group for this cluster
-        temp_group = conn.execute("INSERT INTO match_groups (merged) VALUES (0)").lastrowid
+    # Step 2: Create permanent sub-groups
+    new_group_ids = []
+    for cluster_doc_ids in final_clusters:
+        new_gid = conn.execute("INSERT INTO match_groups (merged) VALUES (0)").lastrowid
         for doc_id in cluster_doc_ids:
             conn.execute(
-                "INSERT OR IGNORE INTO match_group_members (group_id, doc_id, similarity) VALUES (?, ?, 1.0)",
-                (temp_group, doc_id)
+                "INSERT OR IGNORE INTO match_group_members (group_id, doc_id, similarity) "
+                "VALUES (?, ?, 1.0)",
+                (new_gid, doc_id)
             )
+        new_group_ids.append(new_gid)
 
-        result = merge_group(conn, temp_group, redaction_markers, anchor_length)
+    # Step 3: Orphans are already removed (they were in the deleted group).
+    # They are now ungrouped and will be picked up by Phase 2 LSH on the next cycle.
+    logger.info("Group %d: split into %d sub-groups, released %d orphans",
+                group_id, len(new_group_ids), len(orphans))
 
-        all_recovered_count += result["recovered_count"]
-        all_total_redacted += result["total_redacted"]
-        all_source_doc_ids.extend(result["source_doc_ids"])
-        all_recovered_segments.extend(result["recovered_segments"])
-
-        # Track best merged text (the one with most recoveries)
-        if result["recovered_count"] > best_recovered:
-            best_recovered = result["recovered_count"]
-            best_merged_text = result["merged_text"]
-
-        # Clean up temporary group
-        conn.execute("DELETE FROM match_group_members WHERE group_id = ?", (temp_group,))
-        conn.execute("DELETE FROM match_groups WHERE group_id = ?", (temp_group,))
-
-    # Release orphans: remove them from the original group
-    if orphans:
-        placeholders = ",".join("?" * len(orphans))
-        conn.execute(
-            f"DELETE FROM match_group_members WHERE group_id = ? AND doc_id IN ({placeholders})",
-            (group_id, *orphans)
-        )
-        logger.info("Group %d: released %d orphan documents for re-evaluation",
-                     group_id, len(orphans))
-
-    return {
-        "merged_text": best_merged_text,
-        "recovered_count": all_recovered_count,
-        "total_redacted": all_total_redacted,
-        "source_doc_ids": all_source_doc_ids,
-        "recovered_segments": all_recovered_segments,
-    }
+    conn.commit()
+    return new_group_ids
 ```
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `cd /root/Unobfuscator && .venv/bin/pytest tests/stages/test_merger.py::test_cluster_and_merge_group_splits_unrelated_docs tests/stages/test_merger.py::test_cluster_and_merge_group_releases_orphans -v`
+Run: `cd /root/Unobfuscator && .venv/bin/pytest tests/stages/test_merger.py::test_cluster_and_split_creates_permanent_subgroups tests/stages/test_merger.py::test_cluster_and_split_releases_orphans tests/stages/test_merger.py::test_cluster_and_split_handles_recursive_large_component -v`
 
-Expected: Both PASS.
-
-NOTE: These tests use small groups without pre-computed fingerprints, so `_load_group_fingerprints` will return empty dicts. The test documents need to have fingerprints seeded. If the tests fail because of missing fingerprints, add fingerprint seeding to the test setup:
-
-```python
-from datasketch import MinHash
-from core.db import upsert_fingerprint
-
-def _seed_doc_with_fingerprint(conn, doc_id, text, num_perm=128):
-    """Seed a document and compute+store its MinHash fingerprint."""
-    seed_doc(conn, doc_id, text)
-    mh = MinHash(num_perm=num_perm)
-    for shingle in [text[i:i+5] for i in range(len(text) - 4)]:
-        mh.update(shingle.encode('utf-8'))
-    upsert_fingerprint(conn, doc_id, mh.hashvalues.tobytes(), len(text) - 4)
-```
-
-Then use `_seed_doc_with_fingerprint` instead of `seed_doc` in the clustering tests.
+Expected: All PASS.
 
 - [ ] **Step 5: Run full test suite**
 
 Run: `cd /root/Unobfuscator && .venv/bin/pytest -v`
 
-Expected: All tests PASS.
+Expected: All PASS.
 
 - [ ] **Step 6: Commit**
 
 ```bash
 cd /root/Unobfuscator
 git add stages/merger.py tests/stages/test_merger.py
-git commit -m "feat: add sub-clustering for large match groups before merging
+git commit -m "feat: add cluster_and_split_group to break mega-groups into permanent sub-groups
 
-Groups with >50 members are sub-clustered using within-group LSH on
-pre-computed MinHash fingerprints. Each genuine sub-cluster is merged
-independently with existing merge_group() logic. Orphan documents
-(no match within group) are released for re-evaluation by the LSH pipeline."
+Uses within-group LSH on pre-computed MinHash fingerprints to find
+genuine sub-clusters. Each becomes a permanent group with its own
+merge_result. Orphan documents are released for LSH re-evaluation.
+Includes recursive sub-clustering for components still above threshold."
 ```
 
 ---
 
-### Task 4: Wire Sub-Clustering into `run_merger()` and Add Cross-Group Pair Merging
+### Task 4: Wire Sub-Clustering Into `run_merger()` and Add Cross-Group Pair Merging
 
 **Files:**
 - Modify: `stages/merger.py:570-596` (run_merger)
 - Test: `tests/stages/test_merger.py`
 
-- [ ] **Step 1: Write failing test for run_merger routing large groups to clustering**
+- [ ] **Step 1: Write failing test for run_merger routing large groups**
 
 Add to `tests/stages/test_merger.py`:
 
 ```python
-def test_run_merger_routes_large_group_to_clustering(conn):
-    """Groups exceeding _CLUSTER_THRESHOLD should use cluster_and_merge_group."""
-    # Create a group with enough members to trigger clustering
-    from stages.merger import _CLUSTER_THRESHOLD
-
-    # We need _CLUSTER_THRESHOLD + 1 docs to trigger clustering.
-    # For the test, temporarily set the threshold low.
+def test_run_merger_splits_large_group_then_merges_subgroups(conn):
+    """Groups exceeding _CLUSTER_THRESHOLD should be split, then each sub-group merged."""
     import stages.merger as merger_mod
-    original_threshold = merger_mod._CLUSTER_THRESHOLD
+    original = merger_mod._CLUSTER_THRESHOLD
     merger_mod._CLUSTER_THRESHOLD = 3  # trigger on 4+ members
 
     try:
-        # 2 related docs + 2 orphans
-        base = (
+        base_a = (
             "From: jeffrey@example.com\nTo: pilot@example.com\n"
-            "Subject: Flight\n\nPassenger [REDACTED] on the manifest."
+            "Subject: Flight schedule for the weekend trip\n\n"
+            "The flight to [REDACTED] departs at 9am from Palm Beach airport terminal."
         )
-        donor = (
+        donor_a = (
             "From: jeffrey@example.com\nTo: pilot@example.com\n"
-            "Subject: Flight\n\nPassenger Bill Clinton on the manifest."
+            "Subject: Flight schedule for the weekend trip\n\n"
+            "The flight to Little St. James departs at 9am from Palm Beach airport terminal."
         )
-        orphan1 = "From: a@b.com\nCompletely different content alpha."
-        orphan2 = "From: c@d.com\nCompletely different content beta."
+        orphan1 = "From: a@b.com\nCompletely different content alpha beta gamma delta."
+        orphan2 = "From: c@d.com\nCompletely different content epsilon zeta eta theta."
 
-        _seed_doc_with_fingerprint(conn, "m1", base)
-        _seed_doc_with_fingerprint(conn, "m2", donor)
+        _seed_doc_with_fingerprint(conn, "m1", base_a)
+        _seed_doc_with_fingerprint(conn, "m2", donor_a)
         _seed_doc_with_fingerprint(conn, "m3", orphan1)
         _seed_doc_with_fingerprint(conn, "m4", orphan2)
         conn.commit()
@@ -743,20 +835,29 @@ def test_run_merger_routes_large_group_to_clustering(conn):
         conn.commit()
 
         count = run_merger(conn, REDACTION_MARKERS, anchor_length=50)
-        assert count == 1
 
-        # Group should be marked as merged
-        row = conn.execute("SELECT merged FROM match_groups WHERE group_id = ?", (g,)).fetchone()
-        assert row["merged"] == 1
+        # Original mega-group should be gone
+        original_group = conn.execute(
+            "SELECT * FROM match_groups WHERE group_id = ?", (g,)
+        ).fetchone()
+        assert original_group is None
 
-        # Orphans should have been released
-        orphan_rows = conn.execute(
-            "SELECT doc_id FROM match_group_members WHERE group_id = ? AND doc_id IN ('m3', 'm4')",
-            (g,)
+        # Sub-groups should have been created and merged
+        # At least one merge result should exist with a recovery
+        results = conn.execute(
+            "SELECT recovered_count FROM merge_results WHERE recovered_count > 0"
         ).fetchall()
-        assert len(orphan_rows) == 0
+        assert len(results) >= 1
+
+        # Orphans should be ungrouped
+        for orphan_id in ["m3", "m4"]:
+            row = conn.execute(
+                "SELECT group_id FROM match_group_members WHERE doc_id = ?", (orphan_id,)
+            ).fetchone()
+            assert row is None, f"Orphan {orphan_id} should be ungrouped"
+
     finally:
-        merger_mod._CLUSTER_THRESHOLD = original_threshold
+        merger_mod._CLUSTER_THRESHOLD = original
 ```
 
 - [ ] **Step 2: Write failing test for cross-group pair merging**
@@ -766,15 +867,16 @@ Add to `tests/stages/test_merger.py`:
 ```python
 from stages.merger import run_cross_group_merger
 
+
 def test_run_cross_group_merger_recovers_redactions(conn):
-    """Cross-group pairs should recover redactions between docs in different groups."""
+    """Cross-group pairs should recover redactions using full merge_group() pipeline."""
     base = (
         "The investigation found [REDACTED] at the scene on March 10. "
-        "The evidence was collected by officer Johnson."
+        "The evidence was collected by officer Johnson at the precinct."
     )
     donor = (
         "The investigation found John Smith at the scene on March 10. "
-        "The evidence was collected by officer Johnson."
+        "The evidence was collected by officer Johnson at the precinct."
     )
     seed_doc(conn, "x1", base)
     seed_doc(conn, "x2", donor)
@@ -801,26 +903,30 @@ def test_run_cross_group_merger_recovers_redactions(conn):
     ).fetchone()
     assert row["pair_merged"] == 1
 
-    # A merge result should exist for the group containing the redacted doc
+    # A merge result should exist with the recovery
     mr = conn.execute(
-        "SELECT recovered_count FROM merge_results WHERE group_id = ?", (g1,)
+        "SELECT recovered_count, merged_text FROM merge_results WHERE group_id = ?", (g1,)
     ).fetchone()
     assert mr is not None
     assert mr["recovered_count"] >= 1
+    assert "John Smith" in mr["merged_text"]
 ```
 
 - [ ] **Step 3: Run tests to verify they fail**
 
-Run: `cd /root/Unobfuscator && .venv/bin/pytest tests/stages/test_merger.py::test_run_merger_routes_large_group_to_clustering tests/stages/test_merger.py::test_run_cross_group_merger_recovers_redactions -v`
+Run: `cd /root/Unobfuscator && .venv/bin/pytest tests/stages/test_merger.py::test_run_merger_splits_large_group_then_merges_subgroups tests/stages/test_merger.py::test_run_cross_group_merger_recovers_redactions -v`
 
 Expected: FAIL.
 
-- [ ] **Step 4: Modify `run_merger()` to route large groups to clustering**
+- [ ] **Step 4: Modify `run_merger()` to handle large groups**
 
-Replace `run_merger()` in `stages/merger.py` (lines 570-596):
+Replace `run_merger()` in `stages/merger.py`:
 
 ```python
-def run_merger(conn, redaction_markers: list[str], anchor_length: int = 50) -> int:
+def run_merger(
+    conn, redaction_markers: list[str], anchor_length: int = 50,
+    shutdown_check=None,
+) -> int:
     """Run merger on all unmerged match groups with 2+ members. Returns count processed."""
     groups = conn.execute("""
         SELECT group_id FROM match_groups
@@ -828,20 +934,33 @@ def run_merger(conn, redaction_markers: list[str], anchor_length: int = 50) -> i
         AND (SELECT COUNT(*) FROM match_group_members WHERE group_id = match_groups.group_id) >= 2
     """).fetchall()
 
+    # Phase 1: Split any mega-groups. Collect new sub-group IDs.
+    new_sub_groups = []
     count = 0
     for row in groups:
+        if shutdown_check and shutdown_check():
+            break
+
         group_id = row["group_id"]
+
+        # Check if this group still exists (may have been deleted by a prior split)
         member_count = conn.execute(
             "SELECT COUNT(*) FROM match_group_members WHERE group_id = ?", (group_id,)
         ).fetchone()[0]
+        if member_count < 2:
+            continue
 
         if member_count > _CLUSTER_THRESHOLD:
-            logger.info("Group %d has %d members — using sub-cluster merge",
+            logger.info("Group %d has %d members — splitting into sub-groups",
                         group_id, member_count)
-            result = cluster_and_merge_group(conn, group_id, redaction_markers, anchor_length)
-        else:
-            result = merge_group(conn, group_id, redaction_markers, anchor_length)
+            new_ids = cluster_and_split_group(
+                conn, group_id, redaction_markers,
+                shutdown_check=shutdown_check,
+            )
+            new_sub_groups.extend(new_ids)
+            continue
 
+        result = merge_group(conn, group_id, redaction_markers, anchor_length)
         upsert_merge_result(
             conn, group_id,
             result["merged_text"],
@@ -856,20 +975,51 @@ def run_merger(conn, redaction_markers: list[str], anchor_length: int = 50) -> i
         conn.commit()
         count += 1
 
+    # Phase 2: Process newly created sub-groups from splits.
+    # No recursion needed — these groups are guaranteed to be at or below
+    # _CLUSTER_THRESHOLD (or accepted as-is at max LSH threshold).
+    for sub_gid in new_sub_groups:
+        if shutdown_check and shutdown_check():
+            break
+        member_count = conn.execute(
+            "SELECT COUNT(*) FROM match_group_members WHERE group_id = ?", (sub_gid,)
+        ).fetchone()[0]
+        if member_count < 2:
+            continue
+        result = merge_group(conn, sub_gid, redaction_markers, anchor_length)
+        upsert_merge_result(
+            conn, sub_gid,
+            result["merged_text"],
+            result["recovered_count"],
+            result["total_redacted"],
+            result["source_doc_ids"],
+            recovered_segments=result.get("recovered_segments", [])
+        )
+        conn.execute(
+            "UPDATE match_groups SET merged = 1 WHERE group_id = ?", (sub_gid,)
+        )
+        conn.commit()
+        count += 1
+
     return count
 ```
 
+**No recursion, no infinite loop risk.** `cluster_and_split_group` returns the new group IDs, and `run_merger` processes them in a flat loop. Sub-groups produced by splitting are guaranteed to be at or below `_CLUSTER_THRESHOLD` (via the iterative work queue), or accepted as-is at max threshold 0.95. Either way, they go directly to `merge_group()`, never back through the splitting path.
+
 - [ ] **Step 5: Implement `run_cross_group_merger()`**
 
-Add to `stages/merger.py` after `run_merger()`:
+Ensure `import json` is at the top of `stages/merger.py` (added in Task 3). Then add after `run_merger()`:
 
 ```python
-def run_cross_group_merger(conn, redaction_markers: list[str], anchor_length: int = 50) -> int:
+def run_cross_group_merger(
+    conn, redaction_markers: list[str], anchor_length: int = 50,
+    shutdown_check=None,
+) -> int:
     """Attempt redaction recovery on cross-group verified pairs.
 
-    For each unmerged pair where docs are in different groups, load both
-    documents and attempt anchor-based recovery. Updates the merge_result
-    for the group containing the more-redacted document.
+    For each unmerged pair where docs are in different groups, create a
+    temporary 2-member group and run the full merge_group() pipeline on it.
+    Updates the merge_result for the group containing the more-redacted doc.
 
     Returns count of pairs processed.
     """
@@ -883,122 +1033,154 @@ def run_cross_group_merger(conn, redaction_markers: list[str], anchor_length: in
     count = 0
 
     for pair in pairs:
+        if shutdown_check and shutdown_check():
+            break
+
         doc_a_id = pair["doc_id_a"]
         doc_b_id = pair["doc_id_b"]
         group_a = pair["group_a"]
         group_b = pair["group_b"]
 
-        text_a = conn.execute(
+        # Determine which group has the more-redacted doc
+        text_a = (conn.execute(
             "SELECT extracted_text FROM documents WHERE id = ?", (doc_a_id,)
-        ).fetchone()
-        text_b = conn.execute(
+        ).fetchone() or {}).get("extracted_text", "") or ""
+        text_b = (conn.execute(
             "SELECT extracted_text FROM documents WHERE id = ?", (doc_b_id,)
-        ).fetchone()
-        if not text_a or not text_b:
-            conn.execute(
-                "UPDATE verified_pairs SET pair_merged = 1 WHERE doc_id_a = ? AND doc_id_b = ?",
-                (doc_a_id, doc_b_id)
-            )
-            count += 1
-            continue
+        ).fetchone() or {}).get("extracted_text", "") or ""
 
-        text_a = text_a["extracted_text"] or ""
-        text_b = text_b["extracted_text"] or ""
-
-        # Determine which doc is more redacted
-        def redaction_count(text):
-            return sum(text.count(m) for m in redaction_markers)
-
-        count_a = redaction_count(text_a)
-        count_b = redaction_count(text_b)
+        count_a = sum(text_a.count(m) for m in redaction_markers)
+        count_b = sum(text_b.count(m) for m in redaction_markers)
 
         if count_a == 0 and count_b == 0:
-            # Neither has redactions — nothing to recover
             conn.execute(
-                "UPDATE verified_pairs SET pair_merged = 1 WHERE doc_id_a = ? AND doc_id_b = ?",
+                "UPDATE verified_pairs SET pair_merged = 1 "
+                "WHERE doc_id_a = ? AND doc_id_b = ?",
                 (doc_a_id, doc_b_id)
             )
             count += 1
             continue
 
-        # Use more-redacted as base, less-redacted as donor
-        if count_a >= count_b:
-            base_id, base_text, donor_id, donor_text = doc_a_id, text_a, doc_b_id, text_b
-            target_group = group_a
-        else:
-            base_id, base_text, donor_id, donor_text = doc_b_id, text_b, doc_a_id, text_a
-            target_group = group_b
+        # Temporarily move docs into a 2-member temp group to run the full
+        # merge_group() pipeline. Protected by SAVEPOINT so a crash during the
+        # swap doesn't permanently orphan docs.
+        conn.execute("SAVEPOINT cross_merge")
+        try:
+            # Save original group memberships
+            orig_a = conn.execute(
+                "SELECT group_id, similarity FROM match_group_members WHERE doc_id = ?",
+                (doc_a_id,)
+            ).fetchone()
+            orig_b = conn.execute(
+                "SELECT group_id, similarity FROM match_group_members WHERE doc_id = ?",
+                (doc_b_id,)
+            ).fetchone()
 
-        # Get existing merge result for the target group (if any)
-        existing = conn.execute(
-            "SELECT merged_text, recovered_count, total_redacted, source_doc_ids, recovered_segments "
-            "FROM merge_results WHERE group_id = ?", (target_group,)
-        ).fetchone()
-
-        if existing and existing["merged_text"]:
-            # Use existing merged text as base (it may have prior recoveries)
-            merged_base = existing["merged_text"]
-            prior_count = existing["recovered_count"]
-            prior_total = existing["total_redacted"]
-            prior_sources = json.loads(existing["source_doc_ids"]) if existing["source_doc_ids"] else []
-            prior_segments = json.loads(existing["recovered_segments"]) if existing["recovered_segments"] else []
-        else:
-            merged_base = base_text
-            prior_count = 0
-            prior_total = len(find_redaction_positions(base_text, redaction_markers))
-            prior_sources = [base_id]
-            prior_segments = []
-
-        # Attempt recovery using the cross-group donor
-        positions = find_redaction_positions(merged_base, redaction_markers)
-        if not positions:
+            # Create temp group and move docs into it
+            temp_gid = conn.execute("INSERT INTO match_groups (merged) VALUES (0)").lastrowid
             conn.execute(
-                "UPDATE verified_pairs SET pair_merged = 1 WHERE doc_id_a = ? AND doc_id_b = ?",
+                "UPDATE match_group_members SET group_id = ? WHERE doc_id = ?",
+                (temp_gid, doc_a_id)
+            )
+            conn.execute(
+                "UPDATE match_group_members SET group_id = ? WHERE doc_id = ?",
+                (temp_gid, doc_b_id)
+            )
+
+            result = merge_group(conn, temp_gid, redaction_markers, anchor_length)
+
+            # Restore original group memberships
+            if orig_a:
+                conn.execute(
+                    "UPDATE match_group_members SET group_id = ?, similarity = ? WHERE doc_id = ?",
+                    (orig_a["group_id"], orig_a["similarity"], doc_a_id)
+                )
+            if orig_b:
+                conn.execute(
+                    "UPDATE match_group_members SET group_id = ?, similarity = ? WHERE doc_id = ?",
+                    (orig_b["group_id"], orig_b["similarity"], doc_b_id)
+                )
+            # Delete the temp group
+            conn.execute("DELETE FROM match_groups WHERE group_id = ?", (temp_gid,))
+            conn.execute("RELEASE cross_merge")
+        except Exception:
+            conn.execute("ROLLBACK TO cross_merge")
+            conn.execute("RELEASE cross_merge")
+            logger.warning("Cross-group merge failed for pair (%s, %s), skipping",
+                           doc_a_id, doc_b_id)
+            conn.execute(
+                "UPDATE verified_pairs SET pair_merged = 1 "
+                "WHERE doc_id_a = ? AND doc_id_b = ?",
                 (doc_a_id, doc_b_id)
             )
             count += 1
             continue
 
-        recovered_count = 0
-        merged = merged_base
-        new_segments = []
+        # If we recovered anything, apply the recovered segments to the
+        # existing merge_result for the target group. We do NOT replace the
+        # existing merged_text (which contains recoveries from all group members)
+        # with the 2-doc merge text (which would lose prior recoveries).
+        if result["recovered_count"] > 0:
+            target_group = group_a if count_a >= count_b else group_b
 
-        for pos, marker in reversed(positions):
-            left_anchor, right_anchor = extract_anchors(
-                merged, pos, len(marker), anchor_length, redaction_markers
-            )
-            alpha_content = re.sub(r'[^a-zA-Z0-9]', '', left_anchor + right_anchor)
-            if len(alpha_content) < 8:
-                continue
+            existing = conn.execute(
+                "SELECT merged_text, recovered_count, total_redacted, "
+                "source_doc_ids, recovered_segments FROM merge_results WHERE group_id = ?",
+                (target_group,)
+            ).fetchone()
 
-            recovered = find_text_between_anchors(donor_text, left_anchor, right_anchor)
-            if recovered and _is_real_recovery(recovered, redaction_markers):
-                merged = merged[:pos] + recovered + merged[pos + len(marker):]
-                recovered_count += 1
-                new_segments.append({
-                    "text": recovered,
-                    "source_doc_id": donor_id,
-                    "stage": "cross_group",
-                    "confidence": "high",
-                    "anchor_alpha_len": len(alpha_content),
-                })
+            if existing and existing["merged_text"]:
+                # Apply cross-group recovered segments to the EXISTING merged_text
+                # (not the 2-doc result's merged_text, which would lose prior recoveries)
+                updated_text = existing["merged_text"]
+                new_segments = result.get("recovered_segments", [])
+                applied_count = 0
+                for seg in new_segments:
+                    # Try to find and replace the redaction in existing text
+                    for marker in redaction_markers:
+                        left_a, right_a = extract_anchors(
+                            updated_text,
+                            updated_text.find(marker) if marker in updated_text else -1,
+                            len(marker), anchor_length, redaction_markers
+                        )
+                        recovered = find_text_between_anchors(
+                            result["merged_text"], left_a, right_a
+                        )
+                        if recovered and _is_real_recovery(recovered, redaction_markers):
+                            pos = updated_text.find(marker)
+                            if pos >= 0:
+                                updated_text = updated_text[:pos] + recovered + updated_text[pos + len(marker):]
+                                applied_count += 1
+                                break
 
-        if recovered_count > 0:
-            all_sources = prior_sources + ([donor_id] if donor_id not in prior_sources else [])
-            all_segments = prior_segments + new_segments
-            upsert_merge_result(
-                conn, target_group,
-                merged,
-                prior_count + recovered_count,
-                prior_total,
-                all_sources,
-                recovered_segments=all_segments,
-            )
+                prior_sources = json.loads(existing["source_doc_ids"]) if existing["source_doc_ids"] else []
+                prior_segments = json.loads(existing["recovered_segments"]) if existing["recovered_segments"] else []
+                new_sources = [s for s in result["source_doc_ids"] if s not in prior_sources]
+                upsert_merge_result(
+                    conn, target_group,
+                    updated_text,
+                    existing["recovered_count"] + applied_count,
+                    existing["total_redacted"],
+                    prior_sources + new_sources,
+                    recovered_segments=prior_segments + new_segments,
+                )
+            else:
+                # No prior merge result — use the 2-doc result directly
+                upsert_merge_result(
+                    conn, target_group,
+                    result["merged_text"],
+                    result["recovered_count"],
+                    result["total_redacted"],
+                    result["source_doc_ids"],
+                    recovered_segments=result.get("recovered_segments", []),
+                )
+
             logger.info("Cross-group pair (%s, %s): recovered %d redactions for group %d",
-                        doc_a_id, doc_b_id, recovered_count, target_group)
+                        doc_a_id, doc_b_id, result["recovered_count"], target_group)
 
         conn.execute(
-            "UPDATE verified_pairs SET pair_merged = 1 WHERE doc_id_a = ? AND doc_id_b = ?",
+            "UPDATE verified_pairs SET pair_merged = 1 "
+            "WHERE doc_id_a = ? AND doc_id_b = ?",
             (doc_a_id, doc_b_id)
         )
         count += 1
@@ -1010,13 +1192,11 @@ def run_cross_group_merger(conn, redaction_markers: list[str], anchor_length: in
     return count
 ```
 
-Add `import json` to the top of merger.py if not already present.
-
 - [ ] **Step 6: Run tests to verify they pass**
 
 Run: `cd /root/Unobfuscator && .venv/bin/pytest tests/stages/test_merger.py -v`
 
-Expected: All tests PASS.
+Expected: All PASS.
 
 - [ ] **Step 7: Run full test suite**
 
@@ -1031,10 +1211,10 @@ cd /root/Unobfuscator
 git add stages/merger.py tests/stages/test_merger.py
 git commit -m "feat: wire sub-clustering into run_merger, add cross-group pair merger
 
-run_merger() routes groups above _CLUSTER_THRESHOLD to
-cluster_and_merge_group(). New run_cross_group_merger() processes
-verified pairs where docs are in different groups, recovering
-redactions without merging the groups themselves."
+run_merger() splits groups above _CLUSTER_THRESHOLD into permanent
+sub-groups, then recursively merges them. run_cross_group_merger()
+processes verified pairs between different groups using the full
+merge_group() pipeline via temporary group membership swaps."
 ```
 
 ---
@@ -1042,32 +1222,49 @@ redactions without merging the groups themselves."
 ### Task 5: Wire Cross-Group Merger into the Daemon Loop
 
 **Files:**
-- Modify: `unobfuscator.py` (daemon loop, Stage 3 section)
+- Modify: `unobfuscator.py` (Stage 3 section, around line 303-333)
 
-- [ ] **Step 1: Read the daemon loop**
+- [ ] **Step 1: Read the daemon Stage 3 section**
 
-Read `unobfuscator.py` around lines 303-327 (Stage 3 section) to find the exact integration point.
-
-- [ ] **Step 2: Add cross-group merger call after run_merger()**
-
-In the Stage 3 section of `_run_one_cycle()`, after the `run_merger()` call and its logging, add:
+Read `unobfuscator.py` around lines 295-333 to confirm the exact integration point. The current code is:
 
 ```python
-from stages.merger import run_cross_group_merger
-
-# Cross-group pair merging: recover redactions between docs in different groups
-cross_count = run_cross_group_merger(conn, redaction_markers, anchor_length)
-if cross_count > 0:
-    logger.info("Stage 3: processed %d cross-group pairs", cross_count)
+_set_activity("Stage 3 Merger: merging groups")
+logger.info("Stage 3: starting merger")
+merged_count = run_merger(conn, redaction_markers=markers)
+logger.info("Stage 3: merged %d groups", merged_count)
 ```
 
-Move the import to the top of the file with the other merger imports.
+- [ ] **Step 2: Add cross-group merger and shutdown_check to Stage 3**
 
-- [ ] **Step 3: Run the daemon smoke test**
+After the existing `run_merger` call and before the merge queue processing, add:
+
+```python
+# Cross-group pair merging
+if not _shutdown_requested:
+    from stages.merger import run_cross_group_merger
+    cross_count = run_cross_group_merger(
+        conn, redaction_markers=markers,
+        shutdown_check=lambda: _shutdown_requested,
+    )
+    if cross_count > 0:
+        logger.info("Stage 3: processed %d cross-group pairs", cross_count)
+```
+
+Also update the existing `run_merger` call to pass `shutdown_check`:
+
+```python
+merged_count = run_merger(conn, redaction_markers=markers,
+                          shutdown_check=lambda: _shutdown_requested)
+```
+
+Move the `run_cross_group_merger` import to the top of the file with the other merger imports.
+
+- [ ] **Step 3: Run daemon tests**
 
 Run: `cd /root/Unobfuscator && .venv/bin/pytest tests/test_daemon.py -v`
 
-Expected: PASS (or no daemon tests fail).
+Expected: PASS.
 
 - [ ] **Step 4: Run full test suite**
 
@@ -1080,55 +1277,54 @@ Expected: All PASS.
 ```bash
 cd /root/Unobfuscator
 git add unobfuscator.py
-git commit -m "feat: add cross-group pair merging to daemon Stage 3 loop"
+git commit -m "feat: add cross-group pair merging and shutdown checks to daemon Stage 3"
 ```
 
 ---
 
-### Task 6: Integration Test with Real Mega-Group Scenario
+### Task 6: End-to-End Integration Test
 
 **Files:**
 - Test: `tests/stages/test_merger.py`
 
-- [ ] **Step 1: Write integration test simulating the mega-group scenario**
+- [ ] **Step 1: Write integration test simulating the full mega-group scenario**
 
 ```python
-def test_mega_group_scenario_end_to_end(conn):
-    """Simulate the real scenario: 6 docs, 2 genuine clusters, 2 orphans, 1 cross-group pair.
+def test_mega_group_full_scenario(conn):
+    """End-to-end: mega-group with mixed clusters, orphans, and a cross-group pair.
 
-    This exercises the full flow:
-    1. run_merger sub-clusters the group, merges each cluster, releases orphans
+    1. run_merger splits the mega-group, merges sub-groups, releases orphans
     2. run_cross_group_merger recovers redactions from cross-group pairs
     """
     from core.db import insert_verified_pair
     import stages.merger as merger_mod
-    original_threshold = merger_mod._CLUSTER_THRESHOLD
-    merger_mod._CLUSTER_THRESHOLD = 3  # trigger clustering on 4+ members
+    original = merger_mod._CLUSTER_THRESHOLD
+    merger_mod._CLUSTER_THRESHOLD = 3
 
     try:
-        # Cluster A: flight docs (2 members)
+        # Cluster A: flight docs
         flight_redacted = (
             "From: pilot@jets.com\nTo: jeffrey@example.com\n"
-            "Subject: Flight plan\n\n"
-            "Departing [REDACTED] at 0800. Passengers: Jeffrey, [REDACTED]."
+            "Subject: Flight plan for Palm Beach\n\n"
+            "Departing [REDACTED] at 0800 hours. Passengers: Jeffrey, [REDACTED]."
         )
         flight_clean = (
             "From: pilot@jets.com\nTo: jeffrey@example.com\n"
-            "Subject: Flight plan\n\n"
-            "Departing Palm Beach at 0800. Passengers: Jeffrey, Prince Andrew."
+            "Subject: Flight plan for Palm Beach\n\n"
+            "Departing Teterboro at 0800 hours. Passengers: Jeffrey, Prince Andrew."
         )
-        # Cluster B: legal docs (2 members)
+        # Cluster B: legal docs
         legal_redacted = (
-            "CASE NO. 2005-0042\nPlaintiff: [REDACTED]\n"
-            "The deposition was taken on March 10, 2005."
+            "CASE NO. 2005-0042\nSouthern District of New York\n"
+            "Plaintiff: [REDACTED]\nThe deposition was taken on March 10."
         )
         legal_clean = (
-            "CASE NO. 2005-0042\nPlaintiff: Virginia Giuffre\n"
-            "The deposition was taken on March 10, 2005."
+            "CASE NO. 2005-0042\nSouthern District of New York\n"
+            "Plaintiff: Virginia Giuffre\nThe deposition was taken on March 10."
         )
         # Orphans
-        orphan1 = "Completely unrelated document about weather forecasts in Idaho."
-        orphan2 = "Dinner reservation for 8 at restaurant Le Bernardin tonight."
+        orphan1 = "Completely unrelated document about weather forecasts in Idaho state parks."
+        orphan2 = "Dinner reservation for eight guests at restaurant Le Bernardin tonight in NYC."
 
         for doc_id, text in [
             ("f1", flight_redacted), ("f2", flight_clean),
@@ -1138,54 +1334,62 @@ def test_mega_group_scenario_end_to_end(conn):
             _seed_doc_with_fingerprint(conn, doc_id, text)
         conn.commit()
 
-        # All in one mega-group (simulating transitive chaining)
+        # All in one mega-group
         g = create_match_group(conn)
         for doc_id in ["f1", "f2", "l1", "l2", "o1", "o2"]:
             add_group_member(conn, g, doc_id, 1.0)
         conn.commit()
 
-        # Also a doc in a separate group that has a verified cross-group pair with f1
-        cross_donor_text = (
+        # Cross-group donor in a separate group
+        cross_text = (
             "From: pilot@jets.com\nTo: jeffrey@example.com\n"
-            "Subject: Flight plan\n\n"
-            "Departing Teterboro at 0800. Passengers: Jeffrey, Prince Andrew."
+            "Subject: Flight plan for Palm Beach\n\n"
+            "Departing Newark at 0800 hours. Passengers: Jeffrey, Prince Andrew."
         )
-        _seed_doc_with_fingerprint(conn, "cross1", cross_donor_text)
+        _seed_doc_with_fingerprint(conn, "cross1", cross_text)
         conn.commit()
         g2 = create_match_group(conn)
         add_group_member(conn, g2, "cross1", 1.0)
         insert_verified_pair(conn, "f1", "cross1", similarity=0.8, phase="phase3")
         conn.commit()
 
-        # Step 1: run_merger handles the mega-group via clustering
+        # Step 1: run_merger handles the mega-group
         merge_count = run_merger(conn, REDACTION_MARKERS, anchor_length=50)
-        assert merge_count >= 1
+
+        # Original mega-group should be gone
+        assert conn.execute(
+            "SELECT * FROM match_groups WHERE group_id = ?", (g,)
+        ).fetchone() is None
 
         # Orphans released
         for orphan_id in ["o1", "o2"]:
-            row = conn.execute(
+            assert conn.execute(
                 "SELECT group_id FROM match_group_members WHERE doc_id = ?", (orphan_id,)
-            ).fetchone()
-            assert row is None, f"Orphan {orphan_id} should be released"
+            ).fetchone() is None
 
-        # Recoveries from within-group clustering
-        mr = conn.execute(
-            "SELECT recovered_count, merged_text FROM merge_results WHERE group_id = ?", (g,)
+        # At least some recoveries from within-group merging
+        results = conn.execute(
+            "SELECT SUM(recovered_count) FROM merge_results WHERE recovered_count > 0"
         ).fetchone()
-        assert mr is not None
-        assert mr["recovered_count"] >= 1  # At least some within-group recoveries
+        assert results[0] is not None and results[0] >= 1
 
-        # Step 2: cross-group merger picks up the verified pair
+        # Step 2: cross-group merger
         cross_count = run_cross_group_merger(conn, REDACTION_MARKERS, anchor_length=50)
         assert cross_count >= 1
 
+        # Cross-group pair should be marked as merged
+        pair_row = conn.execute(
+            "SELECT pair_merged FROM verified_pairs WHERE doc_id_a = 'cross1' OR doc_id_b = 'cross1'"
+        ).fetchone()
+        assert pair_row["pair_merged"] == 1
+
     finally:
-        merger_mod._CLUSTER_THRESHOLD = original_threshold
+        merger_mod._CLUSTER_THRESHOLD = original
 ```
 
 - [ ] **Step 2: Run the integration test**
 
-Run: `cd /root/Unobfuscator && .venv/bin/pytest tests/stages/test_merger.py::test_mega_group_scenario_end_to_end -v`
+Run: `cd /root/Unobfuscator && .venv/bin/pytest tests/stages/test_merger.py::test_mega_group_full_scenario -v`
 
 Expected: PASS.
 
@@ -1207,37 +1411,41 @@ git commit -m "test: add end-to-end integration test for mega-group fix"
 
 ### Task 7: File GitHub Issue and Update Memory
 
-- [ ] **Step 1: Create GitHub issue for the mega-group bug**
+- [ ] **Step 1: Create GitHub issue**
 
 ```bash
-gh issue create --title "Merger hangs on mega-groups (82K+ members) due to transitive group chaining" \
+gh issue create \
+  --title "Merger hangs on mega-groups (82K+ members) due to transitive group chaining" \
   --body "## Problem
-Match groups with 60K-82K members are created by transitive chaining in \`_assign_to_group()\`. When Phase 0 or Phase 3 finds a pair where both docs are already in different groups, it calls \`merge_groups()\`, which transitively chains unrelated documents. Group 19334 has 82,396 members with 86% having <0.70 Jaccard similarity to any other member.
+Match groups with 60K-82K members are created by transitive chaining in _assign_to_group().
+Group 19334 has 82,396 members with 86% having <0.70 Jaccard similarity to any other member.
+9.6% of trapped members have legitimate matches outside the group they're locked in.
 
 ## Root Cause
-\`_assign_to_group()\` (matcher.py:732-748) calls \`merge_groups()\` unconditionally when both docs are in different groups. Phase 0 email header matching creates large initial groups, and Phase 3 cross-group verification causes cascading merges.
+_assign_to_group() (matcher.py) calls merge_groups() unconditionally when both docs are in
+different groups. Phase 0 email header matching and Phase 3 verification both trigger cascading
+merges that chain unrelated documents together.
 
-## Fix
-1. Sub-cluster large groups using within-group LSH before merging
-2. Release orphan documents (no genuine match) for re-evaluation
-3. Replace transitive group merging with cross-group pair tracking (verified_pairs table)
+## Fix (3 layers)
+1. Sub-cluster large groups using within-group LSH, split into permanent sub-groups
+2. Release orphan documents for re-evaluation by the LSH pipeline
+3. Block transitive group merging above _MERGE_SIZE_LIMIT (1000), record verified_pairs instead
+4. Cross-group pair merger processes verified pairs using full merge_group() pipeline
 
 ## Impact
 - Groups 19334, 48654, 51709 (82K, 70K, 61K members) blocked all merger progress
-- 70K+ orphan docs trapped, unable to match with their actual counterparts
-- 9.6% of mega-group members have legitimate matches outside the group they're locked in"
+- 70K+ orphan docs trapped, unable to find their actual counterparts
+- Daemon stuck at 99.8% CPU for 39+ days on a single group"
 ```
 
 - [ ] **Step 2: Update project memory**
 
-Update `/root/.claude/projects/-root-Unobfuscator/memory/project_merger_bisect_fix.md` to mark the bisect fix as complete and reference this new fix.
+Create `/root/.claude/projects/-root-Unobfuscator/memory/project_mega_group_fix.md` with status and context.
 
-Create a new memory file for this fix at `/root/.claude/projects/-root-Unobfuscator/memory/project_mega_group_fix.md`.
-
-- [ ] **Step 3: Commit plan document**
+- [ ] **Step 3: Final commit**
 
 ```bash
 cd /root/Unobfuscator
 git add docs/superpowers/plans/2026-03-30-mega-group-fix.md
-git commit -m "docs: add implementation plan for mega-group fix"
+git commit -m "docs: update mega-group fix plan (v2, post-review)"
 ```
