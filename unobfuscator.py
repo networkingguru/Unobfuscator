@@ -32,7 +32,7 @@ from stages.matcher import (
     run_phase0_email_fastpath, run_phase2_lsh_candidates,
     run_phase3_verify_and_group
 )
-from stages.merger import run_merger
+from stages.merger import run_merger, run_cross_group_merger
 from stages.output_generator import run_output_generator
 from stages.summary_generator import generate_summary_pdf
 from stages.text_recovery import run_text_recovery
@@ -302,8 +302,17 @@ def _run_one_cycle(conn, cfg: dict) -> None:
 
     _set_activity("Stage 3 Merger: merging groups")
     logger.info("Stage 3: starting merger")
-    merged_count = run_merger(conn, redaction_markers=markers)
+    merged_count = run_merger(conn, redaction_markers=markers, shutdown_check=lambda: _shutdown_requested)
     logger.info("Stage 3: merged %d groups", merged_count)
+
+    # Cross-group pair merging
+    if not _shutdown_requested:
+        cross_count = run_cross_group_merger(
+            conn, redaction_markers=markers,
+            shutdown_check=lambda: _shutdown_requested,
+        )
+        if cross_count > 0:
+            logger.info("Stage 3: processed %d cross-group pairs", cross_count)
 
     # Process any pending merge queue jobs (e.g., from soft-redaction discoveries).
     merge_job = dequeue(conn, stage="merge")
@@ -324,7 +333,7 @@ def _run_one_cycle(conn, cfg: dict) -> None:
 
     # Re-run merger only if groups were actually reset above.
     if remerge_needed and not _shutdown_requested:
-        run_merger(conn, redaction_markers=markers)
+        run_merger(conn, redaction_markers=markers, shutdown_check=lambda: _shutdown_requested)
 
     if not _shutdown_requested:
         stale = cleanup_stale_outputs(conn)

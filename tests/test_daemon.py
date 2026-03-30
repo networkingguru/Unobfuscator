@@ -224,6 +224,7 @@ def test_run_one_cycle_calls_text_recovery(tmp_path):
          patch("unobfuscator.run_phase2_lsh_candidates", return_value=[]), \
          patch("unobfuscator.run_phase3_verify_and_group"), \
          patch("unobfuscator.run_merger", return_value=0), \
+         patch("unobfuscator.run_cross_group_merger", return_value=0), \
          patch("unobfuscator.dequeue", return_value=None), \
          patch("unobfuscator.run_text_recovery") as mock_tr, \
          patch("unobfuscator.run_output_generator", return_value=0), \
